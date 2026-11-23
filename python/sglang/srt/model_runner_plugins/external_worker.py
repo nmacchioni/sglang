@@ -26,7 +26,14 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
 )
 from sglang.srt.model_runner_plugins.kv_view import PluginKVView, kv_view_refusal
-from sglang.srt.runtime_context import get_exec, get_memory, get_model, get_schedule
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_model,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -128,6 +135,12 @@ class PluginOwnedModelRunner(ModelRunner):
             start_layer=0, end_layer=num_layers, num_effective_layers=num_layers
         )
         self.kv_cache_dtype = self.dtype
+        # PD peers check this string matches before they move bytes. A runner's
+        # KV rows are opaque bytes per TP rank, which a transfer cannot slice
+        # between TP sizes: only peers of the same runner and TP size pair.
+        self.kv_cache_dtype_str = (
+            f"model runner {self._runner.name} at TP {get_parallel().tp_size}"
+        )
         self.uocr_greedy_graph = None
         self.decode_cuda_graph_runner = None
         self.prefill_cuda_graph_runner = None
@@ -186,12 +199,23 @@ class PluginOwnedModelRunner(ModelRunner):
         refusal = kv_view_refusal(layout)
         if refusal is None:
             return PluginKVView(layout=layout, device=self.device)
-        if get_memory().enable_hierarchical_cache:
-            raise ValueError(
-                f"--model-runner {self._runner.name} cannot use the hierarchical "
-                f"cache: its KVLayout has {refusal}; drop "
-                "--enable-hierarchical-cache"
-            )
+        for in_use, feature, flag in (
+            (
+                get_memory().enable_hierarchical_cache,
+                "the hierarchical cache",
+                "drop --enable-hierarchical-cache",
+            ),
+            (
+                get_disagg().disaggregation_mode != "null",
+                "PD disaggregation",
+                "serve without --disaggregation-mode",
+            ),
+        ):
+            if in_use:
+                raise ValueError(
+                    f"--model-runner {self._runner.name} cannot use {feature}: "
+                    f"its KVLayout has {refusal}; {flag}"
+                )
         return _PluginOwnedKVCache(
             size=layout.num_slots,
             page_size=layout.page_size,

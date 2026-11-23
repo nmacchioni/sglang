@@ -116,6 +116,11 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     lora: bool = False
     multimodal: bool = False
     pooling: bool = False
+    # PD and HiCache: between steps, SGLang transfers or host-copies the bytes
+    # of the slots KVLayout.full_attention lists, by address and slot size, and
+    # holds each in-flight transfer's pages until it completes; the runner keeps
+    # those addresses fixed for the layout's epoch and touches only the slots a
+    # Step names.
     pd_disaggregation: bool = False
     hicache: bool = False
     memory_saver: bool = False
