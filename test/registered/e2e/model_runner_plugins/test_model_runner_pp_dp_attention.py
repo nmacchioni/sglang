@@ -4,7 +4,8 @@ PP=2: every stage runs its steps through the built-in runner; the first stage
 returns pp_out and no logits, the last stage logits. DP attention (TP=2, two
 DP ranks): each rank runs its own batch or an idle step and all join the MLP
 collectives; the graph decision is the one SGLang's MLP-sync gather voted, so
-one rank's oversized batch sends every rank eager on that step.
+one rank's oversized batch sends every rank eager on that step, and an extend
+step with prefill graphs pads every rank to one shared bucket.
 
 Both are compared with the direct path step by step, matched by their inputs
 (batch composition under DP depends on request arrival), each configuration
@@ -137,14 +138,12 @@ class _Compare:
             matched += 1
         return matched
 
-    def _check_paths(self, direct, steps, key, *, direct_fallback=False):
+    def _check_paths(self, direct, steps, key):
         for rank, records in _by(direct, key).items():
             self.assertEqual({r["path"] for r in records}, {"direct"}, rank)
         by_rank = _by(steps, key)
         self.assertEqual(set(by_rank), {0, 1})
         for rank, records in by_rank.items():
-            if direct_fallback:
-                records = [r for r in records if r["path"] != "direct"]
             self.assertEqual(
                 {(r["path"], r["runner"]) for r in records}, {("step", "sglang")}
             )
@@ -255,11 +254,9 @@ class TestDPAttention(_Compare, CustomTestCase):
         long.join()
         return [alone, late]
 
-    def _check(self, name, args, *, direct_fallback=False):
+    def _check(self, name, args, *, prefill_graphs=False):
         runs = self._three_runs(args, self.workload)
-        by_rank = self._check_paths(
-            runs[0][1], runs[2][1], "attn_dp_rank", direct_fallback=direct_fallback
-        )
+        by_rank = self._check_paths(runs[0][1], runs[2][1], "attn_dp_rank")
         ranks = (by_rank[0], by_rank[1])
         # Lockstep: every step runs on both DP ranks, with one graph decision
         # and, where a step falls back to the direct path, on every rank.
@@ -270,9 +267,9 @@ class TestDPAttention(_Compare, CustomTestCase):
             self.assertEqual(a["path"], b["path"], (a, b))
         modes = [(a["mode"], b["mode"]) for a, b in zip(*ranks)]
         self.assertIn(("decode", "idle"), modes)
-        if not direct_fallback:
-            # With prefill graphs, the direct path pads a decode rank of an
-            # extend step into a dummy extend, and the trace records that.
+        if not prefill_graphs:
+            # With prefill graphs, the forward pads a decode rank of an extend
+            # step into a dummy extend, and the trace records that.
             self.assertTrue(
                 any(a != b and "idle" not in (a, b) for a, b in modes), modes
             )
@@ -303,18 +300,34 @@ class TestDPAttention(_Compare, CustomTestCase):
             )
         )
 
-    def test_dp_attention_prefill_graph_steps_keep_the_direct_path(self):
-        """With prefill graphs on, the forward pads every rank of an extend
-        step to one prefill graph bucket after the Step is built: those steps
-        take the direct path on every rank, the others stay on the API."""
+    def test_dp_attention_prefill_graph_steps(self):
+        """With prefill graphs on, every rank of an extend step pads to one
+        prefill graph bucket, idle and decode ranks included: Step.graph names
+        that bucket on every rank, and the forward's MAX_LEN padding matches."""
         rank0, rank1 = self._check(
             "dp2 prefill graphs",
             [*_DP, "--cuda-graph-max-bs-decode", "2"],
-            direct_fallback=True,
+            prefill_graphs=True,
         )
-        paths = {(r["path"], r["replayed_graph"]) for r in rank0 + rank1}
-        self.assertIn(("direct", True), paths)
-        self.assertIn(("step", True), paths)
+        shared = [
+            (a, b)
+            for a, b in zip(rank0, rank1)
+            if a["step_graph"] is not None and a["step_graph"][0] == "prefill"
+        ]
+        self.assertTrue(shared)
+        for a, b in shared:
+            self.assertEqual(a["step_graph"], b["step_graph"])
+            bucket = a["step_graph"][1]
+            for r in (a, b):
+                self.assertEqual(r["dp_padding"], "MAX_LEN")
+                self.assertEqual(r["padded_num_tokens"], [bucket, bucket])
+        # A rank with fewer rows (idle or decoding) replayed the shared bucket.
+        self.assertTrue(
+            any(
+                min(a["global_num_tokens"]) < max(a["global_num_tokens"])
+                for a, _ in shared
+            )
+        )
 
 
 if __name__ == "__main__":

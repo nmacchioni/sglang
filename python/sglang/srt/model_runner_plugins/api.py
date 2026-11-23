@@ -38,6 +38,9 @@ class Feature(str, Enum):
     DP_ATTENTION = "dp_attention"
     EXPERT_PARALLEL = "expert_parallel"
     CONTEXT_PARALLEL = "context_parallel"
+    # Two micro-batches per step whose communication overlaps the other's
+    # compute; the split arrives in ``Step.dp``.
+    TWO_BATCH_OVERLAP = "two_batch_overlap"
     CUDA_GRAPHS = "cuda_graphs"
     OVERLAP_SCHEDULE = "overlap_schedule"
     SPECULATIVE_DECODING = "speculative_decoding"
@@ -106,6 +109,7 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     dp_attention: bool = False
     expert_parallel: bool = False
     context_parallel: bool = False
+    two_batch_overlap: bool = False
     cuda_graphs: bool = False
     overlap_schedule: bool = False
     speculative_decoding: bool = False
@@ -175,6 +179,7 @@ class ResolvedConfig(msgspec.Struct, frozen=True, kw_only=True):
     moe_ep_size: int = 1
     attn_cp_size: int = 1
     dcp_size: int = 1
+    two_batch_overlap: bool = False
     # Phases ("decode", "prefill") whose CUDA graph backend is not disabled.
     cuda_graph_phases: tuple[str, ...] = ()
     overlap_schedule: bool = False
@@ -531,9 +536,15 @@ class DPInfo(msgspec.Struct, frozen=True, kw_only=True):
     # The coordinated graph votes: every rank could replay its decode
     # (resp. prefill) graph. Step.graph is eager on every rank otherwise.
     decode_graph: bool = False
-    # Steps with this vote and an extend on some rank keep the direct path for
-    # now: the forward reshapes every rank's batch to one prefill bucket.
+    # With this vote and an extend on some rank, every rank replays the
+    # prefill graph of one bucket (``Step.graph``), idle and decode ranks
+    # included: each pads its step to the bucket's rows, a decode step
+    # presented as one-token extends and an idle step as one padding request.
     prefill_graph: bool = False
+    # Two-batch overlap: the rendezvous voted every rank to run this step as
+    # two micro-batches, this rank's requests [0, split) and [split, B), each
+    # joining its own round of MLP collectives. None: no rank splits.
+    tbo_split_seq_index: Optional[int] = None
 
     def __post_init__(self) -> None:
         n = len(self.global_num_tokens)
@@ -614,6 +625,21 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
                 )
         if self.dp is not None:
             _check_rendezvous(self.dp, num_tokens=num_tokens, graph=self.graph)
+            split = self.dp.tbo_split_seq_index
+            if split is not None and not 0 <= split <= self.rows.batch_size:
+                raise ValueError(
+                    f"a two-batch-overlap split at request {split} of a step "
+                    f"with {self.rows.batch_size} requests"
+                )
+        if (
+            self.graph.phase is GraphPhase.PREFILL
+            and self.mode in (StepMode.DECODE, StepMode.IDLE)
+            and (self.dp is None or not self.dp.extend_in_batch)
+        ):
+            raise ValueError(
+                f"a {self.mode.value} step replays a prefill graph only under DP "
+                "attention, presented as an extend while another rank extends"
+            )
 
 
 class RendezvousMismatch(ValueError):

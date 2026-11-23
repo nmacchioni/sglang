@@ -68,20 +68,66 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         return "position scoring"
     if forward_batch.input_candidate_selectors is not None:
         return "input candidate selectors"
-    if forward_batch.tbo_split_seq_index is not None:
-        return "two-batch overlap"
     if forward_batch.input_ids_from_graph:
         return "input ids read inside the decode graph"
     if (
         forward_batch.global_num_tokens_cpu is not None
         and forward_batch.is_extend_in_batch
         and forward_batch.can_run_dp_prefill_cuda_graph
+        and dp_prefill_graph_bucket(forward_batch) is None
     ):
-        # The forward pads every DP rank to a shared prefill graph bucket and
-        # turns idle and decode ranks into dummy extends, after the Step is
-        # built. The vote is the rendezvous's, so every rank falls back alike.
-        return "a prefill graph step under DP attention"
+        # The vote stands but the ranks' tokens fit no shared bucket: each rank
+        # then decides its own prefill graph after padding to its own count.
+        # The inputs are the rendezvous's, so every rank falls back alike.
+        return "a prefill graph step under DP attention without a shared bucket"
     return None
+
+
+def dp_prefill_graph_bucket(forward_batch: ForwardBatch) -> Optional[int]:
+    """The prefill graph bucket every DP rank pads this step to, from the
+    rendezvous's token counts; None when the step has no shared bucket.
+
+    The same decision ``ForwardBatch.prepare_mlp_sync_batch`` takes in the
+    forward (MAX_LEN padding to one captured bucket); the built-in runner
+    checks after its forward that it was taken. None as well under context
+    parallelism, where replay also depends on whether the padded batch is
+    CP-sharded."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.cp.base import get_cp_strategy
+    from sglang.srt.model_executor.forward_batch_info import (
+        _mega_moe_materializes_idle_rank,
+        prefill_graph_tolerates_sum_len,
+    )
+    from sglang.srt.runtime_context import get_exec, get_parallel
+    from sglang.srt.utils.common import ceil_align
+
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    if (
+        global_num_tokens is None
+        or not forward_batch.is_extend_in_batch
+        or not forward_batch.can_run_dp_prefill_cuda_graph
+        or forward_batch.dp_spec_prefill_coordination_applied
+        or get_cp_strategy() is not None
+    ):
+        return None
+    if _mega_moe_materializes_idle_rank(forward_batch):
+        global_num_tokens = [1] * len(global_num_tokens)
+    attn_tp_size = get_parallel().attn_tp_size
+    rows = [ceil_align(n, attn_tp_size) for n in global_num_tokens]
+    buckets = get_exec().graph.cuda_graph_config.prefill.bs
+    idle_allowed = (
+        min(rows) > 0
+        if envs.SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER.get()
+        else True
+    )
+    if (
+        not buckets
+        or max(rows) > max(buckets)
+        or not idle_allowed
+        or prefill_graph_tolerates_sum_len()
+    ):
+        return None
+    return min(b for b in buckets if b >= max(rows))
 
 
 def step_mode(forward_batch: ForwardBatch) -> StepMode:
@@ -158,6 +204,7 @@ def dp_info(forward_batch: ForwardBatch) -> Optional[DPInfo]:
         extend_in_batch=forward_batch.is_extend_in_batch,
         decode_graph=forward_batch.can_run_decode_cuda_graph,
         prefill_graph=forward_batch.can_run_dp_prefill_cuda_graph,
+        tbo_split_seq_index=forward_batch.tbo_split_seq_index,
     )
 
 
