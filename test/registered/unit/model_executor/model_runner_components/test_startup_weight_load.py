@@ -34,6 +34,17 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
 )
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
+from sglang.srt.model_runner_plugins.api import (
+    Capacity,
+    GraphBuckets,
+    LoadContext,
+    RuntimeConfig,
+)
+from sglang.srt.model_runner_plugins.startup import (
+    ModelRunnerStartup,
+    StartupInputs,
+    StartupPhase,
+)
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 
@@ -703,14 +714,31 @@ class TestModelRunnerStartupWeightLoadOwnership(CustomTestCase):
         self.assertIsNone(runner.startup_weight_load)
 
 
+_STARTUP_INPUTS = StartupInputs(
+    load=LoadContext(model_path="dummy", device="cuda", gpu_id=0),
+    runtime=RuntimeConfig(page_size=1),
+    buckets=GraphBuckets(),
+    capacity=Capacity(),
+)
+
+
 class _SchedulerWorker:
+    # What --model-runner sglang reads for its typed results.
+    model_config = SimpleNamespace(
+        context_len=2048, vocab_size=32000, is_generation=True
+    )
+    preloaded_weights_bytes = 0
+
     def __init__(self, trace, *, post_capture_active=False):
         self._trace = trace
         self.model_runner = SimpleNamespace(
             device="cuda",
             forward_stream=object(),
+            weight_load_mem_usage=1.0,
             prewarm_sampling=lambda: trace.append("prewarm"),
-            token_to_kv_pool=SimpleNamespace(post_capture_active=post_capture_active),
+            token_to_kv_pool=SimpleNamespace(
+                post_capture_active=post_capture_active, page_size=1, size=4096
+            ),
             token_to_kv_pool_allocator=None,
             post_capture_resize_kv_pool=Mock(
                 side_effect=lambda *, draft_runners: trace.append("resize")
@@ -719,6 +747,9 @@ class _SchedulerWorker:
 
     def start_startup_weight_load(self):
         self._trace.append("start")
+
+    def get_worker_info(self):
+        return (4096, 16384, 64, None, 2047, 2042, 0, "cuda", None, 65, 2048, 4096)
 
     def finalize_startup_weight_load(self):
         self._trace.append("finalize")
@@ -730,7 +761,15 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         self.addCleanup(reset_context)
 
     def _scheduler(
-        self, worker, trace, *, mode, draft_worker=None, enable_overlap=True, pp_size=1
+        self,
+        worker,
+        trace,
+        *,
+        mode,
+        draft_worker=None,
+        enable_overlap=True,
+        pp_size=1,
+        model_runner=None,
     ):
         # The schedule reads the mode from the bags, so the test states it by
         # publishing a record rather than by standing one in.
@@ -740,6 +779,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 model_path="dummy",
                 startup_weight_load_mode=mode,
                 pp_size=pp_size,
+                model_runner=model_runner,
             ),
             role="scheduler",
         )
@@ -756,12 +796,20 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
         return scheduler
 
     def _run_startup(
-        self, mode, *, use_draft_worker=False, enable_overlap=True, pp_size=1, mlx=False
+        self,
+        mode,
+        *,
+        use_draft_worker=False,
+        enable_overlap=True,
+        pp_size=1,
+        mlx=False,
+        model_runner=None,
     ):
         trace = []
         worker = _SchedulerWorker(trace, post_capture_active=True)
         draft_worker = (
             SimpleNamespace(
+                preloaded_weights_bytes=0,
                 hicache_draft_plan=None,
                 prewarm_sampling=lambda: trace.append("draft_prewarm"),
                 _draft_model_runners=lambda: (worker.model_runner,),
@@ -776,6 +824,10 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             draft_worker=draft_worker,
             enable_overlap=enable_overlap,
             pp_size=pp_size,
+            model_runner=model_runner,
+        )
+        scheduler.model_runner_startup = ModelRunnerStartup.maybe_create(
+            native_host=scheduler
         )
         schedule_stream = object()
         expected_stream = (
@@ -821,11 +873,20 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "sglang.srt.managers.scheduler.prewarm_graph_pool_borrow",
                 side_effect=lambda: trace.append("borrow_prewarm"),
             ),
+            patch.object(StartupInputs, "from_published", return_value=_STARTUP_INPUTS),
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
             scheduler.init_model_worker()
 
         self.assertIs(scheduler.schedule_stream, None if mlx else schedule_stream)
+        # The flag ran the phases through the runner lifecycle, to completion.
+        self.assertEqual(
+            scheduler.model_runner_startup is not None, model_runner is not None
+        )
+        if model_runner is not None:
+            self.assertEqual(
+                scheduler.model_runner_startup.phase, StartupPhase.FINALIZED
+            )
         worker.model_runner.post_capture_resize_kv_pool.assert_called_once_with(
             draft_runners=(worker.model_runner,) if use_draft_worker else ()
         )
@@ -874,6 +935,20 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 "finalize",
             ],
         )
+
+    def test_model_runner_sglang_runs_the_same_startup(self):
+        for mode, use_draft_worker in (
+            ("serial", False),
+            ("overlap", False),
+            ("serial", True),
+        ):
+            with self.subTest(mode=mode, use_draft_worker=use_draft_worker):
+                self.assertEqual(
+                    self._run_startup(
+                        mode, use_draft_worker=use_draft_worker, model_runner="sglang"
+                    ),
+                    self._run_startup(mode, use_draft_worker=use_draft_worker),
+                )
 
     def test_draft_worker_prewarm_uses_target_forward_stream(self):
         self.assertEqual(

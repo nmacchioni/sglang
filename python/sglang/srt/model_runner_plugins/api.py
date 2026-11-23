@@ -144,6 +144,148 @@ class ResolvedConfig(msgspec.Struct, frozen=True, kw_only=True):
     radix_cache: bool = False
 
 
+class LoadContext(msgspec.Struct, frozen=True, kw_only=True):
+    """What SGLang hands a runner when it loads, on one rank.
+
+    The model config, tokenizer and process groups are SGLang's and are
+    resolved before ``load``; the checkpoint must be readable by SGLang's
+    ``ModelConfig``.
+    """
+
+    model_path: str
+    device: str
+    gpu_id: int
+    tp_rank: int = 0
+    tp_size: int = 1
+    pp_rank: int = 0
+    pp_size: int = 1
+
+
+class ModelInfo(msgspec.Struct, frozen=True, kw_only=True):
+    """Facts about the loaded model that SGLang sizes and admits against."""
+
+    context_len: int
+    vocab_size: int
+    is_generation: bool = True
+
+    def __post_init__(self) -> None:
+        if self.context_len <= 0 or self.vocab_size <= 0:
+            raise ValueError(
+                f"ModelInfo needs a positive context_len and vocab_size, got "
+                f"context_len={self.context_len}, vocab_size={self.vocab_size}"
+            )
+
+
+class MemoryNeeds(msgspec.Struct, frozen=True, kw_only=True):
+    """Device memory the loaded runner holds before any KV is allocated."""
+
+    # Bytes the weights took on the device while loading.
+    weight_bytes: int
+    # Bytes already resident before SGLang measured free memory (a weight cache).
+    preloaded_weight_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.weight_bytes < 0 or self.preloaded_weight_bytes < 0:
+            raise ValueError("MemoryNeeds byte counts must not be negative")
+
+
+class LoadResult(msgspec.Struct, frozen=True, kw_only=True):
+    model_info: ModelInfo
+    memory: MemoryNeeds
+
+
+class RuntimeConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """The KV budget SGLang asks a runner to back in ``allocate``."""
+
+    page_size: int
+    mem_fraction_static: Optional[float] = None
+    # Explicit limits (--max-total-tokens, --max-running-requests); None sizes
+    # from the memory budget.
+    max_total_tokens: Optional[int] = None
+    max_running_requests: Optional[int] = None
+
+
+class GraphBuckets(msgspec.Struct, frozen=True, kw_only=True):
+    """Configured CUDA graph buckets per phase; empty when the phase is eager."""
+
+    decode: tuple[int, ...] = ()
+    prefill: tuple[int, ...] = ()
+
+
+class Capacity(msgspec.Struct, frozen=True, kw_only=True):
+    """What SGLang allows ``finalize`` to settle on.
+
+    ``resize`` permits resizing the backing after capture, which happens only
+    if the backing supports it; the explicit limits stay caps.
+    """
+
+    resize: bool = True
+    max_total_tokens: Optional[int] = None
+    max_running_requests: Optional[int] = None
+
+
+class FullAttentionLayer(msgspec.Struct, frozen=True, kw_only=True):
+    """One full-attention layer's K and V bytes: slot ``i`` starts at
+    ``ptr + i * slot_bytes``."""
+
+    layer_id: int
+    k_ptr: int
+    v_ptr: int
+    k_slot_bytes: int
+    v_slot_bytes: int
+
+
+class AdmissionLimits(msgspec.Struct, frozen=True, kw_only=True):
+    """The final token and request limits SGLang admits against."""
+
+    max_total_num_tokens: int
+    max_running_requests: int
+    max_req_len: int
+    max_req_input_len: int
+
+    def __post_init__(self) -> None:
+        if self.max_total_num_tokens <= 0 or self.max_running_requests <= 0:
+            raise ValueError(
+                "AdmissionLimits needs positive max_total_num_tokens and "
+                f"max_running_requests, got {self.max_total_num_tokens} and "
+                f"{self.max_running_requests}"
+            )
+        if not 0 < self.max_req_len or self.max_req_input_len > self.max_req_len:
+            raise ValueError(
+                f"AdmissionLimits needs 0 < max_req_len and max_req_input_len <= "
+                f"max_req_len, got {self.max_req_len} and {self.max_req_input_len}"
+            )
+
+
+class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """The bytes backing SGLang's KV slots on one rank.
+
+    SGLang allocates every page and slot ID and translates logical IDs to
+    physical slots; the runner owns the bytes. This version describes
+    full-attention layers only; a runner whose KV is not plain full attention
+    reports no layers. Addresses stay fixed for an ``epoch``: ``finalize`` may
+    change ``num_slots`` but never moves a layer.
+    """
+
+    epoch: int = 0
+    page_size: int
+    # Physical slots per layer that the backing serves.
+    num_slots: int
+    full_attention: tuple[FullAttentionLayer, ...] = ()
+    # Set by ``finalize``; None from ``allocate``.
+    limits: Optional[AdmissionLimits] = None
+
+    def __post_init__(self) -> None:
+        if self.page_size < 1 or self.num_slots < 0:
+            raise ValueError(
+                f"KVLayout needs page_size >= 1 and num_slots >= 0, got "
+                f"page_size={self.page_size}, num_slots={self.num_slots}"
+            )
+        layer_ids = [layer.layer_id for layer in self.full_attention]
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(f"KVLayout lists a layer twice: {layer_ids}")
+
+
 @runtime_checkable
 class ModelRunnerPlugin(Protocol):
     """The selection subset of the model runner plugin protocol.
@@ -156,3 +298,21 @@ class ModelRunnerPlugin(Protocol):
     api_version: int
 
     def describe(self, cfg: ResolvedConfig) -> RunnerCapabilities: ...
+
+
+@runtime_checkable
+class ModelRunnerLifecycle(ModelRunnerPlugin, Protocol):
+    """Startup and shutdown, called on each rank in this order: ``load``,
+    ``allocate``, ``capture``, ``finalize``; ``close`` last, also after a
+    failure in any phase, so it must release whatever was created so far.
+    """
+
+    def load(self, ctx: LoadContext) -> LoadResult: ...
+
+    def allocate(self, cfg: RuntimeConfig) -> KVLayout: ...
+
+    def capture(self, buckets: GraphBuckets) -> None: ...
+
+    def finalize(self, capacity: Capacity) -> KVLayout: ...
+
+    def close(self) -> None: ...

@@ -364,6 +364,7 @@ from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.model_runner_plugins.selection import ModelRunnerAdmission
+from sglang.srt.model_runner_plugins.startup import ModelRunnerStartup, StartupInputs
 from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdder
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
     resolve_uocr_decode_graph_io,
@@ -536,6 +537,8 @@ class Scheduler(
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     # None without --model-runner, and in stub schedulers built via __new__.
     model_runner_admission: Optional[ModelRunnerAdmission] = None
+    # The --model-runner lifecycle; None without the flag and in stub schedulers.
+    model_runner_startup: Optional[ModelRunnerStartup] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
@@ -610,6 +613,7 @@ class Scheduler(
         # Init model configs
         self.init_model_config()
         self.init_model_runner_admission()
+        self.init_model_runner_startup()
 
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
@@ -900,6 +904,10 @@ class Scheduler(
         self.model_runner_admission = ModelRunnerAdmission.maybe_create(
             model_config=self.model_config
         )
+
+    def init_model_runner_startup(self) -> None:
+        """Lifecycle of the runner --model-runner selects; None without it."""
+        self.model_runner_startup = ModelRunnerStartup.maybe_create(native_host=self)
 
     def init_metrics_collector(self) -> None:
         self.metrics_collector_context = SchedulerMetricsCollector.init_new(
@@ -1221,14 +1229,15 @@ class Scheduler(
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
 
-    def init_model_worker(self):
-        # Load model weights.
+    def load_model_workers(self):
+        """Load the target and draft model weights (startup phase: load)."""
         self.init_tp_model_worker()
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
-        # Prepare KV cache pools for all workers
+    def alloc_model_memory_pools(self):
+        """Prepare KV cache pools for all workers (startup phase: allocate)."""
         tic = time.perf_counter()
         self.init_memory_pools()
         self.kv_cache_allocation_time = time.perf_counter() - tic
@@ -1238,6 +1247,8 @@ class Scheduler(
             # before graph capture and KV sizing account for its memory.
             self.tp_worker.model_runner.token_to_kv_pool_allocator.prewarm_compaction()
 
+    def capture_model_graphs(self):
+        """Capture graphs and warm up sampling (startup phase: capture)."""
         self.init_all_attention_backends()
         self.init_all_cuda_graphs()
 
@@ -1269,6 +1280,10 @@ class Scheduler(
                 model_runner.prewarm_sampling()
             else:
                 self.draft_worker.prewarm_sampling()
+
+    def finalize_model_capacity(self):
+        """Settle the final KV capacity after capture (startup phase: finalize)."""
+        model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool(
@@ -1300,6 +1315,16 @@ class Scheduler(
         ):
             model_runner.post_capture_elastic_ep_recover()
 
+    def init_model_worker(self):
+        if self.model_runner_startup is None:
+            self.load_model_workers()
+            self.alloc_model_memory_pools()
+            self.capture_model_graphs()
+            self.finalize_model_capacity()
+        else:
+            # The same phases, through the lifecycle of the --model-runner plugin.
+            self.model_runner_startup.run(StartupInputs.from_published())
+
         # Dispatch the model worker
         if self.spec_algorithm.is_none() or self.draft_worker is None:
             # PP+spec: non-last stages have no draft worker; they run the
@@ -1309,20 +1334,7 @@ class Scheduler(
             self.model_worker = self.draft_worker
 
         # Get token and memory info from the model worker
-        (
-            self.max_total_num_tokens,
-            self.max_prefill_tokens,
-            self.max_running_requests,
-            self.max_queued_requests,
-            self.max_req_len,
-            self.max_req_input_len,
-            self.random_seed,
-            self.device,
-            self.forward_stream,
-            _,
-            _,
-            _,
-        ) = self.tp_worker.get_worker_info()
+        self.init_worker_info()
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -1375,6 +1387,41 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}="
                 f"{self.startup_available_gpu_memory_gb:.2f} GB"
             )
+
+    def init_worker_info(self):
+        """Token and memory limits; typed runner results under --model-runner."""
+        if self.model_runner_startup is None:
+            (
+                self.max_total_num_tokens,
+                self.max_prefill_tokens,
+                self.max_running_requests,
+                self.max_queued_requests,
+                self.max_req_len,
+                self.max_req_input_len,
+                self.random_seed,
+                self.device,
+                self.forward_stream,
+                _,
+                _,
+                _,
+            ) = self.tp_worker.get_worker_info()
+            return
+        limits = self.model_runner_startup.layout.limits
+        self.max_total_num_tokens = limits.max_total_num_tokens
+        self.max_prefill_tokens = get_schedule().max_prefill_tokens
+        self.max_running_requests = limits.max_running_requests
+        self.max_queued_requests = get_schedule().max_queued_requests
+        self.max_req_len = limits.max_req_len
+        self.max_req_input_len = limits.max_req_input_len
+        # Not migrated yet: the seed broadcast, the device and the runner stream.
+        self.random_seed = self.tp_worker.random_seed
+        self.device = self.tp_worker.device
+        self.forward_stream = self.tp_worker.model_runner.forward_stream
+
+    def close_model_runner(self) -> None:
+        """Close the --model-runner plugin on graceful shutdown; no-op without it."""
+        if self.model_runner_startup is not None:
+            self.model_runner_startup.close()
 
     def emit_metrics_constants(self) -> None:
         if not get_observability().enable_metrics:
@@ -7338,6 +7385,7 @@ def run_scheduler_process(
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
                 scheduler.release_host_resources()
+                scheduler.close_model_runner()
                 close_custom_all_reduce()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
