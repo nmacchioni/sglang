@@ -1,8 +1,9 @@
 """Per-forward trace at the worker boundary, for tests and step-overhead runs.
 
 Off unless ``SGLANG_MODEL_RUNNER_STEP_TRACE_DIR`` is set. Each record says which
-path ran (direct, or the runner's steps), the step's shape, and the host time
-spent at the boundary; optionally the inputs and raw logits before sampling.
+path ran (direct, or the runner's steps), the step's shape, whether it replayed
+a graph (and, on the step path, ``Step.graph``), and the host time spent at the
+boundary; optionally the inputs and raw logits before sampling.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from sglang.srt.environ import envs
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_runner_plugins.api import GraphChoice
 
 
 class StepTrace:
@@ -49,6 +51,8 @@ class StepTrace:
         execute_seconds: Optional[float],
         forward_batch: ForwardBatch,
         logits_output: LogitsProcessorOutput,
+        replayed_graph: bool,
+        graph: Optional[GraphChoice] = None,
     ) -> None:
         host_seconds = time.perf_counter() - tic
         record = {
@@ -62,6 +66,13 @@ class StepTrace:
             "host_us": host_seconds * 1e6,
             "execute_us": None if execute_seconds is None else execute_seconds * 1e6,
             "prompt_logprobs": logits_output.input_token_logprobs is not None,
+            "replayed_graph": replayed_graph,
+            # Step path only: [phase, bucket], or None when Step.graph is eager.
+            "step_graph": (
+                None
+                if graph is None or graph.is_eager
+                else [graph.phase.value, graph.bucket]
+            ),
         }
         with open(f"{self._prefix}.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")

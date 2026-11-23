@@ -1,5 +1,11 @@
 """The reference model runner: an independent, pure-PyTorch plugin that owns its
-weights and KV bytes and serves text through the Step API (TP1, eager)."""
+weights and KV bytes and serves text through the Step API (TP1), with overlap
+scheduling and decode CUDA graphs.
+
+Its decode graphs write logits into one buffer shared across steps; it declares
+logits a shared output and honors the lifetime contract: a replay waits on the
+release event of the previous output in that buffer before rewriting it, and
+refuses to run if that output was never released."""
 
 from __future__ import annotations
 
@@ -14,6 +20,7 @@ from sglang.srt.model_runner_plugins.api import (
     Capacity,
     FullAttentionLayer,
     GraphBuckets,
+    GraphPhase,
     KVLayout,
     LoadContext,
     LoadResult,
@@ -21,6 +28,7 @@ from sglang.srt.model_runner_plugins.api import (
     Logits,
     MemoryNeeds,
     ModelInfo,
+    OutputBuffer,
     ProjectRequest,
     ResolvedConfig,
     RunnerCapabilities,
@@ -28,6 +36,7 @@ from sglang.srt.model_runner_plugins.api import (
     Step,
     StepOutput,
 )
+from sglang.test.model_runner_reference.graphs import DecodeGraphs
 from sglang.test.model_runner_reference.model import (
     DenseDecoder,
     last_rows,
@@ -56,12 +65,21 @@ class ReferenceRunner:
     def __init__(self):
         self._model: Optional[DenseDecoder] = None
         self._layout: Optional[KVLayout] = None
+        self._graphs: Optional[DecodeGraphs] = None
+        # The shared logits buffer: whether an output in it awaits release, and
+        # the event the last release handed over.
+        self._logits_held = False
+        self._logits_free: Optional[torch.cuda.Event] = None
         self.steps_executed = 0
 
     def describe(self, cfg: ResolvedConfig) -> RunnerCapabilities:
         return RunnerCapabilities(
             prompt_logprobs=True,
             top_logprobs=True,
+            overlap_schedule=True,
+            cuda_graphs=True,
+            cuda_graph_phases=(GraphPhase.DECODE,),
+            shared_outputs=(OutputBuffer.LOGITS,),
             architectures=ARCHITECTURES,
         )
 
@@ -105,9 +123,14 @@ class ReferenceRunner:
         )
         return self._layout
 
+    @torch.inference_mode()
     def capture(self, buckets: GraphBuckets) -> None:
-        if buckets.decode or buckets.prefill:
-            raise ValueError("the reference runner is eager only")
+        if buckets.prefill:
+            # SGLang refuses the launch first; prefill runs eager.
+            raise ValueError("the reference runner captures decode graphs only")
+        if buckets.decode:
+            self._graphs = DecodeGraphs(model=self._model, buckets=buckets.decode)
+            logger.info("Reference runner captured decode graphs %s", buckets.decode)
 
     def finalize(self, capacity: Capacity) -> KVLayout:
         return self._layout
@@ -119,22 +142,52 @@ class ReferenceRunner:
     def execute(self, plan: ReferencePlan) -> StepOutput:
         step = plan.step
         self.steps_executed += 1
+        stream = torch.cuda.current_stream()
+        if step.inputs_ready is not None:
+            # Everything here runs on the runner stream, so this orders nothing
+            # more; a runner working on a private stream needs it.
+            stream.wait_event(step.inputs_ready)
         if step.outputs.logit_rows is LogitRows.NONE:
             return StepOutput()
-        plan.hidden = self._model.hidden_states(step)
-        logits = self._model.logits(plan.hidden[last_rows(step)])
-        return StepOutput(logits=Logits(tensor=logits))
+        if step.graph.is_eager:
+            plan.hidden = self._model.hidden_states(step)
+            logits = self._model.logits(plan.hidden[last_rows(step)])
+        else:
+            if self._logits_held:
+                raise RuntimeError(
+                    "SGLang executed a step before releasing the previous output "
+                    "of the shared logits buffer"
+                )
+            logits = self._graphs.replay(
+                step, bucket=step.graph.bucket, before_logits=self._wait_logits_free
+            )
+            self._logits_held = True
+        ready = torch.cuda.Event()
+        ready.record(stream)
+        return StepOutput(logits=Logits(tensor=logits), ready=ready)
+
+    def _wait_logits_free(self) -> None:
+        if self._logits_free is not None:
+            torch.cuda.current_stream().wait_event(self._logits_free)
 
     @torch.inference_mode()
     def project(self, req: ProjectRequest) -> torch.Tensor:
         return self._model.logits(req.plan.hidden[req.rows])
 
-    def release(self, out: StepOutput, after: object) -> None:
-        # Outputs are fresh per step; the plan, and with it the hidden states,
-        # goes when SGLang drops it.
-        pass
+    def release(self, out: StepOutput, after: Optional[torch.cuda.Event]) -> None:
+        # Eager outputs are fresh per step; the plan, and with it the hidden
+        # states, goes when SGLang drops it.
+        if out.logits is not None and self._graphs is not None:
+            if self._graphs.holds(out.logits.tensor):
+                self._logits_held = False
+                self._logits_free = after
+
+    @property
+    def graph_replays(self) -> int:
+        return 0 if self._graphs is None else self._graphs.replays
 
     def close(self) -> None:
+        self._graphs = None
         self._model = None
         self._layout = None
 

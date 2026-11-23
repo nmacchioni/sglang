@@ -164,6 +164,13 @@ def request_uses(opts: RequestOptions) -> Uses:
 def launch_refusals(caps: RunnerCapabilities, cfg: ResolvedConfig) -> list[str]:
     uses = launch_uses(cfg)
     reasons = _unsupported(caps, uses)
+    if caps.cuda_graphs:
+        declared = {phase.value for phase in caps.cuda_graph_phases}
+        reasons += [
+            f"CUDA graphs for {phase} (pass --disable-{phase}-cuda-graph)"
+            for phase in cfg.cuda_graph_phases
+            if phase not in declared
+        ]
     if caps.architectures is not None:
         reasons += [
             f"model architecture {arch} (serves: {', '.join(caps.architectures)})"

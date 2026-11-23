@@ -1,7 +1,8 @@
 """A dense Llama-family decoder (Llama, Qwen2, Qwen3) in plain PyTorch.
 
-Eager and unfused on purpose: it shares no kernel with SGLang's models, so a
-match against SGLang's own runner checks the plugin contract, not shared code.
+Unfused on purpose: it shares no kernel with SGLang's models, so a match against
+SGLang's own runner checks the plugin contract, not shared code. Each layer is
+split at attention, so decode graphs (``graphs.py``) can capture the rest.
 K and V live in one paged tensor per layer, indexed by SGLang's physical slots.
 """
 
@@ -136,40 +137,58 @@ class DenseDecoder:
 
     def hidden_states(self, step: Step) -> torch.Tensor:
         """[T, hidden_size] final-norm hidden states of the step's input rows."""
+        x = self.embed(step.input_ids)
+        cos, sin = self.rope(step.positions)
+        spans = request_spans(step)
+        for layer in range(self.config.num_layers):
+            q = self.pre_attention(
+                x, layer=layer, cos=cos, sin=sin, write_slots=step.kv.write_slots
+            )
+            attn = self.attention(q, layer=layer, step=step, spans=spans)
+            x = self.post_attention(x, attn, layer=layer)
+        return self.final_norm(x)
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.w["model.embed_tokens.weight"][input_ids]
+
+    def final_norm(self, x: torch.Tensor) -> torch.Tensor:
+        return _rms_norm(x, self.w["model.norm.weight"], self.config.rms_norm_eps)
+
+    def pre_attention(
+        self,
+        x: torch.Tensor,
+        *,
+        layer: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        write_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Writes the layer's K and V of every row to its slot; returns Q."""
         c = self.config
-        x = self.w["model.embed_tokens.weight"][step.input_ids]
-        cos, sin = self._rope(step.positions)
-        spans = _request_spans(step)
-        for layer in range(c.num_layers):
-            p = f"model.layers.{layer}."
-            h = _rms_norm(x, self.w[p + "input_layernorm.weight"], c.rms_norm_eps)
-            q = self._linear(h, p + "self_attn.q_proj").view(
-                -1, c.num_heads, c.head_dim
-            )
-            k = self._linear(h, p + "self_attn.k_proj").view(
-                -1, c.num_kv_heads, c.head_dim
-            )
-            v = self._linear(h, p + "self_attn.v_proj").view(
-                -1, c.num_kv_heads, c.head_dim
-            )
-            if p + "self_attn.q_norm.weight" in self.w:
-                q = _rms_norm(q, self.w[p + "self_attn.q_norm.weight"], c.rms_norm_eps)
-                k = _rms_norm(k, self.w[p + "self_attn.k_norm.weight"], c.rms_norm_eps)
-            q = _apply_rope(q, cos, sin)
-            k = _apply_rope(k, cos, sin)
-            self.kv.k[layer, step.kv.write_slots] = k
-            self.kv.v[layer, step.kv.write_slots] = v
-            attn = self._attention(q, layer=layer, step=step, spans=spans)
-            x = x + self._linear(
-                attn.reshape(attn.shape[0], -1), p + "self_attn.o_proj"
-            )
-            h = _rms_norm(
-                x, self.w[p + "post_attention_layernorm.weight"], c.rms_norm_eps
-            )
-            gate = self._linear(h, p + "mlp.gate_proj")
-            up = self._linear(h, p + "mlp.up_proj")
-            x = x + self._linear(F.silu(gate) * up, p + "mlp.down_proj")
-        return _rms_norm(x, self.w["model.norm.weight"], c.rms_norm_eps)
+        p = f"model.layers.{layer}."
+        h = _rms_norm(x, self.w[p + "input_layernorm.weight"], c.rms_norm_eps)
+        q = self._linear(h, p + "self_attn.q_proj").view(-1, c.num_heads, c.head_dim)
+        k = self._linear(h, p + "self_attn.k_proj").view(-1, c.num_kv_heads, c.head_dim)
+        v = self._linear(h, p + "self_attn.v_proj").view(-1, c.num_kv_heads, c.head_dim)
+        if p + "self_attn.q_norm.weight" in self.w:
+            q = _rms_norm(q, self.w[p + "self_attn.q_norm.weight"], c.rms_norm_eps)
+            k = _rms_norm(k, self.w[p + "self_attn.k_norm.weight"], c.rms_norm_eps)
+        q = _apply_rope(q, cos, sin)
+        k = _apply_rope(k, cos, sin)
+        self.kv.k[layer, write_slots] = k
+        self.kv.v[layer, write_slots] = v
+        return q
+
+    def post_attention(
+        self, x: torch.Tensor, attn: torch.Tensor, *, layer: int
+    ) -> torch.Tensor:
+        c = self.config
+        p = f"model.layers.{layer}."
+        x = x + self._linear(attn.reshape(attn.shape[0], -1), p + "self_attn.o_proj")
+        h = _rms_norm(x, self.w[p + "post_attention_layernorm.weight"], c.rms_norm_eps)
+        gate = self._linear(h, p + "mlp.gate_proj")
+        up = self._linear(h, p + "mlp.up_proj")
+        return x + self._linear(F.silu(gate) * up, p + "mlp.down_proj")
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """FP32 full-vocabulary logits."""
@@ -178,13 +197,13 @@ class DenseDecoder:
     def _linear(self, x: torch.Tensor, name: str) -> torch.Tensor:
         return F.linear(x, self.w[name + ".weight"], self.w.get(name + ".bias"))
 
-    def _rope(self, positions: torch.Tensor):
+    def rope(self, positions: torch.Tensor):
         """FP32 cos and sin, [T, 1, head_dim]."""
         freqs = positions.float()[:, None] * self._inv_freq[None, :]
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[:, None, :], emb.sin()[:, None, :]
 
-    def _attention(self, q: torch.Tensor, *, layer: int, step: Step, spans):
+    def attention(self, q: torch.Tensor, *, layer: int, step: Step, spans):
         """Causal attention of each request's query rows over its KV in the pool."""
         c = self.config
         out = torch.empty_like(q)
@@ -207,7 +226,7 @@ class DenseDecoder:
         return out
 
 
-def _request_spans(step: Step) -> list[tuple[int, int, int, int]]:
+def request_spans(step: Step) -> list[tuple[int, int, int, int]]:
     """(first input row, rows, prefix length, sequence length) per request."""
     rows = step.rows
     seq_lens = (

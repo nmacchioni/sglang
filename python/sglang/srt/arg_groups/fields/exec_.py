@@ -285,7 +285,7 @@ class ExecKernel(msgspec.Struct):
     ] = False
     model_runner: A[
         Optional[str],
-        "Select a model runner plugin by name: 'sglang' for the built-in runner, or the name of an installed 'sglang.srt.model_runners' entry point. When unset, SGLang runs its built-in path and enumerates no runner plugins. SGLANG_PLUGINS, when set, must list an external runner's name. A launch configuration or request the runner does not support is refused with every reason listed. An installed runner executes single-GPU eager text (no CUDA graphs, overlap scheduling or speculative decoding) in this release. Experimental feature.",
+        "Select a model runner plugin by name: 'sglang' for the built-in runner, or the name of an installed 'sglang.srt.model_runners' entry point. When unset, SGLang runs its built-in path and enumerates no runner plugins. SGLANG_PLUGINS, when set, must list an external runner's name. A launch configuration or request the runner does not support is refused with every reason listed. An installed runner executes single-GPU text, with overlap scheduling and CUDA graphs when it declares them, and no speculative decoding, in this release. Experimental feature.",
     ] = None
     prefill_attention_backend: A[
         Optional[str],

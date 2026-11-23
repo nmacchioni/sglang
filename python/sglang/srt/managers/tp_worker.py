@@ -656,6 +656,8 @@ class TpModelWorker(BaseTpWorker):
                 execute_seconds=steps.last_execute_seconds if via_steps else None,
                 forward_batch=forward_batch,
                 logits_output=out.logits_output,
+                replayed_graph=out.can_run_graph,
+                graph=steps.last_graph if via_steps else None,
             )
         return out
 
@@ -763,6 +765,11 @@ class TpModelWorker(BaseTpWorker):
                     else self.model_runner.runner_ids.own_plan(batch)
                 ),
                 kv_weight_version_record=out.kv_weight_version_record,
+                step_output_lease=(
+                    None
+                    if self.step_forward is None
+                    else self.step_forward.take_lease()
+                ),
             )
             if (
                 batch is not None

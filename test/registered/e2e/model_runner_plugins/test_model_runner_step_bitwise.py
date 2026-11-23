@@ -1,13 +1,18 @@
-"""The controlled bitwise fixture for --model-runner sglang steps (TP1, eager,
-overlap off): raw logits before sampling are bitwise equal to the direct path's
-at identical batches, row order, positions and KV slots; prompt logprobs, which
-the built-in runner returns natively, are equal too. Each comparison is first
-made direct against direct, to show the configuration repeats. Also reports the
-host time each path spends at the worker boundary."""
+"""The controlled bitwise fixture for --model-runner sglang steps (TP1): raw
+logits before sampling are bitwise equal to the direct path's at identical
+batches, row order, positions and KV slots; prompt logprobs, which the built-in
+runner returns natively, are equal too. Eager with overlap off, CUDA graphs,
+overlap scheduling, and both are compared separately, each with the same
+configuration on both paths, and each first direct against direct, to show the
+configuration repeats. Also reports the host time each path spends at the
+worker boundary."""
 
+import json
 import os
 import statistics
 import tempfile
+import threading
+import time
 import unittest
 
 import requests
@@ -24,16 +29,36 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=600, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=1500, stage="base-b", runner_config="1-gpu-small")
 
 _MODEL = "Qwen/Qwen3-0.6B"
-_EAGER = [
-    "--disable-overlap-schedule",
-    "--disable-decode-cuda-graph",
-    "--disable-prefill-cuda-graph",
-    # Startup autotuning takes minutes on GB300 and changes nothing compared here.
-    "--disable-flashinfer-autotune",
+# Startup autotuning takes minutes on GB300 and changes nothing compared here.
+_COMMON = ["--disable-flashinfer-autotune"]
+_NO_OVERLAP = ["--disable-overlap-schedule"]
+_NO_GRAPHS = ["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"]
+# Small buckets, so the batches below run both replayed and eager: decode of
+# four requests and the four-prompt prefill fall outside them.
+_GRAPHS = [
+    "--cuda-graph-max-bs-decode",
+    "2",
+    "--cuda-graph-max-bs-prefill",
+    "256",
+    "--enable-mixed-chunk",
 ]
+_EAGER = [*_NO_OVERLAP, *_NO_GRAPHS, *_COMMON]
+_CONFIGS = {
+    "eager": _EAGER,
+    "graphs": [*_NO_OVERLAP, *_GRAPHS, *_COMMON],
+    "overlap": [*_NO_GRAPHS, *_COMMON],
+    "overlap_graphs": [*_GRAPHS, *_COMMON],
+}
+_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {"city": {"type": "string"}, "rank": {"type": "integer"}},
+        "required": ["city", "rank"],
+    }
+)
 # Longer than two KV pages (64 tokens on Blackwell backends), so a follow-up
 # reuses whole cached pages.
 _PREAMBLE = "Answer in one short sentence, plainly and without lists. " * 12
@@ -51,12 +76,16 @@ _FOLLOW_UPS = [
 _SIGNATURE = ("input_ids", "positions", "out_cache_loc", "seq_lens", "req_pool_indices")
 
 
-def _generate(input_ids, **extra):
+def _generate(input_ids, *, max_new_tokens=8, sampling=None, **extra):
     response = requests.post(
         DEFAULT_URL_FOR_TEST + "/generate",
         json={
             "input_ids": input_ids,
-            "sampling_params": {"max_new_tokens": 8, "temperature": 0},
+            "sampling_params": {
+                "max_new_tokens": max_new_tokens,
+                "temperature": 0,
+                **(sampling or {}),
+            },
             **extra,
         },
     )
@@ -86,12 +115,44 @@ def _serve(other_args, *, save_logits, workload):
     return result, read_step_trace(trace_dir)
 
 
+def _unique_by_inputs(trace) -> dict:
+    """Steps keyed by their inputs, without keys that repeat in the run: a
+    freed partial page can put another request's token at the same position
+    and slot, over different earlier KV."""
+    by_inputs, repeated = {}, set()
+    for record in trace:
+        if "tensors" not in record:
+            continue
+        key = _inputs_key(record)
+        if key in by_inputs:
+            repeated.add(key)
+        by_inputs[key] = record
+    return {key: r for key, r in by_inputs.items() if key not in repeated}
+
+
+def _inputs_key(record):
+    return tuple(record["tensors"][name].numpy().tobytes() for name in _SIGNATURE) + (
+        record["mode"],
+    )
+
+
+def _assert_bitwise(test, want, got):
+    want_logits, got_logits = want["tensors"]["logits"], got["tensors"]["logits"]
+    test.assertEqual(got_logits.shape, want_logits.shape)
+    test.assertTrue(
+        torch.equal(got_logits, want_logits),
+        f"step {want['index']} ({want['mode']}): logits differ, max abs "
+        f"{(got_logits.float() - want_logits.float()).abs().max().item()}",
+    )
+
+
 class TestModelRunnerStepBitwise(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         tokenizer = AutoTokenizer.from_pretrained(_MODEL)
         cls.prompts = [tokenizer.encode(p) for p in _PROMPTS]
         cls.follow_ups = [tokenizer.encode(p) for p in _FOLLOW_UPS]
+        cls.json_prompt = tokenizer.encode("Give a city and its rank as JSON:")
 
     def _workload(self):
         # Pre-tokenized batches reach the scheduler as one message each, so the
@@ -104,7 +165,66 @@ class TestModelRunnerStepBitwise(CustomTestCase):
             logprob_start_len=0,
             top_logprobs_num=3,
         )
-        return first, second, logprobs
+        # One request at a time: decode batches inside the graph buckets.
+        single = _generate(self.prompts[1], max_new_tokens=12)
+        # A grammar: under overlap its sampling is deferred until the bitmask
+        # of the previous step is ready, so the next replay runs first.
+        grammar = _generate(
+            self.json_prompt,
+            max_new_tokens=64,
+            sampling={"json_schema": _SCHEMA},
+            return_logprob=True,
+        )
+        return first, second, logprobs, single, grammar
+
+    def _check_config(self, name):
+        args = _CONFIGS[name]
+        runs = {
+            run: _serve(run_args, save_logits=True, workload=self._workload)
+            for run, run_args in (
+                ("direct", args),
+                ("direct_again", args),
+                ("steps", [*args, "--model-runner", "sglang"]),
+            )
+        }
+        (direct_out, direct), (again_out, again), (steps_out, steps) = runs.values()
+
+        self.assertEqual({r["path"] for r in direct + again}, {"direct"})
+        self.assertEqual(
+            {(r["path"], r["runner"]) for r in steps}, {("step", "sglang")}
+        )
+        modes = {r["mode"] for r in steps}
+        self.assertTrue({"extend", "decode"} <= modes, modes)
+        self.assertTrue(any(any(r["prefix_lens"] or ()) for r in steps))
+        self.assertTrue(any(r["prompt_logprobs"] for r in steps))
+        json.loads(steps_out[4]["text"])
+        # Step.graph reports exactly what the native forward replayed, and the
+        # two paths make the same graph decision at every step.
+        for r in steps:
+            self.assertEqual(r["step_graph"] is not None, r["replayed_graph"], r)
+        self.assertEqual(
+            [(r["mode"], r["replayed_graph"]) for r in direct],
+            [(r["mode"], r["replayed_graph"]) for r in steps],
+        )
+        if "graphs" in name:
+            replays = {(r["mode"], r["replayed_graph"]) for r in steps}
+            # Replayed and eager-fallback steps in both phases.
+            for mode in ("extend", "decode"):
+                for replayed in (True, False):
+                    self.assertIn((mode, replayed), replays)
+        else:
+            self.assertFalse(any(r["replayed_graph"] for r in steps))
+
+        # Direct against direct first: the fixture repeats bitwise.
+        repeat = self._assert_same_steps(direct, again)
+        self._assert_same_responses(direct_out, again_out)
+        through_steps = self._assert_same_steps(direct, steps)
+        self._assert_same_responses(direct_out, steps_out)
+        print(
+            f"[{name}] bitwise logits: {repeat} steps direct vs direct, "
+            f"{through_steps} steps direct vs steps"
+        )
+        self.assertGreater(through_steps, 0)
 
     def _assert_same_steps(self, expected, actual):
         self.assertEqual(len(actual), len(expected))
@@ -118,48 +238,57 @@ class TestModelRunnerStepBitwise(CustomTestCase):
                 torch.testing.assert_close(
                     got["tensors"][name], want["tensors"][name], rtol=0, atol=0
                 )
-            want_logits, got_logits = (
-                want["tensors"]["logits"],
-                got["tensors"]["logits"],
-            )
-            self.assertEqual(got_logits.shape, want_logits.shape)
-            self.assertTrue(
-                torch.equal(got_logits, want_logits),
-                f"step {want['index']} ({want['mode']}): logits differ, max abs "
-                f"{(got_logits.float() - want_logits.float()).abs().max().item()}",
-            )
+            _assert_bitwise(self, want, got)
         return compared
 
-    def test_step_logits_are_bitwise_equal_to_the_direct_path(self):
-        runs = {
-            name: _serve(args, save_logits=True, workload=self._workload)
-            for name, args in (
-                ("direct", _EAGER),
-                ("direct_again", _EAGER),
-                ("steps", [*_EAGER, "--model-runner", "sglang"]),
-            )
-        }
-        (direct_out, direct), (again_out, again), (steps_out, steps) = runs.values()
+    def test_eager_steps_are_bitwise_equal_to_the_direct_path(self):
+        self._check_config("eager")
 
-        self.assertEqual({r["path"] for r in direct + again}, {"direct"})
-        self.assertEqual(
-            {(r["path"], r["runner"]) for r in steps}, {("step", "sglang")}
-        )
-        modes = {r["mode"] for r in steps}
-        self.assertTrue({"extend", "decode"} <= modes, modes)
-        self.assertTrue(any(any(r["prefix_lens"] or ()) for r in steps))
-        self.assertTrue(any(r["prompt_logprobs"] for r in steps))
+    def test_graph_steps_are_bitwise_equal_to_the_direct_path(self):
+        self._check_config("graphs")
 
-        # Direct against direct first: the fixture repeats bitwise.
-        repeat = self._assert_same_steps(direct, again)
-        self._assert_same_responses(direct_out, again_out)
-        through_steps = self._assert_same_steps(direct, steps)
-        self._assert_same_responses(direct_out, steps_out)
-        print(
-            f"bitwise logits: {repeat} steps direct vs direct, "
-            f"{through_steps} steps direct vs steps"
+    def test_overlap_steps_are_bitwise_equal_to_the_direct_path(self):
+        self._check_config("overlap")
+
+    def test_overlap_graph_steps_are_bitwise_equal_to_the_direct_path(self):
+        self._check_config("overlap_graphs")
+
+    def test_mixed_prefill_and_decode_under_overlap_and_graphs(self):
+        """A prefill arriving while a decode runs makes mixed steps, whose
+        composition depends on timing: steps are matched by their inputs, and
+        every matched step's logits must be bitwise equal."""
+        args = _CONFIGS["overlap_graphs"]
+        _, direct = _serve(args, save_logits=True, workload=self._mixed_workload)
+        _, steps = _serve(
+            [*args, "--model-runner", "sglang"],
+            save_logits=True,
+            workload=self._mixed_workload,
         )
-        self.assertGreater(through_steps, 0)
+        self.assertTrue(any(r["mode"] == "mixed" for r in steps))
+        self.assertTrue(all(r["path"] == "step" for r in steps if r["mode"] == "mixed"))
+        by_inputs = _unique_by_inputs(direct)
+        matched = {"mixed": 0, "other": 0}
+        for key, got in _unique_by_inputs(steps).items():
+            want = by_inputs.get(key)
+            if want is None:
+                continue
+            _assert_bitwise(self, want, got)
+            matched["mixed" if got["mode"] == "mixed" else "other"] += 1
+        print(f"[mixed] bitwise logits on matched steps: {matched}")
+        self.assertGreater(matched["other"], 0)
+
+    def _mixed_workload(self):
+        long = threading.Thread(
+            target=_generate,
+            args=(self.prompts[0],),
+            # Long enough to still decode when the prefills arrive, with graphs.
+            kwargs={"max_new_tokens": 512, "sampling": {"ignore_eos": True}},
+        )
+        long.start()
+        time.sleep(0.5)
+        late = [_generate(p, max_new_tokens=4) for p in self.follow_ups]
+        long.join()
+        return late
 
     def _assert_same_responses(self, expected, actual):
         # Request ids and timings differ per launch; tokens and logprobs must not.
@@ -187,58 +316,79 @@ class TestModelRunnerStepBitwise(CustomTestCase):
             self.assertEqual(want[key], got[key])
 
     def test_step_overhead_at_the_worker_boundary(self):
-        """Host time per forward at TpModelWorker.forward_model, direct vs steps.
+        """Host time per forward at TpModelWorker.forward_model, and the wall
+        time of a decode-heavy workload, direct vs steps, per configuration.
 
-        Reported, not gated: the step path adds building the Step views, plan
-        and the output conversion around the same ModelRunner.forward.
+        Reported, not gated: the step path adds building the Step views, the
+        graph decision, plan, the output conversion and, under overlap, the
+        release bookkeeping around the same ModelRunner.forward. Responses are
+        compared too: without saved logits nothing synchronizes the overlap
+        schedule, so this is the run where consumers truly lag the next replay.
         """
 
         def decode_heavy():
-            for batch in (self.prompts[:1], self.prompts):
-                requests.post(
-                    DEFAULT_URL_FOR_TEST + "/generate",
-                    json={
-                        "input_ids": batch,
-                        "sampling_params": {
-                            "max_new_tokens": 64,
-                            "temperature": 0,
-                            "ignore_eos": True,
-                        },
-                    },
-                ).raise_for_status()
+            outputs = []
+            tic = time.perf_counter()
+            for batch in (self.prompts[:1], self.prompts[:2], self.prompts):
+                outputs.append(
+                    _generate(
+                        batch,
+                        max_new_tokens=64,
+                        sampling={"ignore_eos": True},
+                        return_logprob=True,
+                    )
+                )
+            return outputs, time.perf_counter() - tic
 
-        _, direct = _serve(_EAGER, save_logits=False, workload=decode_heavy)
-        _, steps = _serve(
-            [*_EAGER, "--model-runner", "sglang"],
-            save_logits=False,
-            workload=decode_heavy,
-        )
         report = []
-        for mode in ("extend", "decode"):
-            for batch_size in (1, len(self.prompts)):
-                rows = {
-                    name: [
-                        r
-                        for r in trace[2:]  # skip warmup
-                        if r["mode"] == mode and r["batch_size"] == batch_size
-                    ]
-                    for name, trace in (("direct", direct), ("steps", steps))
-                }
-                if not all(rows.values()):
-                    continue
-                direct_us = statistics.median(r["host_us"] for r in rows["direct"])
-                steps_us = statistics.median(r["host_us"] for r in rows["steps"])
-                outside = statistics.median(
-                    r["host_us"] - r["execute_us"] for r in rows["steps"]
-                )
-                report.append(
-                    f"{mode} bs={batch_size}: direct {direct_us:.0f} us, "
-                    f"steps {steps_us:.0f} us (outside execute {outside:.0f} us), "
-                    f"n={len(rows['direct'])}/{len(rows['steps'])}"
-                )
+        for config in ("eager", "graphs", "overlap_graphs"):
+            args = _CONFIGS[config]
+            (direct_out, direct_s), direct = _serve(
+                args, save_logits=False, workload=decode_heavy
+            )
+            (steps_out, steps_s), steps = _serve(
+                [*args, "--model-runner", "sglang"],
+                save_logits=False,
+                workload=decode_heavy,
+            )
+            self._assert_same_responses(direct_out, steps_out)
+            report.append(
+                f"[{config}] workload wall time: direct {direct_s:.3f} s, "
+                f"steps {steps_s:.3f} s"
+            )
+            report += _host_time_report(direct, steps, batch_sizes=(1, 2, 4))
         print("STEP OVERHEAD (median host time at forward_model)")
         print("\n".join(report))
         self.assertTrue(report)
+
+
+def _host_time_report(direct, steps, *, batch_sizes):
+    report = []
+    for mode in ("extend", "decode"):
+        for batch_size in batch_sizes:
+            rows = {
+                name: [
+                    r
+                    for r in trace[2:]  # skip warmup
+                    if r["mode"] == mode and r["batch_size"] == batch_size
+                ]
+                for name, trace in (("direct", direct), ("steps", steps))
+            }
+            if not all(rows.values()):
+                continue
+            direct_us = statistics.median(r["host_us"] for r in rows["direct"])
+            steps_us = statistics.median(r["host_us"] for r in rows["steps"])
+            outside = statistics.median(
+                r["host_us"] - r["execute_us"] for r in rows["steps"]
+            )
+            replayed = sum(r["replayed_graph"] for r in rows["steps"])
+            report.append(
+                f"  {mode} bs={batch_size}: direct {direct_us:.0f} us, "
+                f"steps {steps_us:.0f} us (outside execute {outside:.0f} us), "
+                f"n={len(rows['direct'])}/{len(rows['steps'])}, "
+                f"replayed {replayed}"
+            )
+    return report
 
 
 if __name__ == "__main__":

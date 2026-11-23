@@ -9,7 +9,7 @@ a few attribute reads and no device work.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -17,6 +17,8 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_runner_plugins.api import (
+    EAGER,
+    GraphChoice,
     KVTables,
     LogitRows,
     OutputSpec,
@@ -41,7 +43,7 @@ _STEP_MODES = {
 
 
 def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
-    """Why ``forward_batch`` cannot run as a block-3 ``Step``; None when it can."""
+    """Why ``forward_batch`` cannot run as a ``Step`` yet; None when it can."""
     if forward_batch.forward_mode not in _STEP_MODES:
         return f"forward mode {forward_batch.forward_mode.name}"
     if forward_batch.capture_hidden_mode != CaptureHiddenMode.NULL:
@@ -66,7 +68,13 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         return "input candidate selectors"
     if forward_batch.global_num_tokens_cpu is not None:
         return "MLP-sync padding"
+    if forward_batch.input_ids_from_graph:
+        return "input ids read inside the decode graph"
     return None
+
+
+def step_mode(forward_batch: ForwardBatch) -> StepMode:
+    return _STEP_MODES[forward_batch.forward_mode]
 
 
 def reads_prompt_logprobs(forward_batch: ForwardBatch) -> bool:
@@ -77,7 +85,13 @@ def reads_prompt_logprobs(forward_batch: ForwardBatch) -> bool:
     )
 
 
-def build_step(*, forward_batch: ForwardBatch, page_table: torch.Tensor) -> Step:
+def build_step(
+    *,
+    forward_batch: ForwardBatch,
+    page_table: torch.Tensor,
+    graph: GraphChoice = EAGER,
+    inputs_ready: Optional[Any] = None,
+) -> Step:
     """The step ``forward_batch`` describes; every tensor is one of its own."""
     mode = _STEP_MODES[forward_batch.forward_mode]
     extend = mode in (StepMode.EXTEND, StepMode.MIXED)
@@ -100,6 +114,8 @@ def build_step(*, forward_batch: ForwardBatch, page_table: torch.Tensor) -> Step
             logit_rows=LogitRows.NONE if mode is StepMode.IDLE else LogitRows.LAST,
             prompt_logprobs=reads_prompt_logprobs(forward_batch),
         ),
+        graph=graph,
+        inputs_ready=inputs_ready,
     )
 
 

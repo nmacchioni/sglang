@@ -62,6 +62,20 @@ class Feature(str, Enum):
 UNGATED_FEATURES = frozenset({Feature.RADIX_CACHE})
 
 
+class GraphPhase(str, Enum):
+    """A phase a runner can replay graphs for; values match ``--cuda-graph-config``."""
+
+    DECODE = "decode"
+    PREFILL = "prefill"
+
+
+class OutputBuffer(str, Enum):
+    """A ``StepOutput`` field whose storage a runner may reuse across steps."""
+
+    LOGITS = "logits"
+    PROMPT_LOGPROBS = "prompt_logprobs"
+
+
 class RefusedCombination(msgspec.Struct, frozen=True, kw_only=True):
     """Features that are each supported but not together.
 
@@ -115,6 +129,13 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     # StepOutput.logprobs carries prompt logprobs computed in execute();
     # otherwise SGLang computes them through project().
     native_prompt_logprobs: bool = False
+    # Phases the runner captures graphs for, when ``cuda_graphs`` is set; a
+    # launch with graphs on for another phase is refused.
+    cuda_graph_phases: tuple[GraphPhase, ...] = (GraphPhase.DECODE, GraphPhase.PREFILL)
+    # Outputs that live in buffers a later step overwrites (graph output
+    # buffers). SGLang keeps no reference to them past ``release``, and releases
+    # each before the next ``execute``; any other output is fresh per step.
+    shared_outputs: tuple[OutputBuffer, ...] = ()
 
     @classmethod
     def all_supported(
@@ -122,11 +143,13 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
         *,
         refused_combinations: tuple[RefusedCombination, ...] = (),
         native_prompt_logprobs: bool = False,
+        shared_outputs: tuple[OutputBuffer, ...] = (),
     ) -> RunnerCapabilities:
         return cls(
             **{f.value: True for f in Feature if f not in UNGATED_FEATURES},
             refused_combinations=refused_combinations,
             native_prompt_logprobs=native_prompt_logprobs,
+            shared_outputs=shared_outputs,
         )
 
     def supports(self, feature: Feature) -> bool:
@@ -232,10 +255,26 @@ class RuntimeConfig(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class GraphBuckets(msgspec.Struct, frozen=True, kw_only=True):
-    """Configured CUDA graph buckets per phase; empty when the phase is eager."""
+    """CUDA graph buckets per phase, ascending; empty when the phase is eager.
+
+    ``decode`` buckets count requests, ``prefill`` buckets count input tokens.
+    SGLang replays a step in the smallest bucket that holds it and runs any
+    larger step eagerly.
+    """
 
     decode: tuple[int, ...] = ()
     prefill: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        for name, buckets in (("decode", self.decode), ("prefill", self.prefill)):
+            if list(buckets) != sorted(set(buckets)) or any(b <= 0 for b in buckets):
+                raise ValueError(
+                    f"GraphBuckets.{name} must be positive and strictly ascending, "
+                    f"got {buckets}"
+                )
+
+    def of(self, phase: GraphPhase) -> tuple[int, ...]:
+        return self.decode if phase is GraphPhase.DECODE else self.prefill
 
 
 class Capacity(msgspec.Struct, frozen=True, kw_only=True):
@@ -315,7 +354,7 @@ class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class StepMode(str, Enum):
-    """What one step runs. Block 3 executes EXTEND, DECODE, MIXED and IDLE."""
+    """What one step runs; EXTEND, DECODE, MIXED and IDLE execute in this version."""
 
     EXTEND = "extend"
     DECODE = "decode"
@@ -338,9 +377,21 @@ class SamplingOwner(str, Enum):
 
 
 class GraphChoice(msgspec.Struct, frozen=True, kw_only=True):
-    """The graph bucket SGLang chose for a step; ``bucket=None`` runs eager."""
+    """The graph SGLang chose for a step: replay ``phase``'s graph of ``bucket``
+    rows (requests for decode, tokens for prefill), or run eager when both are
+    None. Rows past the step's own are padding, whose KV writes go to the
+    reserved slot 0."""
 
+    phase: Optional[GraphPhase] = None
     bucket: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if (self.phase is None) != (self.bucket is None):
+            raise ValueError("GraphChoice names a phase and a bucket, or neither")
+
+    @property
+    def is_eager(self) -> bool:
+        return self.bucket is None
 
 
 EAGER = GraphChoice()
@@ -401,7 +452,13 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
 
     Tensors are views of what SGLang built for the step; a runner must not
     modify them. Fields of later blocks (input embeddings, masks, adapters,
-    multimodal items, speculative and parallel inputs) are not part of block 3.
+    multimodal items, speculative and parallel inputs) are not part of this
+    version.
+
+    With overlap scheduling, ``plan`` runs while the device still executes
+    the previous step: host fields (shapes, ``*_cpu`` copies) are final then,
+    device tensors only once ``inputs_ready`` fires. A decode step's
+    ``input_ids`` are the previous step's samples.
     """
 
     mode: StepMode
@@ -414,8 +471,9 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     outputs: OutputSpec
     sampling_owner: SamplingOwner = SamplingOwner.SGLANG
     graph: GraphChoice = EAGER
-    # Fires on the runner stream once device inputs are written. None: they are
-    # written when plan() is called (overlap scheduling off).
+    # A device event recorded on the runner stream once the device inputs are
+    # written; work on another stream waits on it. None: they were written
+    # before plan() was called (overlap scheduling off).
     inputs_ready: Optional[Any] = None
 
     def __post_init__(self) -> None:
@@ -440,6 +498,17 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
                 f"a {self.mode.value} step has one input row per request, got "
                 f"{num_tokens} rows for {self.rows.batch_size} requests"
             )
+        if self.graph.bucket is not None:
+            rows = (
+                self.rows.batch_size
+                if self.graph.phase is GraphPhase.DECODE
+                else num_tokens
+            )
+            if rows > self.graph.bucket:
+                raise ValueError(
+                    f"a step of {rows} rows cannot replay the "
+                    f"{self.graph.phase.value} graph of {self.graph.bucket}"
+                )
 
 
 class LogitsLayout(str, Enum):
@@ -471,11 +540,28 @@ class PromptLogprobs(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
+    """What one step produced.
+
+    Lifetimes: SGLang reads an output only after ``ready``; it may modify
+    ``logits.tensor`` in place and nothing else; an output listed in
+    ``RunnerCapabilities.shared_outputs`` may be overwritten by a later step
+    only once ``release``'s ``after`` event for this output has fired.
+    """
+
     logits: Optional[Logits] = None
     logprobs: Optional[PromptLogprobs] = None
-    # Fires on the runner stream when the outputs are written. None: they are
-    # ordered on the runner stream before execute() returns.
+    # A device event that fires when the outputs are written; SGLang's runner
+    # stream waits on it before any consumer. None: the outputs are ordered on
+    # the runner stream before execute() returns.
     ready: Optional[Any] = None
+
+    def buffers(self) -> frozenset[OutputBuffer]:
+        held = set()
+        if self.logits is not None:
+            held.add(OutputBuffer.LOGITS)
+        if self.logprobs is not None:
+            held.add(OutputBuffer.PROMPT_LOGPROBS)
+        return frozenset(held)
 
 
 class ProjectRequest(msgspec.Struct, frozen=True, kw_only=True):
@@ -528,7 +614,13 @@ class ModelRunnerLifecycle(ModelRunnerPlugin, Protocol):
 class ModelRunnerExecutor(ModelRunnerLifecycle, Protocol):
     """Execution, after startup. SGLang calls ``plan`` then ``execute`` for every
     step, ``project`` for prompt-logprob rows when the runner computes no native
-    prompt logprobs, and ``release`` once SGLang no longer reads the output.
+    prompt logprobs, and ``release`` once the last consumer of the output
+    (sampling, host copies, grammar) is enqueued. ``execute`` launches device
+    work on the current (runner) stream, or rejoins it before returning, and
+    must not synchronize with the host.
+
+    Outputs are released in the order they were produced, each before the
+    next ``execute`` when it holds a shared output buffer.
     """
 
     def plan(self, step: Step) -> Any: ...
@@ -538,6 +630,8 @@ class ModelRunnerExecutor(ModelRunnerLifecycle, Protocol):
     # [N, vocab_size] logits for the requested rows.
     def project(self, req: ProjectRequest) -> torch.Tensor: ...
 
-    # ``after`` fires when SGLang's last consumer is done; None when they are
-    # all ordered on the runner stream before this call.
+    # ``after`` is a device event that fires when SGLang's last consumer of
+    # ``out`` is done; a runner orders any overwrite of ``out``'s buffers after
+    # it (a stream wait, not a host sync). None: every consumer is complete or
+    # ordered on the runner stream before this call.
     def release(self, out: StepOutput, after: Optional[Any]) -> None: ...
