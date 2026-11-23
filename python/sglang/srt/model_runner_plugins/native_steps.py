@@ -78,17 +78,21 @@ class NativePlan(msgspec.Struct, frozen=True, kw_only=True):
 
 def native_step_refusals(model_runner: ModelRunner) -> list[str]:
     """Why the built-in runner keeps today's path for every step; empty when
-    its TP1 steps run through the API. Fixed for the runner's lifetime."""
+    its steps run through the API. Fixed for the runner's lifetime.
+
+    Tensor parallelism runs through the API: every TP rank lowers the same
+    batch from the same replicated schedule, so each member reaches the same
+    graph decision and SGLang adds no collective to agree on it."""
     reasons = []
     parallel = get_parallel()
-    if (
-        parallel.tp_size > 1
-        or parallel.pp_size > 1
-        or parallel.attn_dp_size > 1
-        or parallel.attn_cp_size > 1
-        or parallel.dcp_size > 1
-    ):
-        reasons.append("model parallelism")
+    if parallel.pp_size > 1:
+        reasons.append("pipeline parallelism")
+    if parallel.attn_dp_size > 1:
+        reasons.append("data-parallel attention")
+    if parallel.attn_cp_size > 1 or parallel.dcp_size > 1:
+        reasons.append("context parallelism")
+    if parallel.moe_ep_size > 1:
+        reasons.append("expert parallelism")
     if not get_schedule().disable_overlap_schedule and is_confidential_compute():
         # Host copies then run on a worker thread, unordered with the streams
         # a release event could be recorded on.

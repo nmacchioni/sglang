@@ -193,6 +193,50 @@ class ResolvedConfig(msgspec.Struct, frozen=True, kw_only=True):
     diffusion_algorithm: Optional[str] = None
 
 
+class RankGroup(msgspec.Struct, frozen=True, kw_only=True):
+    """One process group SGLang built, as this rank sees it.
+
+    ``device`` is the ``torch.distributed`` group for device tensors (NCCL on
+    CUDA), ``cpu`` the one for host tensors (Gloo); both are None when the
+    group has one rank. A runner may run collectives on them only inside the
+    calls SGLang makes on every member of the group in lockstep.
+    """
+
+    rank: int = 0
+    size: int = 1
+    # Global ranks of the members, in group-rank order.
+    ranks: tuple[int, ...] = (0,)
+    device: Optional[Any] = None
+    cpu: Optional[Any] = None
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.rank < self.size or len(self.ranks) != self.size:
+            raise ValueError(
+                f"RankGroup needs 0 <= rank < size == len(ranks), got rank="
+                f"{self.rank}, size={self.size}, ranks={self.ranks}"
+            )
+
+
+SINGLE_RANK = RankGroup()
+
+
+class ParallelLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """The process groups SGLang built for this rank, before ``load``.
+
+    A runner joins no group of its own and adds no collective of its own to a
+    step: every choice that changes a collective (graph bucket, eager
+    fallback, padded width, local mode) arrives decided in the ``Step``.
+    """
+
+    # Every rank of one model replica: SGLang sends each member the same Step.
+    tp: RankGroup = SINGLE_RANK
+    pp: RankGroup = SINGLE_RANK
+    # The attention TP group, a slice of ``tp`` when attention is data parallel.
+    attn_tp: RankGroup = SINGLE_RANK
+    attn_dp_rank: int = 0
+    attn_dp_size: int = 1
+
+
 class LoadContext(msgspec.Struct, frozen=True, kw_only=True):
     """What SGLang hands a runner when it loads, on one rank.
 
@@ -208,6 +252,21 @@ class LoadContext(msgspec.Struct, frozen=True, kw_only=True):
     tp_size: int = 1
     pp_rank: int = 0
     pp_size: int = 1
+    parallel: ParallelLayout = ParallelLayout()
+
+    def __post_init__(self) -> None:
+        tp, pp = self.parallel.tp, self.parallel.pp
+        if (tp.rank, tp.size, pp.rank, pp.size) != (
+            self.tp_rank,
+            self.tp_size,
+            self.pp_rank,
+            self.pp_size,
+        ):
+            raise ValueError(
+                "LoadContext ranks disagree with its parallel layout: "
+                f"tp {self.tp_rank}/{self.tp_size} vs {tp.rank}/{tp.size}, "
+                f"pp {self.pp_rank}/{self.pp_size} vs {pp.rank}/{pp.size}"
+            )
 
 
 class ModelInfo(msgspec.Struct, frozen=True, kw_only=True):
@@ -512,13 +571,19 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class LogitsLayout(str, Enum):
+    # [rows, vocab_size] on every TP rank.
     FULL = "full"
+    # [rows, shard] on each TP rank: rank r holds vocabulary columns
+    # [r * shard, (r + 1) * shard) of a vocabulary padded to tp_size * shard.
+    # SGLang gathers the shards across the TP group, the collective it schedules
+    # on every member in lockstep, and drops the padding.
+    VOCAB_SHARDED = "vocab_sharded"
 
 
 class Logits(msgspec.Struct, frozen=True, kw_only=True):
     """Next-token logits; SGLang may modify ``tensor`` in place."""
 
-    # [rows, vocab_size].
+    # [rows, vocab_size], or [rows, shard] when vocabulary-sharded.
     tensor: torch.Tensor
     layout: LogitsLayout = LogitsLayout.FULL
     # [rows] device: the request each row belongs to; None when row b is request b.
@@ -568,7 +633,9 @@ class ProjectRequest(msgspec.Struct, frozen=True, kw_only=True):
     """Apply the LM head to input rows of an executed step.
 
     SGLang selects and chunks the rows as native prompt logprobs do and calls
-    ``project`` once per chunk, between ``execute`` and ``release``.
+    ``project`` once per chunk, between ``execute`` and ``release``, on every
+    TP rank in lockstep with the same rows, so a runner may gather inside it.
+    ``layout`` is the layout SGLang reads the result in.
     """
 
     # The plan whose step's rows are projected.

@@ -26,6 +26,7 @@ from sglang.srt.model_runner_plugins.api import (
     LoadContext,
     LoadResult,
     Logits,
+    LogitsLayout,
     MemoryNeeds,
     ModelInfo,
     OutputBuffer,
@@ -209,6 +210,37 @@ class TestStepView(CustomTestCase):
         with lowering.bind(step=step, forward_batch=copied):
             with self.assertRaisesRegex(RuntimeError, "does not view"):
                 lowering.forward_batch_of(step)
+
+
+class TestVocabShardedLogits(CustomTestCase):
+    def test_sglang_gathers_shards_and_drops_the_vocabulary_padding(self):
+        """Rank r holds columns [r * shard, (r + 1) * shard) of a vocabulary
+        padded to tp_size * shard; SGLang's gather must return exactly the
+        vocabulary, in order, for every rank."""
+        full = torch.arange(2 * 12, dtype=torch.float32).view(2, 12)
+        shards = [full[:, :6], full[:, 6:]]
+
+        class _Group:
+            world_size = 2
+
+            def all_gather(self, shard, dim):
+                return torch.cat(shards, dim=dim)
+
+        executor = _FakeExecutor()
+        executor.execute = lambda plan: StepOutput(
+            logits=Logits(tensor=shards[1], layout=LogitsLayout.VOCAB_SHARDED)
+        )
+        forward = StepForward(
+            runner_name="fake",
+            executor=executor,
+            page_table=_PAGE_TABLE,
+            vocab_size=_VOCAB,
+            native_prompt_logprobs=False,
+            tp_group=_Group(),
+        )
+        logits = forward.forward(_decode_batch()).logits_output.next_token_logits
+        torch.testing.assert_close(logits, full[:, :_VOCAB])
+        self.assertTrue(logits.is_contiguous())
 
 
 class TestStepSubset(CustomTestCase):
@@ -426,8 +458,8 @@ class TestGraphChoice(CustomTestCase):
 
 class TestExternalRelease(CustomTestCase):
     def test_external_runners_keep_only_features_of_landed_blocks(self):
-        """Whatever an external runner declares, launches outside TP1 text are
-        refused until their block lands; overlap and graphs have landed."""
+        """Whatever an external runner declares, launches outside TP text are
+        refused until their block lands; TP, overlap and graphs have landed."""
         declared = RunnerCapabilities.all_supported()
         external = capabilities_in_this_release(declared, native=False)
         self.assertIs(capabilities_in_this_release(declared, native=True), declared)
@@ -436,6 +468,7 @@ class TestExternalRelease(CustomTestCase):
             ResolvedConfig(
                 model_path="m",
                 tp_size=2,
+                pp_size=2,
                 cuda_graph_phases=("decode",),
                 overlap_schedule=True,
                 advanced_kv=("sliding_window",),
@@ -443,7 +476,10 @@ class TestExternalRelease(CustomTestCase):
             ),
         )
         self.assertEqual(len(reasons), 3, reasons)
-        self.assertFalse(any("graph" in r or "overlap" in r for r in reasons))
+        self.assertFalse(
+            any("graph" in r or "overlap" in r or "tensor" in r for r in reasons)
+        )
+        self.assertTrue(external.tensor_parallel)
         self.assertTrue(external.prompt_logprobs and external.top_logprobs)
         self.assertTrue(external.cuda_graphs and external.overlap_schedule)
         self.assertEqual(launch_refusals(external, ResolvedConfig(model_path="m")), [])
@@ -530,10 +566,12 @@ class _Host:
 
 
 class TestExternalStartup(CustomTestCase):
-    def _run(self, plugin):
-        runner = ExternalRunner(name="fake", plugin=plugin, host=_Host(plugin.calls))
+    def _run(self, plugin, agree_min=lambda slots: slots, page_size=1):
+        runner = ExternalRunner(
+            name="fake", plugin=plugin, host=_Host(plugin.calls), agree_min=agree_min
+        )
         runner.load(LoadContext(model_path="m", device="cuda", gpu_id=0))
-        runner.allocate(RuntimeConfig(page_size=1))
+        runner.allocate(RuntimeConfig(page_size=page_size))
         runner.capture(GraphBuckets())
         return runner, runner.finalize(Capacity())
 
@@ -557,6 +595,22 @@ class TestExternalStartup(CustomTestCase):
         self.assertEqual(runner.layout.num_slots, 4096)
         # Admission limits are SGLang's, from the pools it sized.
         self.assertEqual(final.limits, _LIMITS)
+
+    def test_tp_ranks_size_allocators_to_the_smallest_backing(self):
+        """Each TP rank backs as many slots as its memory allows; SGLang's
+        replicated allocators use the minimum over the group, page aligned."""
+        seen = []
+
+        def agree_min(slots):
+            seen.append(slots)
+            return 3001
+
+        runner, final = self._run(
+            _Plugin(page_size=16), agree_min=agree_min, page_size=16
+        )
+        self.assertEqual(seen, [4096])
+        self.assertEqual(runner.layout.num_slots, 2992)
+        self.assertEqual(final.num_slots, 2992)
 
     def test_a_resize_or_a_foreign_page_size_is_refused(self):
         with self.assertRaisesRegex(ValueError, "keep their allocated size"):

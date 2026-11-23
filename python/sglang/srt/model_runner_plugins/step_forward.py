@@ -57,6 +57,7 @@ class StepForward:
         choose_graph: Optional[Callable[[ForwardBatch], GraphChoice]] = None,
         lowering: Optional[NativeStepLowering] = None,
         direct_fallback: bool = False,
+        tp_group: Optional[Any] = None,
     ):
         self.runner_name = runner_name
         self._executor = executor
@@ -68,6 +69,9 @@ class StepForward:
         self._lowering = lowering
         # Native only: batches outside the Step subset take the direct path.
         self._direct_fallback = direct_fallback
+        self._vocab_size = vocab_size
+        # SGLang's TP GroupCoordinator, when the runner spans several ranks.
+        self._tp_group = tp_group
         self._input_logprobs = InputLogprobProcessor(vocab_size)
         self._lifetimes = OutputLifetimes(
             runner_name=runner_name,
@@ -128,7 +132,7 @@ class StepForward:
         lease = self._lifetimes.produced(out)
         if self._lifetimes.deferred:
             self._lease = lease
-        logits_output = logits_output_from_step(out)
+        logits_output = logits_output_from_step(out, gather_vocab=self._gather_vocab)
         if step.outputs.prompt_logprobs and not self._native_prompt_logprobs:
             self._project_prompt_logprobs(
                 plan=plan, forward_batch=forward_batch, logits_output=logits_output
@@ -152,6 +156,23 @@ class StepForward:
             torch.get_device_module().synchronize()
         self._lease = None
         self._lifetimes.close()
+
+    def _gather_vocab(self, shard: torch.Tensor) -> torch.Tensor:
+        """Full logits from this rank's vocabulary shard: a gather every TP
+        rank runs at the same point of the same step."""
+        if self._tp_group is None or self._tp_group.world_size == 1:
+            full = shard
+        else:
+            full = self._tp_group.all_gather(shard.contiguous(), dim=-1)
+        if full.shape[-1] < self._vocab_size:
+            raise ValueError(
+                f"Model runner {self.runner_name!r} returned vocabulary shards of "
+                f"{shard.shape[-1]} columns, {full.shape[-1]} in all; the "
+                f"vocabulary has {self._vocab_size}"
+            )
+        if full.shape[-1] == self._vocab_size:
+            return full
+        return full[..., : self._vocab_size].contiguous()
 
     def _record_inputs_ready(self, forward_batch: ForwardBatch) -> Optional[Any]:
         if not self._overlap:

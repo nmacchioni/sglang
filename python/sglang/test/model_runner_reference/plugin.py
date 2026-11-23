@@ -1,6 +1,6 @@
 """The reference model runner: an independent, pure-PyTorch plugin that owns its
-weights and KV bytes and serves text through the Step API (TP1), with overlap
-scheduling and decode CUDA graphs.
+weights and KV bytes and serves text through the Step API, tensor parallel over
+SGLang's TP group, with overlap scheduling and decode CUDA graphs.
 
 Its decode graphs write logits into one buffer shared across steps; it declares
 logits a shared output and honors the lifetime contract: a replay waits on the
@@ -26,6 +26,7 @@ from sglang.srt.model_runner_plugins.api import (
     LoadResult,
     LogitRows,
     Logits,
+    LogitsLayout,
     MemoryNeeds,
     ModelInfo,
     OutputBuffer,
@@ -62,7 +63,10 @@ class ReferencePlan(msgspec.Struct, kw_only=True):
 class ReferenceRunner:
     api_version = MODEL_RUNNER_API_VERSION
 
-    def __init__(self):
+    def __init__(self, *, logits_layout: LogitsLayout = LogitsLayout.FULL):
+        # FULL gathers the vocabulary shards inside the runner; VOCAB_SHARDED
+        # returns this rank's shard for SGLang to gather.
+        self._logits_layout = logits_layout
         self._model: Optional[DenseDecoder] = None
         self._layout: Optional[KVLayout] = None
         self._graphs: Optional[DecodeGraphs] = None
@@ -74,6 +78,7 @@ class ReferenceRunner:
 
     def describe(self, cfg: ResolvedConfig) -> RunnerCapabilities:
         return RunnerCapabilities(
+            tensor_parallel=True,
             prompt_logprobs=True,
             top_logprobs=True,
             overlap_schedule=True,
@@ -89,7 +94,10 @@ class ReferenceRunner:
         config = load_config(path)
         before = torch.cuda.memory_allocated(device)
         self._model = DenseDecoder(
-            config=config, weights=load_weights(path, device=device), device=device
+            config=config,
+            weights=load_weights(path, device=device),
+            device=device,
+            tp=ctx.parallel.tp,
         )
         weight_bytes = torch.cuda.memory_allocated(device) - before
         logger.info("Reference runner loaded %s (%d bytes)", path, weight_bytes)
@@ -129,7 +137,11 @@ class ReferenceRunner:
             # SGLang refuses the launch first; prefill runs eager.
             raise ValueError("the reference runner captures decode graphs only")
         if buckets.decode:
-            self._graphs = DecodeGraphs(model=self._model, buckets=buckets.decode)
+            self._graphs = DecodeGraphs(
+                model=self._model,
+                buckets=buckets.decode,
+                sharded=self._logits_layout is LogitsLayout.VOCAB_SHARDED,
+            )
             logger.info("Reference runner captured decode graphs %s", buckets.decode)
 
     def finalize(self, capacity: Capacity) -> KVLayout:
@@ -151,7 +163,11 @@ class ReferenceRunner:
             return StepOutput()
         if step.graph.is_eager:
             plan.hidden = self._model.hidden_states(step)
-            logits = self._model.logits(plan.hidden[last_rows(step)])
+            last = plan.hidden[last_rows(step)]
+            if self._logits_layout is LogitsLayout.VOCAB_SHARDED:
+                logits = self._model.logits_shard(last)
+            else:
+                logits = self._model.logits(last)
         else:
             if self._logits_held:
                 raise RuntimeError(
@@ -164,7 +180,9 @@ class ReferenceRunner:
             self._logits_held = True
         ready = torch.cuda.Event()
         ready.record(stream)
-        return StepOutput(logits=Logits(tensor=logits), ready=ready)
+        return StepOutput(
+            logits=Logits(tensor=logits, layout=self._logits_layout), ready=ready
+        )
 
     def _wait_logits_free(self) -> None:
         if self._logits_free is not None:
@@ -172,6 +190,7 @@ class ReferenceRunner:
 
     @torch.inference_mode()
     def project(self, req: ProjectRequest) -> torch.Tensor:
+        # Every TP rank projects the same rows here, so the gather lines up.
         return self._model.logits(req.plan.hidden[req.rows])
 
     def release(self, out: StepOutput, after: Optional[torch.cuda.Event]) -> None:
