@@ -39,6 +39,9 @@ _LABELS = {
     Feature.TOP_LOGPROBS: "top logprobs",
     Feature.RETURN_HIDDEN_STATES: "returning hidden states",
     Feature.INPUT_EMBEDS: "input embeddings",
+    Feature.UNIFIED_MEMORY: "unified memory",
+    Feature.ADVANCED_KV: "KV beyond plain full attention",
+    Feature.DIFFUSION_LLM: "diffusion LLMs",
     Feature.RADIX_CACHE: "radix cache",
 }
 
@@ -120,6 +123,12 @@ def launch_uses(cfg: ResolvedConfig) -> Uses:
         uses[Feature.HICACHE] = "drop --enable-hierarchical-cache"
     if cfg.memory_saver:
         uses[Feature.MEMORY_SAVER] = "drop --enable-memory-saver"
+    if cfg.unified_memory:
+        uses[Feature.UNIFIED_MEMORY] = "drop --enable-unified-memory"
+    if cfg.advanced_kv:
+        uses[Feature.ADVANCED_KV] = " ".join(cfg.advanced_kv)
+    if cfg.diffusion_algorithm is not None:
+        uses[Feature.DIFFUSION_LLM] = f"dllm_algorithm={cfg.diffusion_algorithm}"
     if cfg.radix_cache:
         uses[Feature.RADIX_CACHE] = "pass --disable-radix-cache"
     return uses
@@ -155,6 +164,12 @@ def request_uses(opts: RequestOptions) -> Uses:
 def launch_refusals(caps: RunnerCapabilities, cfg: ResolvedConfig) -> list[str]:
     uses = launch_uses(cfg)
     reasons = _unsupported(caps, uses)
+    if caps.architectures is not None:
+        reasons += [
+            f"model architecture {arch} (serves: {', '.join(caps.architectures)})"
+            for arch in cfg.architectures
+            if arch not in caps.architectures
+        ]
     reasons += [
         _combination_reason(combo)
         for combo in caps.refused_combinations

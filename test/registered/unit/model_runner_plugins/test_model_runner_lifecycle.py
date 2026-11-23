@@ -6,7 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from transformers import LlamaConfig
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_runner_plugins.api import (
@@ -20,6 +22,7 @@ from sglang.srt.model_runner_plugins.api import (
     MemoryNeeds,
     ModelInfo,
     ModelRunnerLifecycle,
+    RunnerCapabilities,
     RuntimeConfig,
 )
 from sglang.srt.model_runner_plugins.native import SGLangRunnerPlugin
@@ -97,6 +100,22 @@ class _FakePlugin:
 
     def close(self):
         self.calls.append(("close", None))
+
+
+def _model_config():
+    """The ``ModelConfig`` facts the resolved config reads, without a checkpoint."""
+    return SimpleNamespace(
+        hf_config=LlamaConfig(architectures=["LlamaForCausalLM"]),
+        is_multimodal=False,
+        is_generation=True,
+        is_draft_model=False,
+        is_hybrid_swa=False,
+        sliding_window_size=None,
+        attention_chunk_size=None,
+        attention_arch=AttentionArch.MHA,
+        is_encoder_decoder=False,
+        linear_attn_registry_result=None,
+    )
 
 
 def _names(plugin):
@@ -430,24 +449,61 @@ class TestSchedulerWiring(CustomTestCase):
         side_effect=AssertionError("runner plugins enumerated without the flag"),
     )
     def test_omitted_flag_creates_no_lifecycle(self, _entry_points):
-        self.assertIsNone(ModelRunnerStartup.maybe_create(native_host=_FakeHost()))
+        self.assertIsNone(
+            ModelRunnerStartup.maybe_create(
+                native_host=_FakeHost(), model_config=_model_config()
+            )
+        )
 
     def test_native_flag_binds_the_scheduler_phases(self):
         with get_context().override_server_args(model_runner="sglang"):
             host = _FakeHost()
-            startup = ModelRunnerStartup.maybe_create(native_host=host)
+            startup = ModelRunnerStartup.maybe_create(
+                native_host=host, model_config=_model_config()
+            )
         self.assertEqual(startup.runner_name, "sglang")
+        self.assertFalse(startup.is_external)
         startup.run(_INPUTS)
         self.assertEqual(host.calls, list(_HOST_PHASES))
 
-    @patch(
-        "sglang.srt.model_runner_plugins.startup.load_model_runner",
-        return_value=SimpleNamespace(is_native=False),
-    )
-    def test_external_runner_fails_closed_in_the_scheduler(self, _load):
-        with get_context().override_server_args(model_runner="alpha"):
-            with self.assertRaisesRegex(RuntimeError, "not available yet"):
-                ModelRunnerStartup.maybe_create(native_host=_FakeHost())
+    def test_external_runner_needs_the_step_methods(self):
+        class _DescribeOnly:
+            api_version = 1
+
+            def describe(self, cfg):
+                return RunnerCapabilities()
+
+        class _Executor(_FakePlugin):
+            def describe(self, cfg):
+                return RunnerCapabilities()
+
+            def plan(self, step): ...
+
+            def execute(self, plan): ...
+
+            def project(self, req): ...
+
+            def release(self, out, after): ...
+
+        for plugin, external in ((_DescribeOnly(), None), (_Executor(), True)):
+            runner = SimpleNamespace(name="alpha", is_native=False, plugin=plugin)
+            with (
+                patch(
+                    "sglang.srt.model_runner_plugins.startup.load_model_runner",
+                    return_value=runner,
+                ),
+                get_context().override_server_args(model_runner="alpha"),
+            ):
+                if external is None:
+                    with self.assertRaisesRegex(TypeError, "lacks the lifecycle"):
+                        ModelRunnerStartup.maybe_create(
+                            native_host=_FakeHost(), model_config=_model_config()
+                        )
+                    continue
+                startup = ModelRunnerStartup.maybe_create(
+                    native_host=_FakeHost(), model_config=_model_config()
+                )
+            self.assertTrue(startup.is_external)
 
     def test_inputs_carry_the_published_limits(self):
         with (

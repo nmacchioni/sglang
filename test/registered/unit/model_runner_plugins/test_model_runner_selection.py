@@ -9,6 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from transformers import LlamaConfig
+
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.model_runner_plugins.api import MODEL_RUNNERS_GROUP
 from sglang.srt.model_runner_plugins.registry import load_model_runner
@@ -169,9 +172,16 @@ class TestDiscovery(_DistsCase):
 def _model_config(*, multimodal=False, generation=True):
     """The ``ModelConfig`` facts the resolved config reads, without a checkpoint."""
     return SimpleNamespace(
-        hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        hf_config=LlamaConfig(architectures=["LlamaForCausalLM"]),
         is_multimodal=multimodal,
         is_generation=generation,
+        is_draft_model=False,
+        is_hybrid_swa=False,
+        sliding_window_size=None,
+        attention_chunk_size=None,
+        attention_arch=AttentionArch.MHA,
+        is_encoder_decoder=False,
+        linear_attn_registry_result=None,
     )
 
 
@@ -228,15 +238,30 @@ class TestLaunchCheck(_DistsCase):
         ):
             self.assertIn(reason, message)
 
-    def test_external_runner_fails_closed_after_validation(self):
+    def test_external_runner_is_held_to_this_release_whatever_it_declares(self):
         self.dists.plugin(
             "fake-alpha",
             "alpha",
             capabilities="RunnerCapabilities.all_supported()",
         )
 
-        with self.assertRaisesRegex(RuntimeError, "not available yet"):
+        with self.assertRaises(ValueError) as ctx:
             self._launch(model_runner="alpha", tp_size=2)
+        message = str(ctx.exception)
+        self.assertIn("tensor parallelism (tp_size=2)", message)
+        self.assertIn("multimodal inputs", message)
+
+    def test_external_runner_accepts_a_tp1_eager_text_launch(self):
+        self.dists.plugin("fake-alpha", "alpha")
+
+        with get_context().override_server_args(
+            _model_config=_model_config(),
+            model_runner="alpha",
+            disable_overlap_schedule=True,
+            disable_decode_cuda_graph=True,
+            disable_prefill_cuda_graph=True,
+        ):
+            check_model_runner_at_launch()
 
     def test_native_runner_accepts_the_launch(self):
         self._launch(

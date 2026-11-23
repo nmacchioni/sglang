@@ -907,7 +907,9 @@ class Scheduler(
 
     def init_model_runner_startup(self) -> None:
         """Lifecycle of the runner --model-runner selects; None without it."""
-        self.model_runner_startup = ModelRunnerStartup.maybe_create(native_host=self)
+        self.model_runner_startup = ModelRunnerStartup.maybe_create(
+            native_host=self, model_config=self.model_config
+        )
 
     def init_metrics_collector(self) -> None:
         self.metrics_collector_context = SchedulerMetricsCollector.init_new(
@@ -1131,6 +1133,12 @@ class Scheduler(
             from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
             self.tp_worker = MlxTpModelWorker(**worker_kwargs)
+        elif (
+            self.model_runner_startup is not None
+            and self.model_runner_startup.is_external
+        ):
+            # An external --model-runner owns the model; SGLang's worker has none.
+            self.tp_worker = self.model_runner_startup.create_tp_worker(**worker_kwargs)
         else:
             from sglang.srt.managers.tp_worker import TpModelWorker
 
@@ -1324,6 +1332,7 @@ class Scheduler(
         else:
             # The same phases, through the lifecycle of the --model-runner plugin.
             self.model_runner_startup.run(StartupInputs.from_published())
+            self.init_model_runner_steps()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none() or self.draft_worker is None:
@@ -1417,6 +1426,12 @@ class Scheduler(
         self.random_seed = self.tp_worker.random_seed
         self.device = self.tp_worker.device
         self.forward_stream = self.tp_worker.model_runner.forward_stream
+
+    def init_model_runner_steps(self) -> None:
+        """Route the target worker's forwards through the --model-runner steps."""
+        self.tp_worker.set_step_forward(
+            self.model_runner_startup.step_forward(tp_worker=self.tp_worker)
+        )
 
     def close_model_runner(self) -> None:
         """Close the --model-runner plugin on graceful shutdown; no-op without it."""

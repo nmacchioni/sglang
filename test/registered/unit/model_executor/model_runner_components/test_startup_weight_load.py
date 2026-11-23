@@ -8,6 +8,7 @@ from unittest.mock import Mock, call, patch
 
 import torch
 from torch import nn
+from transformers import LlamaConfig
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -21,7 +22,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.configs.model_config import AttentionArch, ModelImpl
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
@@ -723,9 +724,20 @@ _STARTUP_INPUTS = StartupInputs(
 
 
 class _SchedulerWorker:
-    # What --model-runner sglang reads for its typed results.
+    # What --model-runner sglang reads for its typed results and launch facts.
     model_config = SimpleNamespace(
-        context_len=2048, vocab_size=32000, is_generation=True
+        context_len=2048,
+        vocab_size=32000,
+        is_generation=True,
+        is_multimodal=False,
+        hf_config=LlamaConfig(architectures=["LlamaForCausalLM"]),
+        is_draft_model=False,
+        is_hybrid_swa=False,
+        sliding_window_size=None,
+        attention_chunk_size=None,
+        attention_arch=AttentionArch.MHA,
+        is_encoder_decoder=False,
+        linear_attn_registry_result=None,
     )
     preloaded_weights_bytes = 0
 
@@ -735,6 +747,12 @@ class _SchedulerWorker:
             device="cuda",
             forward_stream=object(),
             weight_load_mem_usage=1.0,
+            # Overlap is on in these launches, so the steps keep the direct path.
+            decode_cuda_graph_runner=None,
+            prefill_cuda_graph_runner=None,
+            is_generation=True,
+            is_multimodal=False,
+            is_draft_worker=False,
             prewarm_sampling=lambda: trace.append("prewarm"),
             token_to_kv_pool=SimpleNamespace(
                 post_capture_active=post_capture_active, page_size=1, size=4096
@@ -747,6 +765,9 @@ class _SchedulerWorker:
 
     def start_startup_weight_load(self):
         self._trace.append("start")
+
+    def set_step_forward(self, step_forward):
+        self.step_forward = step_forward
 
     def get_worker_info(self):
         return (4096, 16384, 64, None, 2047, 2042, 0, "cuda", None, 65, 2048, 4096)
@@ -827,7 +848,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             model_runner=model_runner,
         )
         scheduler.model_runner_startup = ModelRunnerStartup.maybe_create(
-            native_host=scheduler
+            native_host=scheduler, model_config=worker.model_config
         )
         schedule_stream = object()
         expected_stream = (

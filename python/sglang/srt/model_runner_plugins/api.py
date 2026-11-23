@@ -1,4 +1,4 @@
-"""Public contract for model runner plugins (API version 1, selection subset).
+"""Public contract for model runner plugins (API version 1).
 
 A package registers a zero-argument factory in the ``sglang.srt.model_runners``
 entry point group; ``--model-runner NAME`` selects it. The factory returns an
@@ -11,9 +11,12 @@ device or model import.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Optional, Protocol, Sequence, runtime_checkable
 
 import msgspec
+
+if TYPE_CHECKING:
+    import torch
 
 MODEL_RUNNER_API_VERSION = 1
 MODEL_RUNNERS_GROUP = "sglang.srt.model_runners"
@@ -48,6 +51,11 @@ class Feature(str, Enum):
     TOP_LOGPROBS = "top_logprobs"
     RETURN_HIDDEN_STATES = "return_hidden_states"
     INPUT_EMBEDS = "input_embeds"
+    UNIFIED_MEMORY = "unified_memory"
+    # KV beyond plain full attention: sliding window, MLA, recurrent state,
+    # encoder-decoder caches.
+    ADVANCED_KV = "advanced_kv"
+    DIFFUSION_LLM = "diffusion_llm"
     RADIX_CACHE = "radix_cache"
 
 
@@ -97,15 +105,28 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     top_logprobs: bool = False
     return_hidden_states: bool = False
     input_embeds: bool = False
+    unified_memory: bool = False
+    advanced_kv: bool = False
+    diffusion_llm: bool = False
     refused_combinations: tuple[RefusedCombination, ...] = ()
+    # Model architectures served (as in the HF config); None places no limit
+    # beyond the features above, which already gate model-dependent KV.
+    architectures: Optional[tuple[str, ...]] = None
+    # StepOutput.logprobs carries prompt logprobs computed in execute();
+    # otherwise SGLang computes them through project().
+    native_prompt_logprobs: bool = False
 
     @classmethod
     def all_supported(
-        cls, *, refused_combinations: tuple[RefusedCombination, ...] = ()
+        cls,
+        *,
+        refused_combinations: tuple[RefusedCombination, ...] = (),
+        native_prompt_logprobs: bool = False,
     ) -> RunnerCapabilities:
         return cls(
             **{f.value: True for f in Feature if f not in UNGATED_FEATURES},
             refused_combinations=refused_combinations,
+            native_prompt_logprobs=native_prompt_logprobs,
         )
 
     def supports(self, feature: Feature) -> bool:
@@ -142,6 +163,11 @@ class ResolvedConfig(msgspec.Struct, frozen=True, kw_only=True):
     hicache: bool = False
     memory_saver: bool = False
     radix_cache: bool = False
+    unified_memory: bool = False
+    # KV kinds beyond full attention the model needs ("sliding_window", "mla",
+    # "recurrent_state", "encoder_decoder"); empty for a plain dense model.
+    advanced_kv: tuple[str, ...] = ()
+    diffusion_algorithm: Optional[str] = None
 
 
 class LoadContext(msgspec.Struct, frozen=True, kw_only=True):
@@ -261,7 +287,9 @@ class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
     """The bytes backing SGLang's KV slots on one rank.
 
     SGLang allocates every page and slot ID and translates logical IDs to
-    physical slots; the runner owns the bytes. This version describes
+    physical slots; the runner owns the bytes. The backing serves physical
+    slots ``[0, num_slots + page_size)``: SGLang hands out ``num_slots`` of
+    them and keeps the first page for padded rows. This version describes
     full-attention layers only; a runner whose KV is not plain full attention
     reports no layers. Addresses stay fixed for an ``epoch``: ``finalize`` may
     change ``num_slots`` but never moves a layer.
@@ -284,6 +312,184 @@ class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
         layer_ids = [layer.layer_id for layer in self.full_attention]
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError(f"KVLayout lists a layer twice: {layer_ids}")
+
+
+class StepMode(str, Enum):
+    """What one step runs. Block 3 executes EXTEND, DECODE, MIXED and IDLE."""
+
+    EXTEND = "extend"
+    DECODE = "decode"
+    # Extend rows and decode rows in one batch, laid out as an extend.
+    MIXED = "mixed"
+    IDLE = "idle"
+    VERIFY = "verify"
+    DRAFT = "draft"
+    DRAFT_EXTEND = "draft_extend"
+
+
+EXECUTABLE_STEP_MODES = frozenset(
+    {StepMode.EXTEND, StepMode.DECODE, StepMode.MIXED, StepMode.IDLE}
+)
+
+
+class SamplingOwner(str, Enum):
+    SGLANG = "sglang"
+    PLUGIN = "plugin"
+
+
+class GraphChoice(msgspec.Struct, frozen=True, kw_only=True):
+    """The graph bucket SGLang chose for a step; ``bucket=None`` runs eager."""
+
+    bucket: Optional[int] = None
+
+
+EAGER = GraphChoice()
+
+
+class Rows(msgspec.Struct, frozen=True, kw_only=True):
+    """Which requests a step serves and where their input rows are.
+
+    Request ``b`` owns input rows ``[query_start[b], query_start[b] +
+    query_lens[b])`` and continues a sequence whose first ``prefix_lens[b]``
+    positions are already in KV. Decode and idle steps leave the ``query_*``
+    and ``prefix_*`` fields None: request ``b`` then owns input row ``b``.
+    """
+
+    # [B] device: request b's row of ``KVTables.page_table``.
+    req_pool_indices: torch.Tensor
+    # [B] device: request b's KV length once this step has written it.
+    seq_lens: torch.Tensor
+    # [B] host copy of seq_lens, when SGLang has one.
+    seq_lens_cpu: Optional[torch.Tensor] = None
+    query_start: Optional[torch.Tensor] = None
+    query_lens: Optional[torch.Tensor] = None
+    prefix_lens: Optional[torch.Tensor] = None
+    query_lens_cpu: Optional[Sequence[int]] = None
+    prefix_lens_cpu: Optional[Sequence[int]] = None
+
+    @property
+    def batch_size(self) -> int:
+        return self.req_pool_indices.shape[0]
+
+
+class KVTables(msgspec.Struct, frozen=True, kw_only=True):
+    """Physical KV slots, as SGLang allocated and translated them."""
+
+    # [T] device: the slot input row t writes its K and V to.
+    write_slots: torch.Tensor
+    # [R, max_context] device, persistent across steps: page_table[r, p] is the
+    # slot holding position p of the request in row r. SGLang owns and writes it.
+    page_table: torch.Tensor
+
+
+class LogitRows(str, Enum):
+    # One row per request, for its last input row; request b is row b.
+    LAST = "last"
+    # No logits (idle steps).
+    NONE = "none"
+
+
+class OutputSpec(msgspec.Struct, frozen=True, kw_only=True):
+    logit_rows: LogitRows = LogitRows.LAST
+    # Some request reads prompt logprobs this step: from StepOutput.logprobs
+    # when the runner declares native_prompt_logprobs, else through project().
+    prompt_logprobs: bool = False
+
+
+class Step(msgspec.Struct, frozen=True, kw_only=True):
+    """One forward step, as SGLang scheduled it.
+
+    Tensors are views of what SGLang built for the step; a runner must not
+    modify them. Fields of later blocks (input embeddings, masks, adapters,
+    multimodal items, speculative and parallel inputs) are not part of block 3.
+    """
+
+    mode: StepMode
+    # [T] device token ids; T = 0 for an idle step.
+    input_ids: torch.Tensor
+    # [T] device positions.
+    positions: torch.Tensor
+    rows: Rows
+    kv: KVTables
+    outputs: OutputSpec
+    sampling_owner: SamplingOwner = SamplingOwner.SGLANG
+    graph: GraphChoice = EAGER
+    # Fires on the runner stream once device inputs are written. None: they are
+    # written when plan() is called (overlap scheduling off).
+    inputs_ready: Optional[Any] = None
+
+    def __post_init__(self) -> None:
+        num_tokens = self.input_ids.shape[0]
+        if self.positions.shape[-1] != num_tokens:
+            raise ValueError(
+                f"Step has {num_tokens} input ids but "
+                f"{self.positions.shape[-1]} positions"
+            )
+        if self.kv.write_slots.shape[0] != num_tokens:
+            raise ValueError(
+                f"Step has {num_tokens} input ids but "
+                f"{self.kv.write_slots.shape[0]} KV write slots"
+            )
+        has_queries = self.rows.query_start is not None
+        if self.mode in (StepMode.EXTEND, StepMode.MIXED) and not has_queries:
+            raise ValueError(f"a {self.mode.value} step needs query offsets")
+        if self.mode in (StepMode.DECODE, StepMode.IDLE) and (
+            has_queries or num_tokens != self.rows.batch_size
+        ):
+            raise ValueError(
+                f"a {self.mode.value} step has one input row per request, got "
+                f"{num_tokens} rows for {self.rows.batch_size} requests"
+            )
+
+
+class LogitsLayout(str, Enum):
+    FULL = "full"
+
+
+class Logits(msgspec.Struct, frozen=True, kw_only=True):
+    """Next-token logits; SGLang may modify ``tensor`` in place."""
+
+    # [rows, vocab_size].
+    tensor: torch.Tensor
+    layout: LogitsLayout = LogitsLayout.FULL
+    # [rows] device: the request each row belongs to; None when row b is request b.
+    row_requests: Optional[torch.Tensor] = None
+
+
+class PromptLogprobs(msgspec.Struct, frozen=True, kw_only=True):
+    """Prompt logprobs computed by the runner, in SGLang's input-logprob layout
+    (``LogitsProcessorOutput.input_*``)."""
+
+    token_logprobs: torch.Tensor
+    top_logprobs_val: Optional[list] = None
+    top_logprobs_idx: Optional[list] = None
+    top_logprobs_weights: Optional[list] = None
+    token_ids_logprobs_val: Optional[list] = None
+    token_ids_logprobs_idx: Optional[list] = None
+    # Fires when host copies of the lists above are complete.
+    copy_done: Optional[Any] = None
+
+
+class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
+    logits: Optional[Logits] = None
+    logprobs: Optional[PromptLogprobs] = None
+    # Fires on the runner stream when the outputs are written. None: they are
+    # ordered on the runner stream before execute() returns.
+    ready: Optional[Any] = None
+
+
+class ProjectRequest(msgspec.Struct, frozen=True, kw_only=True):
+    """Apply the LM head to input rows of an executed step.
+
+    SGLang selects and chunks the rows as native prompt logprobs do and calls
+    ``project`` once per chunk, between ``execute`` and ``release``.
+    """
+
+    # The plan whose step's rows are projected.
+    plan: Any
+    # [N] int64 device: input rows of that step.
+    rows: torch.Tensor
+    layout: LogitsLayout = LogitsLayout.FULL
 
 
 @runtime_checkable
@@ -316,3 +522,22 @@ class ModelRunnerLifecycle(ModelRunnerPlugin, Protocol):
     def finalize(self, capacity: Capacity) -> KVLayout: ...
 
     def close(self) -> None: ...
+
+
+@runtime_checkable
+class ModelRunnerExecutor(ModelRunnerLifecycle, Protocol):
+    """Execution, after startup. SGLang calls ``plan`` then ``execute`` for every
+    step, ``project`` for prompt-logprob rows when the runner computes no native
+    prompt logprobs, and ``release`` once SGLang no longer reads the output.
+    """
+
+    def plan(self, step: Step) -> Any: ...
+
+    def execute(self, plan: Any) -> StepOutput: ...
+
+    # [N, vocab_size] logits for the requested rows.
+    def project(self, req: ProjectRequest) -> torch.Tensor: ...
+
+    # ``after`` fires when SGLang's last consumer is done; None when they are
+    # all ordered on the runner stream before this call.
+    def release(self, out: StepOutput, after: Optional[Any]) -> None: ...

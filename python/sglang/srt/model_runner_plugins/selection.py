@@ -4,8 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+import msgspec
+
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
-from sglang.srt.model_runner_plugins.api import ResolvedConfig, RunnerCapabilities
+from sglang.srt.model_runner_plugins.api import (
+    UNGATED_FEATURES,
+    Feature,
+    ResolvedConfig,
+    RunnerCapabilities,
+)
 from sglang.srt.model_runner_plugins.refusal import (
     RequestOptions,
     Uses,
@@ -46,18 +53,29 @@ def check_model_runner_at_launch() -> None:
         return
     runner = load_model_runner(name)
     cfg = resolved_config(process_model_config())
-    reasons = launch_refusals(_describe(runner, cfg), cfg)
+    reasons = launch_refusals(describe_runner(runner, cfg), cfg)
     if reasons:
         raise ValueError(refusal_message(name, reasons))
-    if not runner.is_native:
-        raise RuntimeError(external_runner_unavailable_message(name))
 
 
-def external_runner_unavailable_message(name: str) -> str:
-    return (
-        f"--model-runner {name}: execution through external model runners is "
-        "not available yet in this SGLang release. Omit --model-runner or "
-        "pass --model-runner sglang."
+# What an external runner can execute in this release, whatever it declares:
+# TP1 eager text with overlap scheduling off and SGLang sampling. Features of
+# later blocks stay refused until SGLang can drive them through the API.
+_EXTERNAL_FEATURES = frozenset({Feature.PROMPT_LOGPROBS, Feature.TOP_LOGPROBS})
+
+
+def capabilities_in_this_release(
+    capabilities: RunnerCapabilities, *, native: bool
+) -> RunnerCapabilities:
+    if native:
+        return capabilities
+    return msgspec.structs.replace(
+        capabilities,
+        **{
+            f.value: False
+            for f in Feature
+            if f not in UNGATED_FEATURES and f not in _EXTERNAL_FEATURES
+        },
     )
 
 
@@ -87,7 +105,31 @@ def resolved_config(model_config: ModelConfig) -> ResolvedConfig:
         hicache=get_memory().enable_hierarchical_cache,
         memory_saver=get_exec().features.enable_memory_saver,
         radix_cache=not get_memory().disable_radix_cache,
+        unified_memory=get_memory().enable_unified_memory,
+        advanced_kv=advanced_kv_kinds(model_config),
+        diffusion_algorithm=get_exec().dllm.dllm_algorithm,
     )
+
+
+def advanced_kv_kinds(model_config: ModelConfig) -> tuple[str, ...]:
+    """The KV kinds beyond plain full attention that the model needs."""
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+    from sglang.srt.configs.model_config import AttentionArch
+
+    kinds = []
+    if (
+        model_config.is_hybrid_swa
+        or model_config.sliding_window_size is not None
+        or model_config.attention_chunk_size is not None
+    ):
+        kinds.append("sliding_window")
+    if model_config.attention_arch == AttentionArch.MLA:
+        kinds.append("mla")
+    if mambaish_config(model_config) is not None:
+        kinds.append("recurrent_state")
+    if model_config.is_encoder_decoder:
+        kinds.append("encoder_decoder")
+    return tuple(kinds)
 
 
 class ModelRunnerAdmission:
@@ -111,7 +153,7 @@ class ModelRunnerAdmission:
         cfg = resolved_config(model_config)
         return cls(
             runner_name=name,
-            capabilities=_describe(load_model_runner(name), cfg),
+            capabilities=describe_runner(load_model_runner(name), cfg),
             launch=launch_uses(cfg),
         )
 
@@ -126,11 +168,14 @@ class ModelRunnerAdmission:
         return refusal_message(self._runner_name, reasons) if reasons else None
 
 
-def _describe(runner: LoadedModelRunner, cfg: ResolvedConfig) -> RunnerCapabilities:
+def describe_runner(
+    runner: LoadedModelRunner, cfg: ResolvedConfig
+) -> RunnerCapabilities:
+    """The runner's declared capabilities, narrowed to what this release can drive."""
     capabilities = runner.plugin.describe(cfg)
     if not isinstance(capabilities, RunnerCapabilities):
         raise TypeError(
             f"Model runner {runner.name!r} describe() returned "
             f"{type(capabilities).__name__}; expected RunnerCapabilities."
         )
-    return capabilities
+    return capabilities_in_this_release(capabilities, native=runner.is_native)
