@@ -50,11 +50,15 @@ def check_model_runner_at_launch() -> None:
     if reasons:
         raise ValueError(refusal_message(name, reasons))
     if not runner.is_native:
-        raise RuntimeError(
-            f"--model-runner {name}: execution through external model runners is "
-            "not available yet in this SGLang release. Omit --model-runner or "
-            "pass --model-runner sglang."
-        )
+        raise RuntimeError(external_runner_unavailable_message(name))
+
+
+def external_runner_unavailable_message(name: str) -> str:
+    return (
+        f"--model-runner {name}: execution through external model runners is "
+        "not available yet in this SGLang release. Omit --model-runner or "
+        "pass --model-runner sglang."
+    )
 
 
 def resolved_config(model_config: ModelConfig) -> ResolvedConfig:
