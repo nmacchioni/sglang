@@ -1,8 +1,10 @@
 """Model runner steps: Step as a view of the step's ForwardBatch, its checks,
 which batches take the API, prompt logprobs through project(), output
-lifetimes (release order and shared buffers), graph bucket choice, and what
-this release lets an external runner run."""
+lifetimes (release order and shared buffers), graph bucket choice, the
+rendezvous check under DP attention, pipeline stage outputs, vocabulary-sharded
+logits, and what this release lets an external runner run."""
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 
@@ -13,7 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_runner_plugins.api import (
     AdmissionLimits,
@@ -25,6 +27,7 @@ from sglang.srt.model_runner_plugins.api import (
     KVTables,
     LoadContext,
     LoadResult,
+    LogitRows,
     Logits,
     LogitsLayout,
     MemoryNeeds,
@@ -32,6 +35,7 @@ from sglang.srt.model_runner_plugins.api import (
     OutputBuffer,
     OutputSpec,
     PromptLogprobs,
+    RendezvousMismatch,
     ResolvedConfig,
     Rows,
     RunnerCapabilities,
@@ -212,6 +216,90 @@ class TestStepView(CustomTestCase):
                 lowering.forward_batch_of(step)
 
 
+def _dp_decode_batch(*, published, votes=(True, False)):
+    """The decode batch on DP rank 1 of two, after the MLP-sync gather."""
+    batch = _decode_batch()
+    batch.global_num_tokens_cpu = list(published)
+    batch.original_global_num_tokens_cpu = list(published)
+    batch.global_num_tokens_for_logprob_cpu = list(published)
+    batch.can_run_decode_cuda_graph, batch.can_run_dp_prefill_cuda_graph = votes
+    return batch
+
+
+class TestRendezvous(CustomTestCase):
+    """Under DP attention a rank's peers size the step's collectives from what
+    the rank published at the MLP-sync gather; a step that disagrees with it
+    must be refused before any collective, on the rank that diverged."""
+
+    def _step(self, batch, graph=GraphChoice()):
+        from unittest.mock import patch
+
+        with patch("sglang.srt.layers.dp_attention.dp_gather_width", lambda: 2):
+            with patch("sglang.srt.layers.dp_attention.dp_gather_slot", lambda: 1):
+                return build_step(
+                    forward_batch=batch, page_table=_PAGE_TABLE, graph=graph
+                )
+
+    def test_step_carries_the_gathered_decisions(self):
+        decode_graph = GraphChoice(phase=GraphPhase.DECODE, bucket=4)
+        step = self._step(_dp_decode_batch(published=[3, 2]), decode_graph)
+        self.assertEqual(step.dp.rank, 1)
+        self.assertEqual(step.dp.global_num_tokens, (3, 2))
+        self.assertTrue(step.dp.decode_graph)
+        self.assertFalse(step.dp.prefill_graph)
+        # An idle peer, and no rendezvous at all, are fine too.
+        self._step(_dp_decode_batch(published=[0, 2]))
+        self.assertIsNone(self._step(_decode_batch()).dp)
+
+    def test_a_step_unlike_its_published_rows_or_votes_is_refused(self):
+        for batch, graph, error in (
+            (_dp_decode_batch(published=[2, 3]), GraphChoice(), "published 3"),
+            (
+                _dp_decode_batch(published=[3, 2], votes=(False, False)),
+                GraphChoice(phase=GraphPhase.DECODE, bucket=4),
+                "voted the step eager",
+            ),
+            (
+                _dp_decode_batch(published=[3, 2]),
+                GraphChoice(phase=GraphPhase.DECODE, bucket=2),
+                "below the largest rank's 3",
+            ),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaisesRegex(RendezvousMismatch, error):
+                    self._step(batch, graph)
+
+
+class TestPipelineStages(CustomTestCase):
+    def _forward(self, out, *, pp_in=None):
+        executor = _FakeExecutor()
+        steps = []
+        executor.plan = lambda step: steps.append(step) or SimpleNamespace(step=step)
+        executor.execute = lambda plan: out
+        forward = StepForward(
+            runner_name="fake",
+            executor=executor,
+            page_table=_PAGE_TABLE,
+            vocab_size=_VOCAB,
+            native_prompt_logprobs=False,
+            last_stage=False,
+        )
+        proxy = None if pp_in is None else PPProxyTensors(pp_in)
+        return forward.forward(_decode_batch(), proxy), steps[0]
+
+    def test_an_earlier_stage_returns_pp_out_and_no_logits(self):
+        hidden = {"hidden_states": torch.ones(2, 4), "residual": torch.zeros(2, 4)}
+        received = {"hidden_states": torch.zeros(2, 4)}
+        result, step = self._forward(StepOutput(pp_out=hidden), pp_in=received)
+        self.assertIs(step.pp_in, received)
+        self.assertTrue(step.outputs.pp_out)
+        self.assertIs(step.outputs.logit_rows, LogitRows.NONE)
+        self.assertIsInstance(result.logits_output, PPProxyTensors)
+        self.assertIs(result.logits_output.tensors, hidden)
+        with self.assertRaisesRegex(ValueError, "no pp_out"):
+            self._forward(StepOutput(logits=Logits(tensor=torch.zeros(2, _VOCAB))))
+
+
 class TestVocabShardedLogits(CustomTestCase):
     def test_sglang_gathers_shards_and_drops_the_vocabulary_padding(self):
         """Rank r holds columns [r * shard, (r + 1) * shard) of a vocabulary
@@ -256,8 +344,13 @@ class TestStepSubset(CustomTestCase):
             "beam search": dict(beam=object()),
             "position scoring": dict(token_indices_to_pool=[torch.zeros(1)]),
             "input candidate selectors": dict(input_candidate_selectors=[None, 1]),
-            "MLP-sync": dict(global_num_tokens_cpu=[2]),
+            "two-batch overlap": dict(tbo_split_seq_index=1),
             "decode graph": dict(input_ids_from_graph=True),
+            "prefill graph step under DP attention": dict(
+                global_num_tokens_cpu=[2, 0],
+                is_extend_in_batch=True,
+                can_run_dp_prefill_cuda_graph=True,
+            ),
         }
         for reason, fields in cases.items():
             with self.subTest(reason=reason):
@@ -469,20 +562,47 @@ class TestExternalRelease(CustomTestCase):
                 model_path="m",
                 tp_size=2,
                 pp_size=2,
+                attn_dp_size=2,
+                moe_ep_size=2,
+                attn_cp_size=2,
                 cuda_graph_phases=("decode",),
                 overlap_schedule=True,
                 advanced_kv=("sliding_window",),
                 unified_memory=True,
             ),
         )
-        self.assertEqual(len(reasons), 3, reasons)
-        self.assertFalse(
-            any("graph" in r or "overlap" in r or "tensor" in r for r in reasons)
+        self.assertEqual(
+            reasons,
+            [
+                "pipeline parallelism (pp_size=2)",
+                "data-parallel attention (attn_dp_size=2)",
+                "expert parallelism (ep_size=2)",
+                "context parallelism (attn_cp_size=2)",
+                "unified memory (drop --enable-unified-memory)",
+                "KV beyond plain full attention (sliding_window)",
+            ],
         )
         self.assertTrue(external.tensor_parallel)
         self.assertTrue(external.prompt_logprobs and external.top_logprobs)
         self.assertTrue(external.cuda_graphs and external.overlap_schedule)
         self.assertEqual(launch_refusals(external, ResolvedConfig(model_path="m")), [])
+
+    def test_builtin_runner_keeps_the_direct_path_outside_tp_pp_dp_attention(self):
+        """Context parallelism and expert parallelism (with EPLB and elastic
+        EP) have not landed: the built-in runner keeps every step on the
+        direct path for them, while TP, PP and DP attention take the API."""
+        landed = dict(tp_size=2, pp_size=2, attn_dp_size=2, attn_cp_size=1, dcp_size=1)
+        cases = {
+            "": {},
+            "context parallelism": dict(attn_cp_size=2),
+            "decode context parallelism": dict(dcp_size=2),
+            "expert parallelism": dict(moe_ep_size=2),
+        }
+        for case, sizes in cases.items():
+            with self.subTest(case=case):
+                refusals = _native_refusals(**{**landed, "moe_ep_size": 1, **sizes})
+                want = case.removeprefix("decode ")
+                self.assertEqual(refusals, [want] if want else [])
 
     def test_graphs_are_refused_per_undeclared_phase(self):
         both = ResolvedConfig(model_path="m", cuda_graph_phases=("decode", "prefill"))
@@ -507,6 +627,39 @@ class TestExternalRelease(CustomTestCase):
         )
         cfg = ResolvedConfig(model_path="m", architectures=("Qwen3ForCausalLM",))
         self.assertEqual(launch_refusals(caps, cfg), [])
+
+
+def _native_refusals(**parallel):
+    from unittest.mock import patch
+
+    from sglang.srt.model_runner_plugins import native_steps
+
+    features = SimpleNamespace(
+        aux_hidden_state_capture=None,
+        enable_return_routed_experts=False,
+        enable_prefill_weight_versions=False,
+        enable_encoder_swa_bounded_replay=False,
+    )
+    exec_ = SimpleNamespace(
+        features=features,
+        moe=SimpleNamespace(expert_distribution_recorder_mode=None),
+        dllm=SimpleNamespace(dllm_algorithm=None),
+    )
+    model_runner = SimpleNamespace(
+        is_generation=True, is_multimodal=False, is_draft_worker=False
+    )
+    getters = dict(
+        get_parallel=SimpleNamespace(**parallel),
+        get_schedule=SimpleNamespace(disable_overlap_schedule=True),
+        get_spec=SimpleNamespace(speculative_algorithm=None),
+        get_lora=SimpleNamespace(enable_lora=False),
+        get_exec=exec_,
+        use_mlx=False,
+    )
+    with contextlib.ExitStack() as stack:
+        for name, value in getters.items():
+            stack.enter_context(patch.object(native_steps, name, lambda v=value: v))
+        return native_steps.native_step_refusals(model_runner)
 
 
 _LIMITS = AdmissionLimits(
@@ -561,7 +714,7 @@ class _Host:
     def capture_model_graphs(self):
         self.calls.append("host.capture")
 
-    def finalize_model_capacity(self):
+    def finalize_model_capacity(self, *, agree_stages=True):
         self.calls.append("host.finalize")
 
 
@@ -593,8 +746,8 @@ class TestExternalStartup(CustomTestCase):
         )
         # The scheduler's allocators saw the plugin's slots before they existed.
         self.assertEqual(runner.layout.num_slots, 4096)
-        # Admission limits are SGLang's, from the pools it sized.
-        self.assertEqual(final.limits, _LIMITS)
+        # Admission limits are SGLang's, set once PP stages have agreed.
+        self.assertIsNone(final.limits)
 
     def test_tp_ranks_size_allocators_to_the_smallest_backing(self):
         """Each TP rank backs as many slots as its memory allows; SGLang's

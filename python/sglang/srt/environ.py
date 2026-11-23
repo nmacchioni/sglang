@@ -439,6 +439,10 @@ class Envs:
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
     SGLANG_TEST_STUCK_SCHEDULER_INIT = EnvFloat(0)
     SGLANG_TEST_STUCK_TOKENIZER = EnvFloat(0)
+    # This TP rank publishes one input row more than its decode batch holds at
+    # the MLP-sync rendezvous: a rank whose step disagrees with the gather.
+    # Decode only, so one-token health requests still pass at launch.
+    SGLANG_TEST_RENDEZVOUS_FAULT_TP_RANK = EnvInt(None)
     SGLANG_TEST_CRASH_AFTER_STREAM_OUTPUTS = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_TEST_DISAGG_FAILURE_PROB = EnvFloat(0.0)

@@ -34,7 +34,10 @@ from sglang.srt.model_runner_plugins.steps import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import (
+        ForwardBatch,
+        PPProxyTensors,
+    )
     from sglang.srt.model_executor.model_runner import ModelRunnerOutput
     from sglang.srt.model_runner_plugins.native_steps import NativeStepLowering
 
@@ -58,6 +61,7 @@ class StepForward:
         lowering: Optional[NativeStepLowering] = None,
         direct_fallback: bool = False,
         tp_group: Optional[Any] = None,
+        last_stage: bool = True,
     ):
         self.runner_name = runner_name
         self._executor = executor
@@ -72,6 +76,8 @@ class StepForward:
         self._vocab_size = vocab_size
         # SGLang's TP GroupCoordinator, when the runner spans several ranks.
         self._tp_group = tp_group
+        # False on pipeline stages before the last, which return pp_out.
+        self._last_stage = last_stage
         self._input_logprobs = InputLogprobProcessor(vocab_size)
         self._lifetimes = OutputLifetimes(
             runner_name=runner_name,
@@ -97,7 +103,11 @@ class StepForward:
             f"--model-runner {self.runner_name} cannot run a step with {refusal}"
         )
 
-    def forward(self, forward_batch: ForwardBatch) -> ModelRunnerOutput:
+    def forward(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> ModelRunnerOutput:
         from sglang.srt.model_executor.model_runner import ModelRunnerOutput
 
         self._lifetimes.step_started()
@@ -109,6 +119,8 @@ class StepForward:
             page_table=self._page_table,
             graph=graph,
             inputs_ready=self._record_inputs_ready(forward_batch),
+            pp_in=None if pp_proxy_tensors is None else pp_proxy_tensors.tensors,
+            last_stage=self._last_stage,
         )
         if self._lowering is None:
             plan = self._executor.plan(step)
@@ -132,6 +144,10 @@ class StepForward:
         lease = self._lifetimes.produced(out)
         if self._lifetimes.deferred:
             self._lease = lease
+        if not self._last_stage:
+            return ModelRunnerOutput(
+                logits_output=self._pp_out(out), can_run_graph=not graph.is_eager
+            )
         logits_output = logits_output_from_step(out, gather_vocab=self._gather_vocab)
         if step.outputs.prompt_logprobs and not self._native_prompt_logprobs:
             self._project_prompt_logprobs(
@@ -156,6 +172,16 @@ class StepForward:
             torch.get_device_module().synchronize()
         self._lease = None
         self._lifetimes.close()
+
+    def _pp_out(self, out: StepOutput) -> PPProxyTensors:
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        if out.pp_out is None or out.logits is not None:
+            raise ValueError(
+                f"Model runner {self.runner_name!r} returned no pp_out (or logits) "
+                "for a pipeline stage before the last"
+            )
+        return PPProxyTensors(out.pp_out)
 
     def _gather_vocab(self, shard: torch.Tensor) -> torch.Tensor:
         """Full logits from this rank's vocabulary shard: a gather every TP

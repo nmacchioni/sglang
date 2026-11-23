@@ -31,6 +31,7 @@ from sglang.srt.model_runner_plugins.startup import (
     ModelRunnerStartup,
     StartupInputs,
     StartupPhase,
+    settle_capacity,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -334,8 +335,13 @@ class _FakeHost:
     def capture_model_graphs(self):
         self._phase("capture_model_graphs")
 
-    def finalize_model_capacity(self):
+    def finalize_model_capacity(self, *, agree_stages=True):
         self._phase("finalize_model_capacity")
+        if agree_stages:
+            self.agree_stage_capacity()
+
+    def agree_stage_capacity(self):
+        self._phase("agree_stage_capacity")
 
 
 _HOST_PHASES = (
@@ -343,15 +349,25 @@ _HOST_PHASES = (
     "alloc_model_memory_pools",
     "capture_model_graphs",
     "finalize_model_capacity",
+    # SGLang's, after the runner's finalize: PP stages agree, then limits.
+    "agree_stage_capacity",
 )
+
+
+def _native_startup(host):
+    plugin = SGLangRunnerPlugin(host=host)
+    startup = ModelRunnerStartup(
+        runner_name="sglang",
+        plugin=plugin,
+        settle=lambda final: settle_capacity(host, final),
+    )
+    return startup, plugin
 
 
 class TestNativeRunner(CustomTestCase):
     def test_delegates_to_the_scheduler_phases_in_order(self):
         host = _FakeHost()
-        startup = ModelRunnerStartup(
-            runner_name="sglang", plugin=SGLangRunnerPlugin(host=host)
-        )
+        startup, _ = _native_startup(host)
 
         final = startup.run(_INPUTS)
 
@@ -370,8 +386,7 @@ class TestNativeRunner(CustomTestCase):
         for index, phase in enumerate(_HOST_PHASES):
             with self.subTest(phase=phase):
                 host = _FakeHost(fail_in=phase)
-                plugin = SGLangRunnerPlugin(host=host)
-                startup = ModelRunnerStartup(runner_name="sglang", plugin=plugin)
+                startup, plugin = _native_startup(host)
 
                 with self.assertRaisesRegex(RuntimeError, f"{phase} failed"):
                     startup.run(_INPUTS)
@@ -523,9 +538,7 @@ class TestSchedulerWiring(CustomTestCase):
         direct = _stub_scheduler(startup=None)
         direct.init_worker_info()
 
-        startup = ModelRunnerStartup(
-            runner_name="sglang", plugin=SGLangRunnerPlugin(host=_FakeHost())
-        )
+        startup, _ = _native_startup(_FakeHost())
         startup.run(_INPUTS)
         via_plugin = _stub_scheduler(startup=startup)
         # The typed path must not call get_worker_info again.

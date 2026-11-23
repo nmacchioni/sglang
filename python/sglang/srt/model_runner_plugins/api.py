@@ -495,7 +495,7 @@ class KVTables(msgspec.Struct, frozen=True, kw_only=True):
 class LogitRows(str, Enum):
     # One row per request, for its last input row; request b is row b.
     LAST = "last"
-    # No logits (idle steps).
+    # No logits (idle steps, and every pipeline stage but the last).
     NONE = "none"
 
 
@@ -504,6 +504,45 @@ class OutputSpec(msgspec.Struct, frozen=True, kw_only=True):
     # Some request reads prompt logprobs this step: from StepOutput.logprobs
     # when the runner declares native_prompt_logprobs, else through project().
     prompt_logprobs: bool = False
+    # A pipeline stage before the last: the step returns StepOutput.pp_out, the
+    # tensors SGLang sends to the next stage as its Step.pp_in.
+    pp_out: bool = False
+
+
+class DPInfo(msgspec.Struct, frozen=True, kw_only=True):
+    """What SGLang's per-step MLP-sync rendezvous decided for every DP rank.
+
+    Under data-parallel attention each DP rank runs its own batch, or an idle
+    step, and every rank joins the MLP collectives of every step. The values
+    here were gathered from every rank at the rendezvous and are identical on
+    all of them; a runner sizes the step's collectives from them and never
+    from its local batch alone.
+    """
+
+    # This rank's index into the per-rank tuples.
+    rank: int
+    # Input rows each DP rank runs this step, as published at the rendezvous;
+    # global_num_tokens[rank] is this step's own T.
+    global_num_tokens: tuple[int, ...]
+    global_num_tokens_for_logprob: tuple[int, ...]
+    # Some DP rank extends this step. A decode batch then runs presented as an
+    # extend, as native does, so every rank's collectives take one layout.
+    extend_in_batch: bool = False
+    # The coordinated graph votes: every rank could replay its decode
+    # (resp. prefill) graph. Step.graph is eager on every rank otherwise.
+    decode_graph: bool = False
+    # Steps with this vote and an extend on some rank keep the direct path for
+    # now: the forward reshapes every rank's batch to one prefill bucket.
+    prefill_graph: bool = False
+
+    def __post_init__(self) -> None:
+        n = len(self.global_num_tokens)
+        if not 0 <= self.rank < n or len(self.global_num_tokens_for_logprob) != n:
+            raise ValueError(
+                f"DPInfo needs 0 <= rank < {n} entries per rank, got rank "
+                f"{self.rank} and {len(self.global_num_tokens_for_logprob)} "
+                "logprob counts"
+            )
 
 
 class Step(msgspec.Struct, frozen=True, kw_only=True):
@@ -534,6 +573,11 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     # written; work on another stream waits on it. None: they were written
     # before plan() was called (overlap scheduling off).
     inputs_ready: Optional[Any] = None
+    # Under data-parallel attention; None otherwise.
+    dp: Optional[DPInfo] = None
+    # Every pipeline stage but the first: what the previous stage's pp_out
+    # held, received by SGLang. None on the first stage.
+    pp_in: Optional[dict[str, torch.Tensor]] = None
 
     def __post_init__(self) -> None:
         num_tokens = self.input_ids.shape[0]
@@ -568,6 +612,36 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
                     f"a step of {rows} rows cannot replay the "
                     f"{self.graph.phase.value} graph of {self.graph.bucket}"
                 )
+        if self.dp is not None:
+            _check_rendezvous(self.dp, num_tokens=num_tokens, graph=self.graph)
+
+
+class RendezvousMismatch(ValueError):
+    """A step disagrees with what its rank published at SGLang's per-step
+    rendezvous: its peers already sized the step's collectives from the
+    published values, so running it would hang or corrupt them."""
+
+
+def _check_rendezvous(dp: DPInfo, *, num_tokens: int, graph: GraphChoice) -> None:
+    published = dp.global_num_tokens[dp.rank]
+    if published != num_tokens:
+        raise RendezvousMismatch(
+            f"DP rank {dp.rank} published {published} input rows at the "
+            f"rendezvous but its step has {num_tokens}"
+        )
+    if graph.bucket is None:
+        return
+    voted = dp.decode_graph if graph.phase is GraphPhase.DECODE else dp.prefill_graph
+    if not voted:
+        raise RendezvousMismatch(
+            f"DP rank {dp.rank} replays its {graph.phase.value} graph, but the "
+            "rendezvous voted the step eager"
+        )
+    if graph.bucket < max(dp.global_num_tokens):
+        raise RendezvousMismatch(
+            f"DP rank {dp.rank} replays the graph of {graph.bucket}, below the "
+            f"largest rank's {max(dp.global_num_tokens)} rows at the rendezvous"
+        )
 
 
 class LogitsLayout(str, Enum):
@@ -615,6 +689,9 @@ class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
 
     logits: Optional[Logits] = None
     logprobs: Optional[PromptLogprobs] = None
+    # Stages before the last (OutputSpec.pp_out): what SGLang sends to the
+    # next stage, which receives it as Step.pp_in.
+    pp_out: Optional[dict[str, torch.Tensor]] = None
     # A device event that fires when the outputs are written; SGLang's runner
     # stream waits on it before any consumer. None: the outputs are ordered on
     # the runner stream before execute() returns.

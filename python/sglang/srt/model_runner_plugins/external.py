@@ -23,7 +23,6 @@ from sglang.srt.model_runner_plugins.api import (
     RuntimeConfig,
 )
 from sglang.srt.model_runner_plugins.native import NativeStartupHost
-from sglang.srt.model_runner_plugins.native_results import admission_limits
 
 if TYPE_CHECKING:
     from sglang.srt.model_runner_plugins.external_worker import (
@@ -94,13 +93,9 @@ class ExternalRunner:
                 f"{self._allocated_slots} to {layout.num_slots} slots in "
                 "finalize(); external runners keep their allocated size."
             )
-        self._host.finalize_model_capacity()
-        # Admission is SGLang's, computed from the pools it sized.
-        return msgspec.structs.replace(
-            layout,
-            num_slots=self.layout.num_slots,
-            limits=admission_limits(self._host.tp_worker),
-        )
+        self._host.finalize_model_capacity(agree_stages=False)
+        # Admission is SGLang's: it sets the limits once stages have agreed.
+        return msgspec.structs.replace(layout, num_slots=self.layout.num_slots)
 
     def close(self) -> None:
         self.plugin.close()

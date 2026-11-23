@@ -35,6 +35,7 @@ from sglang.srt.model_runner_plugins.native_steps import (
     NativePlan,
     NativeStepLowering,
     native_execute,
+    native_plan,
 )
 
 if TYPE_CHECKING:
@@ -73,7 +74,9 @@ class NativeStartupHost(Protocol):
 
     def capture_model_graphs(self) -> None: ...
 
-    def finalize_model_capacity(self) -> None: ...
+    def finalize_model_capacity(self, *, agree_stages: bool = True) -> None: ...
+
+    def agree_stage_capacity(self) -> None: ...
 
 
 class SGLangRunnerPlugin:
@@ -107,14 +110,14 @@ class SGLangRunnerPlugin:
 
     def finalize(self, capacity: Capacity) -> KVLayout:
         # Resizes only when the post-capture backing is active. PP stages agree
-        # on capacity inside this phase, at its native position.
+        # on capacity after this phase, and SGLang then sets the limits.
         host = self._require_host()
-        host.finalize_model_capacity()
-        return native_kv_layout(tp_worker=host.tp_worker, with_limits=True)
+        host.finalize_model_capacity(agree_stages=False)
+        return native_kv_layout(tp_worker=host.tp_worker, with_limits=False)
 
     def plan(self, step: Step) -> NativePlan:
-        return NativePlan(
-            forward_batch=self.lowering.forward_batch_of(step), graph=step.graph
+        return native_plan(
+            step=step, forward_batch=self.lowering.forward_batch_of(step)
         )
 
     def execute(self, plan: NativePlan) -> StepOutput:

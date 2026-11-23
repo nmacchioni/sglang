@@ -74,6 +74,20 @@ class NativeStepLowering:
 class NativePlan(msgspec.Struct, frozen=True, kw_only=True):
     forward_batch: object
     graph: GraphChoice = EAGER
+    # The PPProxyTensors over Step.pp_in, on every stage but the first.
+    pp_proxy_tensors: Optional[object] = None
+
+
+def native_plan(*, step: Step, forward_batch: ForwardBatch) -> NativePlan:
+    pp_proxy_tensors = None
+    if step.pp_in is not None:
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+        # The same dict the stage received: the forward reads it in place.
+        pp_proxy_tensors = PPProxyTensors(step.pp_in)
+    return NativePlan(
+        forward_batch=forward_batch, graph=step.graph, pp_proxy_tensors=pp_proxy_tensors
+    )
 
 
 def native_step_refusals(model_runner: ModelRunner) -> list[str]:
@@ -82,13 +96,12 @@ def native_step_refusals(model_runner: ModelRunner) -> list[str]:
 
     Tensor parallelism runs through the API: every TP rank lowers the same
     batch from the same replicated schedule, so each member reaches the same
-    graph decision and SGLang adds no collective to agree on it."""
+    graph decision and SGLang adds no collective to agree on it. Under DP
+    attention and pipeline parallelism the decisions come from the existing
+    MLP-sync gather and the stage schedule, which ``Step.dp`` and ``pp_in``
+    carry; two-batch overlap steps keep the direct path."""
     reasons = []
     parallel = get_parallel()
-    if parallel.pp_size > 1:
-        reasons.append("pipeline parallelism")
-    if parallel.attn_dp_size > 1:
-        reasons.append("data-parallel attention")
     if parallel.attn_cp_size > 1 or parallel.dcp_size > 1:
         reasons.append("context parallelism")
     if parallel.moe_ep_size > 1:
@@ -132,9 +145,15 @@ def native_graph_choice(
     mode = forward_batch.forward_mode
     decode = model_runner.decode_cuda_graph_runner
     if mode.is_cuda_graph() and decode and decode.can_run_graph(forward_batch):
+        # Under DP attention every rank replays the bucket of the largest
+        # rank's batch, as gathered at the rendezvous.
+        rows = (
+            decode._max_dp_batch_size(forward_batch)
+            if decode.require_mlp_tp_gather
+            else forward_batch.batch_size
+        )
         return GraphChoice(
-            phase=GraphPhase.DECODE,
-            bucket=_bucket(decode, forward_batch.batch_size, decode.capture_bs),
+            phase=GraphPhase.DECODE, bucket=_bucket(decode, rows, decode.capture_bs)
         )
     prefill = model_runner.prefill_cuda_graph_runner
     if (
@@ -143,11 +162,15 @@ def native_graph_choice(
         and not isinstance(prefill, EagerRunner)
         and prefill.can_run_graph(forward_batch)
     ):
+        global_num_tokens = forward_batch.global_num_tokens_cpu
+        rows = (
+            forward_batch.input_ids.shape[0]
+            if global_num_tokens is None
+            else max(global_num_tokens)
+        )
         return GraphChoice(
             phase=GraphPhase.PREFILL,
-            bucket=_bucket(
-                prefill, forward_batch.input_ids.shape[0], prefill.capture_num_tokens
-            ),
+            bucket=_bucket(prefill, rows, prefill.capture_num_tokens),
         )
     return EAGER
 
@@ -160,7 +183,9 @@ def _bucket(runner, rows: int, captured) -> int:
 
 
 def native_execute(*, model_runner: ModelRunner, plan: NativePlan) -> StepOutput:
-    out = model_runner.forward(plan.forward_batch)
+    out = model_runner.forward(
+        plan.forward_batch, pp_proxy_tensors=plan.pp_proxy_tensors
+    )
     if out.can_run_graph == plan.graph.is_eager:
         raise RuntimeError(
             f"Step.graph said {_describe(plan.graph)} but the native forward "
@@ -173,6 +198,11 @@ def native_execute(*, model_runner: ModelRunner, plan: NativePlan) -> StepOutput
         or out.kv_weight_version_record is not None
     ):
         raise RuntimeError("a native forward on the Step path produced captures")
+    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+
+    if isinstance(out.logits_output, PPProxyTensors):
+        # A stage before the last: what goes to the next stage.
+        return StepOutput(pp_out=out.logits_output.tensors)
     return step_output_of(out.logits_output)
 
 

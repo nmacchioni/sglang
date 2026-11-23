@@ -11,11 +11,12 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -58,11 +59,20 @@ class StepTrace:
         runner: Optional[str],
         execute_seconds: Optional[float],
         forward_batch: ForwardBatch,
-        logits_output: LogitsProcessorOutput,
+        logits_output: Union[LogitsProcessorOutput, PPProxyTensors],
         replayed_graph: bool,
         graph: Optional[GraphChoice] = None,
     ) -> None:
         host_seconds = time.perf_counter() - tic
+        # A pipeline stage before the last hands the next stage proxy tensors.
+        pp_out = (
+            logits_output.tensors if isinstance(logits_output, PPProxyTensors) else None
+        )
+        outputs = (
+            {"logits": logits_output.next_token_logits}
+            if pp_out is None
+            else {f"pp_out.{name}": t for name, t in sorted(pp_out.items())}
+        )
         record = {
             "index": self._count,
             **self._ranks,
@@ -74,7 +84,11 @@ class StepTrace:
             "prefix_lens": forward_batch.extend_prefix_lens_cpu,
             "host_us": host_seconds * 1e6,
             "execute_us": None if execute_seconds is None else execute_seconds * 1e6,
-            "prompt_logprobs": logits_output.input_token_logprobs is not None,
+            "prompt_logprobs": pp_out is None
+            and logits_output.input_token_logprobs is not None,
+            "pp_out": None if pp_out is None else sorted(pp_out),
+            # Input rows per DP rank, as gathered at the MLP-sync rendezvous.
+            "global_num_tokens": forward_batch.original_global_num_tokens_cpu,
             "replayed_graph": replayed_graph,
             # Step path only: [phase, bucket], or None when Step.graph is eager.
             "step_graph": (
@@ -85,18 +99,18 @@ class StepTrace:
         }
         with open(f"{self._prefix}.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
-        if self._save_logits and logits_output.next_token_logits is not None:
+        if self._save_logits and all(t is not None for t in outputs.values()):
+            inputs = {
+                "input_ids": forward_batch.input_ids,
+                "positions": forward_batch.positions,
+                "out_cache_loc": forward_batch.out_cache_loc,
+                "seq_lens": forward_batch.seq_lens,
+                "req_pool_indices": forward_batch.req_pool_indices,
+            }
             torch.save(
                 {
                     name: tensor.detach().cpu().clone()
-                    for name, tensor in (
-                        ("input_ids", forward_batch.input_ids),
-                        ("positions", forward_batch.positions),
-                        ("out_cache_loc", forward_batch.out_cache_loc),
-                        ("seq_lens", forward_batch.seq_lens),
-                        ("req_pool_indices", forward_batch.req_pool_indices),
-                        ("logits", logits_output.next_token_logits),
-                    )
+                    for name, tensor in {**inputs, **outputs}.items()
                 },
                 f"{self._prefix}-{self._count:05d}.pt",
             )
