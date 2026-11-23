@@ -55,6 +55,16 @@ class StepTrace:
         self._prefix = os.path.join(directory, f"steps-{os.getpid()}")
         self._save_logits = save_logits
         self._count = 0
+        # The KV pool whose bytes prefix digests read: bound on the step path.
+        self._kv_pool = None
+
+    def bind_kv_pool(self, pool) -> None:
+        """Digest prefix KV bytes from ``pool`` when it keeps slot-row K/V
+        buffers per layer (an MHA pool, or the view of a runner's KV)."""
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+        if isinstance(pool, MHATokenToKVPool) and not pool.use_hnd:
+            self._kv_pool = pool
 
     def start(self) -> float:
         return time.perf_counter()
@@ -122,6 +132,9 @@ class StepTrace:
             "expert_layout": self._expert_layout_crc(),
             # Step path only: the window and state tables the Step carried.
             **_sub_pool_summary(kv),
+            # Step path, with saved tensors: per request with a cached prefix
+            # on an extend step, a CRC of that prefix's K and V bytes.
+            "prefix_kv_crc": self._prefix_kv_crcs(forward_batch, kv),
         }
         with open(f"{self._prefix}.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -142,6 +155,31 @@ class StepTrace:
                 f"{self._prefix}-{self._count:05d}.pt",
             )
         self._count += 1
+
+    def _prefix_kv_crcs(
+        self, forward_batch: ForwardBatch, kv: Optional[KVTables]
+    ) -> Optional[list[int]]:
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if (
+            not self._save_logits
+            or kv is None
+            or self._kv_pool is None
+            or not prefix_lens
+            or not any(prefix_lens)
+        ):
+            return None
+        pool = self._kv_pool
+        crcs = []
+        for row, prefix in zip(forward_batch.req_pool_indices.tolist(), prefix_lens):
+            if not prefix:
+                continue
+            slots = kv.page_table[row, :prefix].long()
+            crc = 0
+            for buffer in (*pool.k_buffer, *pool.v_buffer):
+                rows = buffer[slots].contiguous().view(torch.uint8)
+                crc = zlib.crc32(rows.cpu().numpy().tobytes(), crc)
+            crcs.append(crc)
+        return crcs
 
     def _cp_sharded(self, forward_batch: ForwardBatch) -> bool:
         if not self._prefill_cp:

@@ -25,7 +25,8 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     ModelLayerInfo,
 )
-from sglang.srt.runtime_context import get_exec, get_model, get_schedule
+from sglang.srt.model_runner_plugins.kv_view import PluginKVView, kv_view_refusal
+from sglang.srt.runtime_context import get_exec, get_memory, get_model, get_schedule
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -153,12 +154,7 @@ class PluginOwnedModelRunner(ModelRunner):
             device=self.device,
             enable_memory_saver=False,
         )
-        self.token_to_kv_pool = _PluginOwnedKVCache(
-            size=layout.num_slots,
-            page_size=layout.page_size,
-            dtype=self.kv_cache_dtype,
-            device=self.device,
-        )
+        self.token_to_kv_pool = self._kv_pool(layout)
         if layout.page_size == 1:
             self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                 layout.num_slots,
@@ -182,6 +178,25 @@ class PluginOwnedModelRunner(ModelRunner):
             self._runner.name,
             layout.num_slots,
             self.max_running_requests,
+        )
+
+    def _kv_pool(self, layout):
+        """A byte view of the runner's KV, for host copies and transfers; a
+        stand-in that holds no bytes when the layout is not viewable."""
+        refusal = kv_view_refusal(layout)
+        if refusal is None:
+            return PluginKVView(layout=layout, device=self.device)
+        if get_memory().enable_hierarchical_cache:
+            raise ValueError(
+                f"--model-runner {self._runner.name} cannot use the hierarchical "
+                f"cache: its KVLayout has {refusal}; drop "
+                "--enable-hierarchical-cache"
+            )
+        return _PluginOwnedKVCache(
+            size=layout.num_slots,
+            page_size=layout.page_size,
+            dtype=self.kv_cache_dtype,
+            device=self.device,
         )
 
     def init_attention_backends(self):

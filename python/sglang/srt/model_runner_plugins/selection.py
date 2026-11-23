@@ -74,6 +74,9 @@ _EXTERNAL_FEATURES = frozenset(
         Feature.TOP_LOGPROBS,
         Feature.OVERLAP_SCHEDULE,
         Feature.CUDA_GRAPHS,
+        # SGLang copies the runner's full-attention KV bytes to and from host
+        # memory through the KVLayout (kv_view.py).
+        Feature.HICACHE,
     }
 )
 
