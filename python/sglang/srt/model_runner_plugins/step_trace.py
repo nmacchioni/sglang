@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -36,6 +37,13 @@ class StepTrace:
 
     def __init__(self, *, directory: str, save_logits: bool):
         os.makedirs(directory, exist_ok=True)
+        parallel = get_parallel()
+        # Which rank wrote the record: each rank traces to its own file.
+        self._ranks = {
+            "tp_rank": parallel.tp_rank,
+            "pp_rank": parallel.pp_rank,
+            "attn_dp_rank": parallel.attn_dp_rank,
+        }
         self._prefix = os.path.join(directory, f"steps-{os.getpid()}")
         self._save_logits = save_logits
         self._count = 0
@@ -57,6 +65,7 @@ class StepTrace:
         host_seconds = time.perf_counter() - tic
         record = {
             "index": self._count,
+            **self._ranks,
             "path": "direct" if runner is None else "step",
             "runner": runner,
             "mode": forward_batch.forward_mode.name.lower(),

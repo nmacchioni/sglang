@@ -24,6 +24,8 @@ from sglang.srt.model_runner_plugins.api import (
     LoadResult,
     ModelRunnerExecutor,
     ModelRunnerLifecycle,
+    ParallelLayout,
+    RankGroup,
     RunnerCapabilities,
     RuntimeConfig,
 )
@@ -85,6 +87,7 @@ class StartupInputs(msgspec.Struct, frozen=True, kw_only=True):
                 tp_size=parallel.tp_size,
                 pp_rank=parallel.pp_rank,
                 pp_size=parallel.pp_size,
+                parallel=parallel_layout(),
             ),
             runtime=RuntimeConfig(
                 page_size=schedule.page_size,
@@ -201,6 +204,7 @@ class ModelRunnerStartup:
             choose_graph=choose_graph,
             lowering=lowering,
             direct_fallback=not self.is_external,
+            tp_group=_tp_group_or_none(),
         )
         logger.info("Model runner %r runs steps through its API", self.runner_name)
         return self._step_forward
@@ -269,6 +273,40 @@ class ModelRunnerStartup:
                 f"{type(result).__name__}; expected {expected.__name__}."
             )
         return result
+
+
+def parallel_layout() -> ParallelLayout:
+    """The groups SGLang built for this rank (``init_parallel_runtime`` has run)."""
+    parallel = get_parallel()
+    if parallel.tp_size == 1 and parallel.pp_size == 1:
+        # One rank: no group carries a collective.
+        return ParallelLayout()
+    return ParallelLayout(
+        tp=rank_group(parallel.tp_group),
+        pp=rank_group(parallel.pp_group),
+        attn_tp=rank_group(parallel.attn_tp_group),
+        attn_dp_rank=parallel.attn_dp_rank,
+        attn_dp_size=parallel.attn_dp_size,
+    )
+
+
+def _tp_group_or_none():
+    """The TP ``GroupCoordinator``; None at TP1, where none need be built."""
+    parallel = get_parallel()
+    return parallel.tp_group if parallel.tp_size > 1 else None
+
+
+def rank_group(coordinator) -> RankGroup:
+    """A ``GroupCoordinator`` as the API's ``RankGroup``."""
+    if coordinator.world_size == 1:
+        return RankGroup(ranks=tuple(coordinator.ranks))
+    return RankGroup(
+        rank=coordinator.rank_in_group,
+        size=coordinator.world_size,
+        ranks=tuple(coordinator.ranks),
+        device=coordinator.device_group,
+        cpu=coordinator.cpu_group,
+    )
 
 
 def _check_final_layout(allocated: KVLayout, final: KVLayout) -> None:

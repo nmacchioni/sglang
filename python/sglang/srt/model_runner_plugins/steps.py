@@ -9,7 +9,7 @@ a few attribute reads and no device work.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -21,6 +21,7 @@ from sglang.srt.model_runner_plugins.api import (
     GraphChoice,
     KVTables,
     LogitRows,
+    LogitsLayout,
     OutputSpec,
     PromptLogprobs,
     Rows,
@@ -119,11 +120,17 @@ def build_step(
     )
 
 
-def logits_output_from_step(out: StepOutput) -> LogitsProcessorOutput:
-    """The scheduler's view of a step's outputs."""
-    logits_output = LogitsProcessorOutput(
-        next_token_logits=None if out.logits is None else out.logits.tensor
-    )
+def logits_output_from_step(
+    out: StepOutput, *, gather_vocab: Optional[Callable[[torch.Tensor], torch.Tensor]]
+) -> LogitsProcessorOutput:
+    """The scheduler's view of a step's outputs; ``gather_vocab`` turns
+    vocabulary-sharded logits into full ones (None: the runner has one rank)."""
+    logits = None if out.logits is None else out.logits.tensor
+    if logits is not None and out.logits.layout is LogitsLayout.VOCAB_SHARDED:
+        if gather_vocab is None:
+            raise ValueError("vocabulary-sharded logits need a TP group to gather")
+        logits = gather_vocab(logits)
+    logits_output = LogitsProcessorOutput(next_token_logits=logits)
     if out.logprobs is not None:
         write_prompt_logprobs(out.logprobs, logits_output)
     return logits_output

@@ -25,7 +25,16 @@ from sglang.test.model_runner_reference.model import DenseDecoder, request_spans
 class _BucketGraph:
     """The piecewise graphs of one decode bucket of ``rows`` requests."""
 
-    def __init__(self, *, model: DenseDecoder, rows: int, logits: torch.Tensor, pool):
+    def __init__(
+        self,
+        *,
+        model: DenseDecoder,
+        rows: int,
+        logits: torch.Tensor,
+        pool,
+        sharded: bool,
+    ):
+        self._sharded = sharded
         c = model.config
         device = model.device
         self._model = model
@@ -64,7 +73,11 @@ class _BucketGraph:
     def _last(self) -> None:
         layer = self._model.config.num_layers - 1
         x = self._model.post_attention(self._x, self._attn, layer=layer)
-        self._logits.copy_(self._model.logits(self._model.final_norm(x)))
+        hidden = self._model.final_norm(x)
+        if self._sharded:
+            self._logits.copy_(self._model.logits_shard(hidden))
+        else:
+            self._logits.copy_(self._model.logits(hidden))
 
     def _project(self, layer: int) -> None:
         q = self._model.pre_attention(
@@ -112,17 +125,21 @@ class _BucketGraph:
 
 
 class DecodeGraphs:
-    def __init__(self, *, model: DenseDecoder, buckets: tuple[int, ...]):
+    def __init__(
+        self, *, model: DenseDecoder, buckets: tuple[int, ...], sharded: bool = False
+    ):
         self.logits = torch.zeros(
             max(buckets),
-            model.config.vocab_size,
+            model.vocab_shard_size if sharded else model.full_config.vocab_size,
             dtype=torch.float32,
             device=model.device,
         )
         pool = torch.cuda.graph_pool_handle()
         # Largest first, so smaller buckets reuse the pool's blocks.
         self._graphs = {
-            rows: _BucketGraph(model=model, rows=rows, logits=self.logits, pool=pool)
+            rows: _BucketGraph(
+                model=model, rows=rows, logits=self.logits, pool=pool, sharded=sharded
+            )
             for rows in sorted(buckets, reverse=True)
         }
         self.replays = 0

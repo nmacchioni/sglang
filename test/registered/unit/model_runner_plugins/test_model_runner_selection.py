@@ -246,9 +246,10 @@ class TestLaunchCheck(_DistsCase):
         )
 
         with self.assertRaises(ValueError) as ctx:
-            self._launch(model_runner="alpha", tp_size=2)
+            self._launch(model_runner="alpha", pp_size=2)
         message = str(ctx.exception)
-        self.assertIn("tensor parallelism (tp_size=2)", message)
+        self.assertIn("pipeline parallelism (pp_size=2)", message)
+        self.assertNotIn("tensor parallelism", message)
         self.assertIn("multimodal inputs", message)
 
     def test_external_runner_accepts_a_tp1_eager_text_launch(self):

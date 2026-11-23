@@ -4,6 +4,11 @@ Unfused on purpose: it shares no kernel with SGLang's models, so a match against
 SGLang's own runner checks the plugin contract, not shared code. Each layer is
 split at attention, so decode graphs (``graphs.py``) can capture the rest.
 K and V live in one paged tensor per layer, indexed by SGLang's physical slots.
+
+Tensor parallel over the TP group SGLang hands to ``load``: Q, K, V, gate and up
+projections are column-parallel (whole heads and intermediate columns per
+rank), O and down projections row-parallel with an all-reduce, and the LM head
+vocabulary-parallel. Embeddings and norms are replicated.
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.model_runner_plugins.api import Step, StepMode
+from sglang.srt.model_runner_plugins.api import SINGLE_RANK, RankGroup, Step, StepMode
 
 
 class DecoderConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -102,6 +107,40 @@ class PagedKV(msgspec.Struct, kw_only=True):
     v: torch.Tensor
 
 
+# Sharded along dim 0 (output features) or dim 1 (input features) per rank.
+_COLUMN_PARALLEL = ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj")
+_ROW_PARALLEL = ("o_proj", "down_proj")
+
+
+def shard_config(config: DecoderConfig, tp: RankGroup) -> DecoderConfig:
+    """The per-rank shapes under ``tp``: whole heads per rank."""
+    if config.num_heads % tp.size or config.num_kv_heads % tp.size:
+        raise ValueError(
+            f"the reference runner splits whole heads: {config.num_heads} query "
+            f"and {config.num_kv_heads} KV heads over {tp.size} ranks"
+        )
+    return msgspec.structs.replace(
+        config,
+        num_heads=config.num_heads // tp.size,
+        num_kv_heads=config.num_kv_heads // tp.size,
+    )
+
+
+def _shard(name: str, t: torch.Tensor, tp: RankGroup) -> torch.Tensor:
+    """This rank's slice of checkpoint tensor ``name``, in its own storage."""
+    module = name.rsplit(".", 2)[-2] if name.count(".") >= 2 else ""
+    if tp.size == 1:
+        return t
+    if module in _COLUMN_PARALLEL:
+        return t.chunk(tp.size, dim=0)[tp.rank].clone()
+    if module in _ROW_PARALLEL:
+        if name.endswith(".bias"):
+            # Added once, after the all-reduce sums the partial products.
+            return t if tp.rank == 0 else torch.zeros_like(t)
+        return t.chunk(tp.size, dim=1)[tp.rank].clone()
+    return t
+
+
 class DenseDecoder:
     def __init__(
         self,
@@ -109,12 +148,22 @@ class DenseDecoder:
         config: DecoderConfig,
         weights: dict[str, torch.Tensor],
         device: torch.device,
+        tp: RankGroup = SINGLE_RANK,
     ):
-        self.config = config
+        # ``full_config`` is the checkpoint's; ``config`` this rank's slice.
+        self.full_config = config
+        self.config = shard_config(config, tp)
+        self.tp = tp
         self.device = device
-        self.w = {name: t.to(config.dtype) for name, t in weights.items()}
-        if "lm_head.weight" not in self.w:
-            self.w["lm_head.weight"] = self.w["model.embed_tokens.weight"]
+        if "lm_head.weight" not in weights:
+            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+        self.w = {
+            name: _shard(name, t, tp).to(config.dtype).contiguous()
+            for name, t in weights.items()
+            if name != "lm_head.weight"
+        }
+        self.w["lm_head.weight"] = self._vocab_shard(weights["lm_head.weight"])
+        config = self.config
         half = config.head_dim // 2
         self._inv_freq = 1.0 / (
             config.rope_theta
@@ -184,15 +233,49 @@ class DenseDecoder:
     ) -> torch.Tensor:
         c = self.config
         p = f"model.layers.{layer}."
-        x = x + self._linear(attn.reshape(attn.shape[0], -1), p + "self_attn.o_proj")
+        o = self._linear(attn.reshape(attn.shape[0], -1), p + "self_attn.o_proj")
+        x = x + self._all_reduce(o)
         h = _rms_norm(x, self.w[p + "post_attention_layernorm.weight"], c.rms_norm_eps)
         gate = self._linear(h, p + "mlp.gate_proj")
         up = self._linear(h, p + "mlp.up_proj")
-        return x + self._linear(F.silu(gate) * up, p + "mlp.down_proj")
+        down = self._linear(F.silu(gate) * up, p + "mlp.down_proj")
+        return x + self._all_reduce(down)
+
+    def logits_shard(self, hidden: torch.Tensor) -> torch.Tensor:
+        """FP32 logits of this rank's vocabulary shard, [rows, vocab_shard]."""
+        return (hidden @ self.w["lm_head.weight"].t()).float()
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """FP32 full-vocabulary logits."""
-        return (hidden @ self.w["lm_head.weight"].t()).float()
+        """FP32 full-vocabulary logits, gathered across the TP group."""
+        shard = self.logits_shard(hidden)
+        if self.tp.size > 1:
+            parts = [torch.empty_like(shard) for _ in range(self.tp.size)]
+            torch.distributed.all_gather(parts, shard, group=self.tp.device)
+            shard = torch.cat(parts, dim=-1)
+        vocab = self.full_config.vocab_size
+        return shard if shard.shape[-1] == vocab else shard[:, :vocab].contiguous()
+
+    @property
+    def vocab_shard_size(self) -> int:
+        return self.w["lm_head.weight"].shape[0]
+
+    def _vocab_shard(self, lm_head: torch.Tensor) -> torch.Tensor:
+        """Rows [r * shard, (r + 1) * shard) of the vocabulary padded with zero
+        rows to tp_size * shard."""
+        vocab = lm_head.shape[0]
+        shard = -(-vocab // self.tp.size)
+        start = self.tp.rank * shard
+        rows = lm_head[start : start + shard].to(self.full_config.dtype)
+        if rows.shape[0] < shard:
+            rows = torch.cat(
+                [rows, rows.new_zeros(shard - rows.shape[0], rows.shape[1])]
+            )
+        return rows.contiguous()
+
+    def _all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        if self.tp.size > 1:
+            torch.distributed.all_reduce(x, group=self.tp.device)
+        return x
 
     def _linear(self, x: torch.Tensor, name: str) -> torch.Tensor:
         return F.linear(x, self.w[name + ".weight"], self.w.get(name + ".bias"))

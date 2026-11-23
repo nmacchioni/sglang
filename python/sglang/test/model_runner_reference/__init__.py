@@ -16,10 +16,21 @@ REFERENCE_RUNNER = "reference"
 DISTRIBUTION = "sglang-reference-runner"
 
 
+# The same runner, returning vocabulary-sharded logits for SGLang to gather.
+SHARDED_REFERENCE_RUNNER = "reference-sharded"
+
+
 def create_plugin():
     from sglang.test.model_runner_reference.plugin import ReferenceRunner
 
     return ReferenceRunner()
+
+
+def create_sharded_plugin():
+    from sglang.srt.model_runner_plugins.api import LogitsLayout
+    from sglang.test.model_runner_reference.plugin import ReferenceRunner
+
+    return ReferenceRunner(logits_layout=LogitsLayout.VOCAB_SHARDED)
 
 
 def install_reference_runner(root: str) -> dict[str, str]:
@@ -31,6 +42,8 @@ def install_reference_runner(root: str) -> dict[str, str]:
     (info / "entry_points.txt").write_text(
         f"[{MODEL_RUNNERS_GROUP}]\n"
         f"{REFERENCE_RUNNER} = sglang.test.model_runner_reference:create_plugin\n"
+        f"{SHARDED_REFERENCE_RUNNER} = "
+        "sglang.test.model_runner_reference:create_sharded_plugin\n"
     )
     path = os.environ.get("PYTHONPATH")
     return {"PYTHONPATH": root if not path else f"{root}{os.pathsep}{path}"}
