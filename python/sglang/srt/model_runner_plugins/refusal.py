@@ -131,7 +131,10 @@ def launch_uses(cfg: ResolvedConfig) -> Uses:
     if cfg.unified_memory:
         uses[Feature.UNIFIED_MEMORY] = "drop --enable-unified-memory"
     if cfg.advanced_kv:
-        uses[Feature.ADVANCED_KV] = " ".join(cfg.advanced_kv)
+        # No external runner is driven with these sub-pools yet.
+        uses[Feature.ADVANCED_KV] = (
+            f"{' '.join(cfg.advanced_kv)}; serve this model with --model-runner sglang"
+        )
     if cfg.diffusion_algorithm is not None:
         uses[Feature.DIFFUSION_LLM] = f"dllm_algorithm={cfg.diffusion_algorithm}"
     if cfg.radix_cache:

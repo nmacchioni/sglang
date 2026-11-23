@@ -364,6 +364,61 @@ class FullAttentionLayer(msgspec.Struct, frozen=True, kw_only=True):
     v_slot_bytes: int
 
 
+class KVKind(str, Enum):
+    """A sub-pool beside the full-attention layers."""
+
+    # Sliding-window attention layers: token slots of their own, which SGLang
+    # maps from the full-attention slots it allocates.
+    SLIDING_WINDOW = "sliding_window"
+    # Recurrent (linear-attention, SSM) state: one slot per request row,
+    # copied to checkpoint slots that the prefix cache keeps.
+    RECURRENT_STATE = "recurrent_state"
+
+
+class KVBuffer(msgspec.Struct, frozen=True, kw_only=True):
+    """One buffer of one layer in a sub-pool: item ``i`` (a token slot or a
+    state slot) is the ``item_bytes`` bytes at ``ptr + i * item_bytes``."""
+
+    layer_id: int
+    # Which part of the layer's item this is ("k", "v", "conv0", "temporal").
+    name: str
+    ptr: int
+    item_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.item_bytes <= 0:
+            raise ValueError(
+                f"KVBuffer {self.name} of layer {self.layer_id} needs positive "
+                f"item_bytes, got {self.item_bytes}"
+            )
+
+
+class KVSubPool(msgspec.Struct, frozen=True, kw_only=True):
+    """Items of one kind the backing serves, every buffer ``num_items`` long."""
+
+    kind: KVKind
+    num_items: int
+    buffers: tuple[KVBuffer, ...]
+    # SLIDING_WINDOW: the tokens each query attends back over.
+    window: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.num_items <= 0 or not self.buffers:
+            raise ValueError(
+                f"a {self.kind.value} sub-pool needs items and buffers, got "
+                f"{self.num_items} items and {len(self.buffers)} buffers"
+            )
+        keys = [(b.layer_id, b.name) for b in self.buffers]
+        if len(set(keys)) != len(keys):
+            raise ValueError(f"a {self.kind.value} sub-pool lists a buffer twice")
+        if (self.kind is KVKind.SLIDING_WINDOW) != (self.window is not None):
+            raise ValueError("a window size goes with a sliding-window sub-pool")
+
+    def placement(self) -> tuple[tuple[int, str, int, int], ...]:
+        """What may not change within an epoch: every buffer's address and item size."""
+        return tuple((b.layer_id, b.name, b.ptr, b.item_bytes) for b in self.buffers)
+
+
 class AdmissionLimits(msgspec.Struct, frozen=True, kw_only=True):
     """The final token and request limits SGLang admits against."""
 
@@ -392,10 +447,10 @@ class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
     SGLang allocates every page and slot ID and translates logical IDs to
     physical slots; the runner owns the bytes. The backing serves physical
     slots ``[0, num_slots + page_size)``: SGLang hands out ``num_slots`` of
-    them and keeps the first page for padded rows. This version describes
-    full-attention layers only; a runner whose KV is not plain full attention
-    reports no layers. Addresses stay fixed for an ``epoch``: ``finalize`` may
-    change ``num_slots`` but never moves a layer.
+    them and keeps the first page for padded rows. Sliding-window layers and
+    recurrent state live in ``sub_pools``, each with its own item count.
+    Addresses stay fixed for an ``epoch``: ``finalize`` may change ``num_slots``
+    and sub-pool sizes but never moves a buffer.
     """
 
     epoch: int = 0
@@ -403,6 +458,7 @@ class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
     # Physical slots per layer that the backing serves.
     num_slots: int
     full_attention: tuple[FullAttentionLayer, ...] = ()
+    sub_pools: tuple[KVSubPool, ...] = ()
     # Set by ``finalize``; None from ``allocate``.
     limits: Optional[AdmissionLimits] = None
 
@@ -413,8 +469,26 @@ class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
                 f"page_size={self.page_size}, num_slots={self.num_slots}"
             )
         layer_ids = [layer.layer_id for layer in self.full_attention]
+        layer_ids += [
+            layer_id
+            for pool in self.sub_pools
+            for layer_id in sorted({b.layer_id for b in pool.buffers})
+        ]
         if len(set(layer_ids)) != len(layer_ids):
-            raise ValueError(f"KVLayout lists a layer twice: {layer_ids}")
+            raise ValueError(f"KVLayout lists a layer twice: {sorted(layer_ids)}")
+        kinds = [pool.kind for pool in self.sub_pools]
+        if len(set(kinds)) != len(kinds):
+            raise ValueError(f"KVLayout lists a sub-pool kind twice: {kinds}")
+
+    def sub_pool(self, kind: KVKind) -> Optional[KVSubPool]:
+        return next((p for p in self.sub_pools if p.kind is kind), None)
+
+    def placement(self) -> tuple:
+        """Every buffer's address and item size: fixed within an epoch."""
+        return (
+            self.full_attention,
+            tuple((p.kind, p.placement()) for p in self.sub_pools),
+        )
 
 
 class StepMode(str, Enum):
@@ -487,6 +561,43 @@ class Rows(msgspec.Struct, frozen=True, kw_only=True):
         return self.req_pool_indices.shape[0]
 
 
+class WindowTables(msgspec.Struct, frozen=True, kw_only=True):
+    """The sliding-window sub-pool's slots, translated by SGLang."""
+
+    # [T] device: the window slot input row t writes its K and V to.
+    write_slots: torch.Tensor
+    # [num_slots + page_size] device, persistent across steps: slot_map[s] is
+    # the window slot of full-attention slot s (``page_table`` holds full
+    # slots). Positions that fell out of the window map to a freed slot, which
+    # a runner must not read.
+    slot_map: torch.Tensor
+
+
+class StateTables(msgspec.Struct, frozen=True, kw_only=True):
+    """Recurrent-state slots, and the state operations SGLang scheduled for this
+    step. The operations run on the runner stream before any layer reads the
+    state, in this order: ``clear``, then the copies."""
+
+    # [R] device, persistent across steps: the state slot of request row r.
+    req_to_state: torch.Tensor
+    # [N] device: zero these state slots (a request that starts without state).
+    clear: Optional[torch.Tensor] = None
+    # [M] device each: copy state slot copy_src[i] to copy_dst[i] (a request
+    # resuming from a prefix-cache checkpoint).
+    copy_src: Optional[torch.Tensor] = None
+    copy_dst: Optional[torch.Tensor] = None
+    # Checkpoints the prefix cache keeps, [B] device each: where checkpoint_mask
+    # is set, request b's state after checkpoint_lens[b] tokens (extend steps;
+    # after the step on decode steps) is copied to slot checkpoint_slots[b].
+    checkpoint_slots: Optional[torch.Tensor] = None
+    checkpoint_mask: Optional[torch.Tensor] = None
+    checkpoint_lens: Optional[torch.Tensor] = None
+
+    def __post_init__(self) -> None:
+        if (self.copy_src is None) != (self.copy_dst is None):
+            raise ValueError("state copies name sources and destinations")
+
+
 class KVTables(msgspec.Struct, frozen=True, kw_only=True):
     """Physical KV slots, as SGLang allocated and translated them."""
 
@@ -495,6 +606,10 @@ class KVTables(msgspec.Struct, frozen=True, kw_only=True):
     # [R, max_context] device, persistent across steps: page_table[r, p] is the
     # slot holding position p of the request in row r. SGLang owns and writes it.
     page_table: torch.Tensor
+    # With a sliding-window sub-pool (KVLayout.sub_pools); None otherwise.
+    window: Optional[WindowTables] = None
+    # With a recurrent-state sub-pool; None otherwise.
+    state: Optional[StateTables] = None
 
 
 class LogitRows(str, Enum):
@@ -601,6 +716,12 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError(
                 f"Step has {num_tokens} input ids but "
                 f"{self.kv.write_slots.shape[0]} KV write slots"
+            )
+        window = self.kv.window
+        if window is not None and window.write_slots.shape[0] != num_tokens:
+            raise ValueError(
+                f"Step has {num_tokens} input ids but "
+                f"{window.write_slots.shape[0]} window write slots"
             )
         has_queries = self.rows.query_start is not None
         if self.mode in (StepMode.EXTEND, StepMode.MIXED) and not has_queries:

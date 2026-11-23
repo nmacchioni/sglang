@@ -26,9 +26,11 @@ from sglang.srt.model_runner_plugins.api import (
     OutputSpec,
     PromptLogprobs,
     Rows,
+    StateTables,
     Step,
     StepMode,
     StepOutput,
+    WindowTables,
 )
 
 if TYPE_CHECKING:
@@ -150,6 +152,8 @@ def build_step(
     inputs_ready: Optional[Any] = None,
     pp_in: Optional[dict[str, torch.Tensor]] = None,
     last_stage: bool = True,
+    window: Optional[WindowTables] = None,
+    state: Optional[StateTables] = None,
 ) -> Step:
     """The step ``forward_batch`` describes; every tensor is one of its own.
 
@@ -171,7 +175,12 @@ def build_step(
             query_lens_cpu=forward_batch.extend_seq_lens_cpu if extend else None,
             prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu if extend else None,
         ),
-        kv=KVTables(write_slots=forward_batch.out_cache_loc, page_table=page_table),
+        kv=KVTables(
+            write_slots=forward_batch.out_cache_loc,
+            page_table=page_table,
+            window=window,
+            state=state,
+        ),
         outputs=OutputSpec(
             logit_rows=(
                 LogitRows.LAST

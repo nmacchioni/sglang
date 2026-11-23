@@ -20,6 +20,7 @@ from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.srt.model_runner_plugins.api import (
     EAGER,
     GraphChoice,
+    KVTables,
     ModelRunnerExecutor,
     OutputBuffer,
     ProjectRequest,
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
         PPProxyTensors,
     )
     from sglang.srt.model_executor.model_runner import ModelRunnerOutput
+    from sglang.srt.model_runner_plugins.native_kv import NativeKV
     from sglang.srt.model_runner_plugins.native_steps import NativeStepLowering
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,7 @@ class StepForward:
         direct_fallback: bool = False,
         tp_group: Optional[Any] = None,
         last_stage: bool = True,
+        native_kv: Optional[NativeKV] = None,
     ):
         self.runner_name = runner_name
         self._executor = executor
@@ -78,6 +81,8 @@ class StepForward:
         self._tp_group = tp_group
         # False on pipeline stages before the last, which return pp_out.
         self._last_stage = last_stage
+        # Native only: the window and state tables beside the full-attention ones.
+        self._native_kv = native_kv
         self._input_logprobs = InputLogprobProcessor(vocab_size)
         self._lifetimes = OutputLifetimes(
             runner_name=runner_name,
@@ -90,6 +95,8 @@ class StepForward:
         # the step trace.
         self.last_execute_seconds = 0.0
         self.last_graph: GraphChoice = EAGER
+        # The last step's KV tables, for the step trace.
+        self.last_kv: Optional[KVTables] = None
 
     def takes(self, forward_batch: ForwardBatch) -> bool:
         """Whether ``forward_batch`` runs through the API; False leaves it to
@@ -121,6 +128,7 @@ class StepForward:
             inputs_ready=self._record_inputs_ready(forward_batch),
             pp_in=None if pp_proxy_tensors is None else pp_proxy_tensors.tensors,
             last_stage=self._last_stage,
+            **self._sub_pool_tables(forward_batch),
         )
         if self._lowering is None:
             plan = self._executor.plan(step)
@@ -132,6 +140,7 @@ class StepForward:
         out = self._executor.execute(plan)
         self.last_execute_seconds = time.perf_counter() - tic
         self.last_graph = graph
+        self.last_kv = step.kv
         if not isinstance(out, StepOutput):
             raise TypeError(
                 f"Model runner {self.runner_name!r} execute() returned "
@@ -156,6 +165,15 @@ class StepForward:
         return ModelRunnerOutput(
             logits_output=logits_output, can_run_graph=not graph.is_eager
         )
+
+    def _sub_pool_tables(self, forward_batch: ForwardBatch) -> dict:
+        kv = self._native_kv
+        if kv is None:
+            return {}
+        return {
+            "window": kv.window_tables(forward_batch),
+            "state": kv.state_tables(forward_batch),
+        }
 
     def take_lease(self) -> Optional[OutputLease]:
         """The last step's output for the scheduler to mark consumed (overlap

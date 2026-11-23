@@ -654,6 +654,7 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=out.logits_output,
                 replayed_graph=out.can_run_graph,
                 graph=steps.last_graph if via_steps else None,
+                kv=steps.last_kv if via_steps else None,
             )
         return out
 

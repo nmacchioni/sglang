@@ -23,7 +23,7 @@ from sglang.srt.runtime_context import get_parallel
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.model_runner_plugins.api import GraphChoice
+    from sglang.srt.model_runner_plugins.api import GraphChoice, KVTables
 
 
 class StepTrace:
@@ -69,6 +69,7 @@ class StepTrace:
         logits_output: Union[LogitsProcessorOutput, PPProxyTensors],
         replayed_graph: bool,
         graph: Optional[GraphChoice] = None,
+        kv: Optional[KVTables] = None,
     ) -> None:
         host_seconds = time.perf_counter() - tic
         # A pipeline stage before the last hands the next stage proxy tensors.
@@ -119,6 +120,8 @@ class StepTrace:
             ),
             "padded_num_tokens": forward_batch.global_num_tokens_cpu,
             "expert_layout": self._expert_layout_crc(),
+            # Step path only: the window and state tables the Step carried.
+            **_sub_pool_summary(kv),
         }
         with open(f"{self._prefix}.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -129,6 +132,7 @@ class StepTrace:
                 "out_cache_loc": forward_batch.out_cache_loc,
                 "seq_lens": forward_batch.seq_lens,
                 "req_pool_indices": forward_batch.req_pool_indices,
+                **_sub_pool_tensors(kv, forward_batch),
             }
             torch.save(
                 {
@@ -149,11 +153,49 @@ class StepTrace:
     def _expert_layout_crc(self) -> Optional[int]:
         if not self._expert_layout:
             return None
-        from sglang.srt.eplb.expert_location import (
-            get_global_expert_location_metadata,
-        )
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 
         metadata = get_global_expert_location_metadata()
         if metadata is None:
             return None
         return zlib.crc32(metadata.physical_to_logical_map_cpu.numpy().tobytes())
+
+
+def _sub_pool_summary(kv: Optional[KVTables]) -> dict:
+    """Which sub-pool tables a step carried, and how many state operations."""
+    if kv is None:
+        return {"kv_window": None, "kv_state": None}
+    state = kv.state
+    return {
+        "kv_window": kv.window is not None,
+        "kv_state": None
+        if state is None
+        else {
+            "clear": _rows(state.clear),
+            "copy": _rows(state.copy_src),
+            "checkpoints": (
+                0
+                if state.checkpoint_mask is None
+                else int(state.checkpoint_mask.sum().item())
+            ),
+        },
+    }
+
+
+def _rows(tensor: Optional[torch.Tensor]) -> int:
+    return 0 if tensor is None else int(tensor.shape[0])
+
+
+def _sub_pool_tensors(kv: Optional[KVTables], forward_batch: ForwardBatch) -> dict:
+    """The window write slots, and each request's state slot, as the Step named them."""
+    if kv is None:
+        return {}
+    tensors = {}
+    if kv.window is not None:
+        tensors["window_write_slots"] = kv.window.write_slots
+    if kv.state is not None:
+        tensors["state_slots"] = kv.state.req_to_state[forward_batch.req_pool_indices]
+        if kv.state.copy_src is not None:
+            tensors["state_copy_src"] = kv.state.copy_src
+            tensors["state_copy_dst"] = kv.state.copy_dst
+    return tensors
