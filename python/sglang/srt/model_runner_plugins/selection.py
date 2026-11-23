@@ -59,9 +59,17 @@ def check_model_runner_at_launch() -> None:
 
 
 # What an external runner can execute in this release, whatever it declares:
-# TP1 eager text with overlap scheduling off and SGLang sampling. Features of
-# later blocks stay refused until SGLang can drive them through the API.
-_EXTERNAL_FEATURES = frozenset({Feature.PROMPT_LOGPROBS, Feature.TOP_LOGPROBS})
+# TP1 text with SGLang sampling, with overlap scheduling and CUDA graphs when
+# declared. Features of later blocks stay refused until SGLang can drive them
+# through the API.
+_EXTERNAL_FEATURES = frozenset(
+    {
+        Feature.PROMPT_LOGPROBS,
+        Feature.TOP_LOGPROBS,
+        Feature.OVERLAP_SCHEDULE,
+        Feature.CUDA_GRAPHS,
+    }
+)
 
 
 def capabilities_in_this_release(

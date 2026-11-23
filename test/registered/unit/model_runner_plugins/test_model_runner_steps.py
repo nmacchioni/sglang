@@ -1,6 +1,7 @@
 """Model runner steps: Step as a view of the step's ForwardBatch, its checks,
-which batches take the API, prompt logprobs through project(), release order,
-and what this release lets an external runner run."""
+which batches take the API, prompt logprobs through project(), output
+lifetimes (release order and shared buffers), graph bucket choice, and what
+this release lets an external runner run."""
 
 import unittest
 from types import SimpleNamespace
@@ -18,6 +19,8 @@ from sglang.srt.model_runner_plugins.api import (
     AdmissionLimits,
     Capacity,
     GraphBuckets,
+    GraphChoice,
+    GraphPhase,
     KVLayout,
     KVTables,
     LoadContext,
@@ -25,7 +28,9 @@ from sglang.srt.model_runner_plugins.api import (
     Logits,
     MemoryNeeds,
     ModelInfo,
+    OutputBuffer,
     OutputSpec,
+    PromptLogprobs,
     ResolvedConfig,
     Rows,
     RunnerCapabilities,
@@ -35,6 +40,8 @@ from sglang.srt.model_runner_plugins.api import (
     StepOutput,
 )
 from sglang.srt.model_runner_plugins.external import ExternalRunner
+from sglang.srt.model_runner_plugins.graphs import bucket_graph_choice
+from sglang.srt.model_runner_plugins.lifetimes import OutputLifetimes
 from sglang.srt.model_runner_plugins.native_steps import NativeStepLowering
 from sglang.srt.model_runner_plugins.refusal import launch_refusals
 from sglang.srt.model_runner_plugins.selection import capabilities_in_this_release
@@ -138,7 +145,16 @@ class TestStepView(CustomTestCase):
                 self.assertEqual(step.outputs.prompt_logprobs, expected)
 
     def test_step_shape_checks(self):
-        def step(mode, *, tokens=2, slots=2, positions=2, batch=2, queries=False):
+        def step(
+            mode,
+            *,
+            tokens=2,
+            slots=2,
+            positions=2,
+            batch=2,
+            queries=False,
+            graph=GraphChoice(),
+        ):
             rows = Rows(
                 req_pool_indices=torch.zeros(batch, dtype=torch.int64),
                 seq_lens=torch.ones(batch, dtype=torch.int64),
@@ -151,9 +167,11 @@ class TestStepView(CustomTestCase):
                 rows=rows,
                 kv=KVTables(write_slots=torch.zeros(slots), page_table=_PAGE_TABLE),
                 outputs=OutputSpec(),
+                graph=graph,
             )
 
         step(StepMode.DECODE)
+        step(StepMode.DECODE, graph=GraphChoice(phase=GraphPhase.DECODE, bucket=2))
         step(StepMode.EXTEND, tokens=5, slots=5, positions=5, queries=True)
         for build, error in (
             (lambda: step(StepMode.DECODE, positions=3), "positions"),
@@ -162,6 +180,15 @@ class TestStepView(CustomTestCase):
             (lambda: step(StepMode.MIXED), "query offsets"),
             (lambda: step(StepMode.DECODE, queries=True), "one input row"),
             (lambda: step(StepMode.DECODE, tokens=3, slots=3, positions=3), "rows"),
+            (
+                lambda: step(
+                    StepMode.DECODE,
+                    graph=GraphChoice(phase=GraphPhase.DECODE, bucket=1),
+                ),
+                "cannot replay the decode graph of 1",
+            ),
+            (lambda: GraphChoice(bucket=4), "a phase and a bucket"),
+            (lambda: GraphBuckets(decode=(4, 2)), "strictly ascending"),
         ):
             with self.subTest(error=error):
                 with self.assertRaisesRegex(ValueError, error):
@@ -198,6 +225,7 @@ class TestStepSubset(CustomTestCase):
             "position scoring": dict(token_indices_to_pool=[torch.zeros(1)]),
             "input candidate selectors": dict(input_candidate_selectors=[None, 1]),
             "MLP-sync": dict(global_num_tokens_cpu=[2]),
+            "decode graph": dict(input_ids_from_graph=True),
         }
         for reason, fields in cases.items():
             with self.subTest(reason=reason):
@@ -302,10 +330,104 @@ class TestStepForward(CustomTestCase):
             _external_forward(executor).forward(_decode_batch())
 
 
+def _logits_out(tag):
+    return StepOutput(logits=Logits(tensor=torch.full((1, _VOCAB), float(tag))))
+
+
+class _Releases:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, out, after):
+        self.calls.append((int(out.logits.tensor[0, 0]) if out.logits else None, after))
+
+
+class TestOutputLifetimes(CustomTestCase):
+    def _lifetimes(self, *, deferred=True, shared=(OutputBuffer.LOGITS,)):
+        releases = _Releases()
+        return releases, OutputLifetimes(
+            runner_name="fake",
+            release=releases,
+            shared=frozenset(shared),
+            deferred=deferred,
+        )
+
+    def test_overlap_releases_in_production_order_with_each_consumer_event(self):
+        """A step consumed before an earlier one waits for it: a runner told
+        step n+1 is free while step n is not could reuse step n's buffer."""
+        releases, lifetimes = self._lifetimes(shared=())
+        leases = [lifetimes.produced(_logits_out(i)) for i in range(3)]
+        lifetimes.step_started()  # overlap: the next step starting frees nothing
+        self.assertEqual(releases.calls, [])
+        lifetimes.consumers_enqueued(leases[1], after="event-1")
+        self.assertEqual(releases.calls, [])
+        lifetimes.consumers_enqueued(leases[0], after="event-0")
+        self.assertEqual(releases.calls, [(0, "event-0"), (1, "event-1")])
+        with self.assertRaisesRegex(RuntimeError, "consumed twice"):
+            lifetimes.consumers_enqueued(leases[0], after=None)
+        lifetimes.close()
+        self.assertEqual(releases.calls[-1], (2, None))
+        self.assertEqual(lifetimes.pending, 0)
+
+    def test_without_overlap_the_next_step_releases_with_no_event(self):
+        releases, lifetimes = self._lifetimes(deferred=False)
+        lifetimes.produced(_logits_out(0))
+        lifetimes.step_started()
+        lifetimes.before_execute()
+        self.assertEqual(releases.calls, [(0, None)])
+
+    def test_a_shared_buffer_still_held_blocks_the_next_execute(self):
+        """The race of a graph replay rewriting logits its consumers have not
+        been told about fails loudly instead of corrupting a sample."""
+        _, lifetimes = self._lifetimes()
+        lease = lifetimes.produced(_logits_out(0))
+        with self.assertRaisesRegex(RuntimeError, "step 0's logits is not released"):
+            lifetimes.before_execute()
+        lifetimes.consumers_enqueued(lease, after="event")
+        lifetimes.before_execute()
+
+        # Outputs in buffers no later step writes may stay in flight.
+        prompt_only = StepOutput(logprobs=PromptLogprobs(token_logprobs=torch.zeros(1)))
+        lifetimes.produced(prompt_only)
+        lifetimes.before_execute()
+        _, unshared = self._lifetimes(shared=())
+        unshared.produced(_logits_out(0))
+        unshared.before_execute()
+
+
+class TestGraphChoice(CustomTestCase):
+    def test_smallest_bucket_that_holds_the_step(self):
+        buckets = GraphBuckets(decode=(1, 2, 4, 8), prefill=(16, 64))
+        for mode, bs, tokens, expected in (
+            (StepMode.DECODE, 1, 1, (GraphPhase.DECODE, 1)),
+            (StepMode.DECODE, 3, 3, (GraphPhase.DECODE, 4)),
+            (StepMode.DECODE, 8, 8, (GraphPhase.DECODE, 8)),
+            (StepMode.DECODE, 9, 9, None),
+            # Prefill buckets count tokens, not requests.
+            (StepMode.EXTEND, 2, 17, (GraphPhase.PREFILL, 64)),
+            (StepMode.MIXED, 9, 16, (GraphPhase.PREFILL, 16)),
+            (StepMode.EXTEND, 1, 65, None),
+            (StepMode.IDLE, 0, 0, None),
+        ):
+            with self.subTest(mode=mode, bs=bs, tokens=tokens):
+                choice = bucket_graph_choice(
+                    mode=mode, batch_size=bs, num_tokens=tokens, buckets=buckets
+                )
+                got = None if choice.is_eager else (choice.phase, choice.bucket)
+                self.assertEqual(got, expected)
+        eager_decode = bucket_graph_choice(
+            mode=StepMode.DECODE,
+            batch_size=1,
+            num_tokens=1,
+            buckets=GraphBuckets(prefill=(16,)),
+        )
+        self.assertTrue(eager_decode.is_eager)
+
+
 class TestExternalRelease(CustomTestCase):
-    def test_external_runners_keep_only_block_3_features(self):
-        """Whatever an external runner declares, launches outside TP1 eager
-        text with overlap off are refused until their block lands."""
+    def test_external_runners_keep_only_features_of_landed_blocks(self):
+        """Whatever an external runner declares, launches outside TP1 text are
+        refused until their block lands; overlap and graphs have landed."""
         declared = RunnerCapabilities.all_supported()
         external = capabilities_in_this_release(declared, native=False)
         self.assertIs(capabilities_in_this_release(declared, native=True), declared)
@@ -320,9 +442,25 @@ class TestExternalRelease(CustomTestCase):
                 unified_memory=True,
             ),
         )
-        self.assertEqual(len(reasons), 5, reasons)
+        self.assertEqual(len(reasons), 3, reasons)
+        self.assertFalse(any("graph" in r or "overlap" in r for r in reasons))
         self.assertTrue(external.prompt_logprobs and external.top_logprobs)
+        self.assertTrue(external.cuda_graphs and external.overlap_schedule)
         self.assertEqual(launch_refusals(external, ResolvedConfig(model_path="m")), [])
+
+    def test_graphs_are_refused_per_undeclared_phase(self):
+        both = ResolvedConfig(model_path="m", cuda_graph_phases=("decode", "prefill"))
+        decode_only = RunnerCapabilities(
+            cuda_graphs=True, cuda_graph_phases=(GraphPhase.DECODE,)
+        )
+        self.assertEqual(
+            launch_refusals(decode_only, both),
+            ["CUDA graphs for prefill (pass --disable-prefill-cuda-graph)"],
+        )
+        decode = ResolvedConfig(model_path="m", cuda_graph_phases=("decode",))
+        self.assertEqual(launch_refusals(decode_only, decode), [])
+        # Without the capability, one reason covers every phase.
+        self.assertEqual(len(launch_refusals(RunnerCapabilities(), both)), 1)
 
     def test_architecture_list_refuses_other_models(self):
         caps = RunnerCapabilities(architectures=("Qwen3ForCausalLM",))

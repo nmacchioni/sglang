@@ -5672,6 +5672,9 @@ class Scheduler(
                                     return_logprob=batch.return_logprob,
                                     return_hidden_states=batch.return_hidden_states,
                                 )
+                                self._release_step_outputs(
+                                    batch_result, consumer_stream=self.forward_stream
+                                )
                             else:
                                 self._copy_result_to_cpu(batch_result, batch)
                         else:
@@ -6011,6 +6014,24 @@ class Scheduler(
                 copy_fn()
             else:
                 batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
+        # The copy stream waited on the forward stream: behind both consumers.
+        self._release_step_outputs(batch_result, consumer_stream=self.copy_stream)
+
+    def _release_step_outputs(
+        self, batch_result: GenerationBatchResult, *, consumer_stream
+    ) -> None:
+        """Hand a --model-runner step's outputs back once every consumer of them
+        (sampling, the host copy) is enqueued on ``consumer_stream``; no-op
+        without a runner lease."""
+        lease = batch_result.step_output_lease
+        if lease is None:
+            return
+        batch_result.step_output_lease = None
+        after = self.device_module.Event()
+        after.record(consumer_stream)
+        # SGLang keeps no view of a runner buffer past its release.
+        batch_result.logits_output.next_token_logits = None
+        self.tp_worker.step_forward.consumers_enqueued(lease, after)
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch

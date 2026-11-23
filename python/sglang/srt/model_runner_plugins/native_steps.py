@@ -4,6 +4,11 @@
 Rebuilding a ``ForwardBatch`` from ``Step`` would re-derive the sampling,
 logprob and attention metadata ``init_new`` already made, and copy the inputs a
 second time; reusing the lowering keeps the step path at zero device copies.
+
+Graphs stay the native graph runners': they capture as today and decide replay
+inside ``ModelRunner.forward``. ``native_graph_choice`` asks them the same
+question first, so ``Step.graph`` reports the decision, and ``native_execute``
+checks the forward took it.
 """
 
 from __future__ import annotations
@@ -15,6 +20,9 @@ import msgspec
 
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_runner_plugins.api import (
+    EAGER,
+    GraphChoice,
+    GraphPhase,
     Logits,
     PromptLogprobs,
     Step,
@@ -27,6 +35,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.utils.device import is_confidential_compute
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -64,24 +73,26 @@ class NativeStepLowering:
 
 class NativePlan(msgspec.Struct, frozen=True, kw_only=True):
     forward_batch: object
+    graph: GraphChoice = EAGER
 
 
 def native_step_refusals(model_runner: ModelRunner) -> list[str]:
     """Why the built-in runner keeps today's path for every step; empty when
-    its eager TP1 steps run through the API. Fixed for the runner's lifetime."""
+    its TP1 steps run through the API. Fixed for the runner's lifetime."""
     reasons = []
     parallel = get_parallel()
-    if parallel.tp_size > 1 or parallel.pp_size > 1 or parallel.attn_dp_size > 1:
-        reasons.append("model parallelism")
-    if not get_schedule().disable_overlap_schedule:
-        reasons.append("overlap scheduling")
-    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
-
-    prefill_graphs = model_runner.prefill_cuda_graph_runner
-    if model_runner.decode_cuda_graph_runner is not None or (
-        prefill_graphs is not None and not isinstance(prefill_graphs, EagerRunner)
+    if (
+        parallel.tp_size > 1
+        or parallel.pp_size > 1
+        or parallel.attn_dp_size > 1
+        or parallel.attn_cp_size > 1
+        or parallel.dcp_size > 1
     ):
-        reasons.append("CUDA graphs")
+        reasons.append("model parallelism")
+    if not get_schedule().disable_overlap_schedule and is_confidential_compute():
+        # Host copies then run on a worker thread, unordered with the streams
+        # a release event could be recorded on.
+        reasons.append("overlap scheduling with asynchronous host copies")
     if get_spec().speculative_algorithm is not None:
         reasons.append("speculative decoding")
     if get_lora().enable_lora:
@@ -107,8 +118,50 @@ def native_step_refusals(model_runner: ModelRunner) -> list[str]:
     return reasons
 
 
+def native_graph_choice(
+    *, model_runner: ModelRunner, forward_batch: ForwardBatch
+) -> GraphChoice:
+    """The graph ``ModelRunner.forward`` will replay for ``forward_batch``: the
+    same eligibility checks, in the same order, as ``_forward_raw``."""
+    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+
+    mode = forward_batch.forward_mode
+    decode = model_runner.decode_cuda_graph_runner
+    if mode.is_cuda_graph() and decode and decode.can_run_graph(forward_batch):
+        return GraphChoice(
+            phase=GraphPhase.DECODE,
+            bucket=_bucket(decode, forward_batch.batch_size, decode.capture_bs),
+        )
+    prefill = model_runner.prefill_cuda_graph_runner
+    if (
+        mode.is_extend()
+        and prefill is not None
+        and not isinstance(prefill, EagerRunner)
+        and prefill.can_run_graph(forward_batch)
+    ):
+        return GraphChoice(
+            phase=GraphPhase.PREFILL,
+            bucket=_bucket(
+                prefill, forward_batch.input_ids.shape[0], prefill.capture_num_tokens
+            ),
+        )
+    return EAGER
+
+
+def _bucket(runner, rows: int, captured) -> int:
+    if rows > captured[-1]:
+        # Unpadded replay (disable_padding) of a shape the backend admits.
+        return rows
+    return runner._pad_to_bucket(rows, captured)
+
+
 def native_execute(*, model_runner: ModelRunner, plan: NativePlan) -> StepOutput:
     out = model_runner.forward(plan.forward_batch)
+    if out.can_run_graph == plan.graph.is_eager:
+        raise RuntimeError(
+            f"Step.graph said {_describe(plan.graph)} but the native forward "
+            f"{'replayed a graph' if out.can_run_graph else 'ran eager'}"
+        )
     if (
         out.expert_distribution_metrics is not None
         or out.routed_experts_output is not None
@@ -117,6 +170,12 @@ def native_execute(*, model_runner: ModelRunner, plan: NativePlan) -> StepOutput
     ):
         raise RuntimeError("a native forward on the Step path produced captures")
     return step_output_of(out.logits_output)
+
+
+def _describe(graph: GraphChoice) -> str:
+    if graph.is_eager:
+        return "eager"
+    return f"{graph.phase.value} graph of {graph.bucket}"
 
 
 def step_output_of(logits_output: LogitsProcessorOutput) -> StepOutput:

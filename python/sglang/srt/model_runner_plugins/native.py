@@ -18,6 +18,7 @@ from sglang.srt.model_runner_plugins.api import (
     KVLayout,
     LoadContext,
     LoadResult,
+    OutputBuffer,
     ProjectRequest,
     RefusedCombination,
     ResolvedConfig,
@@ -50,6 +51,8 @@ _NATIVE_CAPABILITIES = RunnerCapabilities.all_supported(
         ),
     ),
     native_prompt_logprobs=True,
+    # Graph runners write logits into one persistent buffer (GraphSharedOutput).
+    shared_outputs=(OutputBuffer.LOGITS,),
 )
 
 
@@ -110,7 +113,9 @@ class SGLangRunnerPlugin:
         return native_kv_layout(tp_worker=host.tp_worker, with_limits=True)
 
     def plan(self, step: Step) -> NativePlan:
-        return NativePlan(forward_batch=self.lowering.forward_batch_of(step))
+        return NativePlan(
+            forward_batch=self.lowering.forward_batch_of(step), graph=step.graph
+        )
 
     def execute(self, plan: NativePlan) -> StepOutput:
         return native_execute(
@@ -123,8 +128,10 @@ class SGLangRunnerPlugin:
         )
 
     def release(self, out: StepOutput, after: object) -> None:
-        # Native outputs live in per-forward tensors, or in graph buffers whose
-        # reuse native replay already orders.
+        # Native outputs live in per-forward tensors, or in the shared logits
+        # buffer, whose consumers (sampling) run on the runner stream before the
+        # next replay; host copies read only sampler outputs. That stream order
+        # is the native replay fence, so ``after`` adds nothing to wait on.
         pass
 
     def close(self) -> None:

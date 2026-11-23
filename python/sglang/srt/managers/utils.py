@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+    from sglang.srt.model_runner_plugins.lifetimes import OutputLease
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,
         ScheduledRequestMetrics,
@@ -223,6 +224,10 @@ class GenerationBatchResult:
     # ForwardObserver output, copied together with the sampling observer's.
     forward_auxiliary_output: Optional[DeviceAuxiliaryOutput] = None
     auxiliary_host_output: Optional[HostAuxiliaryOutput] = None
+
+    # Under --model-runner with overlap scheduling: the runner's step output,
+    # released once its last consumer (sampling, host copy) is enqueued.
+    step_output_lease: Optional[OutputLease] = None
 
     @property
     def has_sampled_token_ids(self) -> bool:

@@ -18,11 +18,13 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_runner_plugins.api import (
     Capacity,
     GraphBuckets,
+    GraphChoice,
     KVLayout,
     LoadContext,
     LoadResult,
     ModelRunnerExecutor,
     ModelRunnerLifecycle,
+    RunnerCapabilities,
     RuntimeConfig,
 )
 from sglang.srt.model_runner_plugins.external import ExternalRunner
@@ -42,6 +44,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils.device import is_confidential_compute
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -126,22 +129,20 @@ class ModelRunnerStartup:
                     "release, close)."
                 )
             plugin = ExternalRunner(name=name, plugin=runner.plugin, host=native_host)
-        return cls(
-            runner_name=name,
-            plugin=plugin,
-            native_prompt_logprobs=capabilities.native_prompt_logprobs,
-        )
+        return cls(runner_name=name, plugin=plugin, capabilities=capabilities)
 
     def __init__(
         self,
         *,
         runner_name: str,
         plugin: ModelRunnerLifecycle,
-        native_prompt_logprobs: bool = False,
+        capabilities: RunnerCapabilities = RunnerCapabilities(),
     ):
         self.runner_name = runner_name
         self._plugin = plugin
-        self._native_prompt_logprobs = native_prompt_logprobs
+        self._capabilities = capabilities
+        # The buckets passed to capture(); SGLang replays external steps in them.
+        self._buckets = GraphBuckets()
         self.phase = StartupPhase.NEW
         self.load_result: Optional[LoadResult] = None
         self.layout: Optional[KVLayout] = None
@@ -158,12 +159,24 @@ class ModelRunnerStartup:
     def step_forward(self, *, tp_worker: TpModelWorker) -> Optional[StepForward]:
         """The worker's forwards through the runner's steps, after startup; None
         when the built-in runner keeps every step on the direct path."""
-        from sglang.srt.model_runner_plugins.native_steps import native_step_refusals
+        from sglang.srt.model_runner_plugins.native_steps import (
+            native_graph_choice,
+            native_step_refusals,
+        )
         from sglang.srt.model_runner_plugins.step_forward import StepForward
 
         model_runner = tp_worker.model_runner
+        overlap = not get_schedule().disable_overlap_schedule
         if self.is_external:
+            if overlap and is_confidential_compute():
+                raise ValueError(
+                    f"--model-runner {self.runner_name} cannot run overlap "
+                    "scheduling with asynchronous host copies (confidential "
+                    "computing); pass --disable-overlap-schedule"
+                )
             executor, lowering = self._plugin.plugin, None
+            buckets = self._buckets
+            choose_graph = lambda batch: _external_graph(batch, buckets=buckets)
         else:
             refusals = native_step_refusals(model_runner)
             if refusals:
@@ -174,12 +187,18 @@ class ModelRunnerStartup:
                 )
                 return None
             executor, lowering = self._plugin, self._plugin.lowering
+            choose_graph = lambda batch: native_graph_choice(
+                model_runner=model_runner, forward_batch=batch
+            )
         self._step_forward = StepForward(
             runner_name=self.runner_name,
             executor=executor,
             page_table=model_runner.req_to_token_pool.req_to_token,
             vocab_size=model_runner.model_config.vocab_size,
-            native_prompt_logprobs=self._native_prompt_logprobs,
+            native_prompt_logprobs=self._capabilities.native_prompt_logprobs,
+            overlap=overlap,
+            shared_outputs=self._capabilities.shared_outputs,
+            choose_graph=choose_graph,
             lowering=lowering,
             direct_fallback=not self.is_external,
         )
@@ -200,6 +219,7 @@ class ModelRunnerStartup:
             )
             self.layout = allocated
             self.phase = StartupPhase.ALLOCATED
+            self._buckets = inputs.buckets
             self._plugin.capture(inputs.buckets)
             self.phase = StartupPhase.CAPTURED
             final = self._checked(
@@ -271,4 +291,16 @@ def _buckets(graphs, phase: str) -> tuple[int, ...]:
     config = graphs[phase]
     if config.backend == Backend.DISABLED or not config.bs:
         return ()
-    return tuple(config.bs)
+    return tuple(sorted(set(config.bs)))
+
+
+def _external_graph(forward_batch, *, buckets: GraphBuckets) -> GraphChoice:
+    from sglang.srt.model_runner_plugins.graphs import bucket_graph_choice
+    from sglang.srt.model_runner_plugins.steps import step_mode
+
+    return bucket_graph_choice(
+        mode=step_mode(forward_batch),
+        batch_size=forward_batch.batch_size,
+        num_tokens=forward_batch.input_ids.shape[0],
+        buckets=buckets,
+    )

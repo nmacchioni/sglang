@@ -747,7 +747,9 @@ class _SchedulerWorker:
             device="cuda",
             forward_stream=object(),
             weight_load_mem_usage=1.0,
-            # Overlap is on in these launches, so the steps keep the direct path.
+            # Read when the steps start running through the API.
+            model_config=SimpleNamespace(vocab_size=32000),
+            req_to_token_pool=SimpleNamespace(req_to_token=None),
             decode_cuda_graph_runner=None,
             prefill_cuda_graph_runner=None,
             is_generation=True,
