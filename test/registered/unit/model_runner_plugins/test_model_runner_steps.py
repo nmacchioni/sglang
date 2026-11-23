@@ -226,6 +226,37 @@ def _dp_decode_batch(*, published, votes=(True, False)):
     return batch
 
 
+@contextlib.contextmanager
+def _fake_runtime(prefill_buckets, *, attn_tp_size=1):
+    """What dp_prefill_graph_bucket reads besides the batch."""
+    from unittest.mock import patch
+
+    graph = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=prefill_buckets))
+    )
+    with contextlib.ExitStack() as stack:
+        for target, value in (
+            ("sglang.srt.runtime_context.get_exec", SimpleNamespace(graph=graph)),
+            (
+                "sglang.srt.runtime_context.get_parallel",
+                SimpleNamespace(attn_tp_size=attn_tp_size),
+            ),
+            ("sglang.srt.layers.cp.base.get_cp_strategy", None),
+            (
+                "sglang.srt.model_executor.forward_batch_info."
+                "prefill_graph_tolerates_sum_len",
+                False,
+            ),
+            (
+                "sglang.srt.model_executor.forward_batch_info."
+                "_mega_moe_materializes_idle_rank",
+                False,
+            ),
+        ):
+            stack.enter_context(patch(target, lambda *a, v=value: v))
+        yield
+
+
 class TestRendezvous(CustomTestCase):
     """Under DP attention a rank's peers size the step's collectives from what
     the rank published at the MLP-sync gather; a step that disagrees with it
@@ -247,9 +278,30 @@ class TestRendezvous(CustomTestCase):
         self.assertEqual(step.dp.global_num_tokens, (3, 2))
         self.assertTrue(step.dp.decode_graph)
         self.assertFalse(step.dp.prefill_graph)
+        self.assertIsNone(step.dp.tbo_split_seq_index)
         # An idle peer, and no rendezvous at all, are fine too.
         self._step(_dp_decode_batch(published=[0, 2]))
         self.assertIsNone(self._step(_decode_batch()).dp)
+
+    def test_step_carries_the_two_batch_overlap_split(self):
+        batch = _dp_decode_batch(published=[3, 2])
+        batch.tbo_split_seq_index = 1
+        self.assertEqual(self._step(batch).dp.tbo_split_seq_index, 1)
+        batch.tbo_split_seq_index = 3
+        with self.assertRaisesRegex(ValueError, "split at request 3 of a step with 2"):
+            self._step(batch)
+
+    def test_a_decode_step_replays_a_prefill_graph_only_presented_as_extend(self):
+        """A decode rank pads into one-token extends when a peer extends and the
+        rendezvous voted prefill graphs; otherwise a prefill graph on a decode
+        step is a lowering bug."""
+        prefill = GraphChoice(phase=GraphPhase.PREFILL, bucket=8)
+        batch = _dp_decode_batch(published=[5, 2], votes=(False, True))
+        batch.is_extend_in_batch = True
+        self.assertEqual(self._step(batch, prefill).graph, prefill)
+        batch.is_extend_in_batch = False
+        with self.assertRaisesRegex(ValueError, "presented as an extend"):
+            self._step(batch, prefill)
 
     def test_a_step_unlike_its_published_rows_or_votes_is_refused(self):
         for batch, graph, error in (
@@ -344,13 +396,7 @@ class TestStepSubset(CustomTestCase):
             "beam search": dict(beam=object()),
             "position scoring": dict(token_indices_to_pool=[torch.zeros(1)]),
             "input candidate selectors": dict(input_candidate_selectors=[None, 1]),
-            "two-batch overlap": dict(tbo_split_seq_index=1),
             "decode graph": dict(input_ids_from_graph=True),
-            "prefill graph step under DP attention": dict(
-                global_num_tokens_cpu=[2, 0],
-                is_extend_in_batch=True,
-                can_run_dp_prefill_cuda_graph=True,
-            ),
         }
         for reason, fields in cases.items():
             with self.subTest(reason=reason):
@@ -358,6 +404,39 @@ class TestStepSubset(CustomTestCase):
                 for name, value in fields.items():
                     setattr(batch, name, value)
                 self.assertIn(reason, step_refusal(batch))
+
+    def test_dp_prefill_graph_steps_take_the_api_when_every_rank_shares_a_bucket(self):
+        """The forward pads every DP rank of such a step to one captured prefill
+        bucket; the Step names that bucket on every rank, idle and decode ranks
+        included. Without a shared bucket (the ranks' tokens exceed the largest)
+        each rank would pick its own graph after padding: direct path."""
+        from sglang.srt.model_runner_plugins import steps
+
+        def batch(published, buckets=(4, 8, 16)):
+            b = _decode_batch()
+            b.global_num_tokens_cpu = published
+            b.global_num_tokens_for_logprob_cpu = published
+            b.is_extend_in_batch = True
+            b.can_run_dp_prefill_cuda_graph = True
+            b.tbo_split_seq_index = 1
+            return b, _fake_runtime(buckets)
+
+        for published, buckets, bucket in (
+            ([2, 5], (4, 8, 16), 8),
+            ([2, 0], (4, 8, 16), 4),
+            ([2, 17], (4, 8, 16), None),
+            ([2, 5], (), None),
+        ):
+            with self.subTest(published=published, buckets=buckets):
+                b, runtime = batch(published, buckets)
+                with runtime:
+                    self.assertEqual(steps.dp_prefill_graph_bucket(b), bucket)
+                    refusal = step_refusal(b)
+                if bucket is None:
+                    self.assertIn("without a shared bucket", refusal)
+                else:
+                    # Two-batch overlap steps take the API as well.
+                    self.assertIsNone(refusal)
 
 
 class _FakeExecutor:
@@ -576,8 +655,8 @@ class TestExternalRelease(CustomTestCase):
             [
                 "pipeline parallelism (pp_size=2)",
                 "data-parallel attention (attn_dp_size=2)",
-                "expert parallelism (ep_size=2)",
-                "context parallelism (attn_cp_size=2)",
+                "expert parallelism (ep_size=2; pass --ep-size 1)",
+                "context parallelism (attn_cp_size=2; pass --attn-cp-size 1)",
                 "unified memory (drop --enable-unified-memory)",
                 "KV beyond plain full attention (sliding_window)",
             ],
@@ -587,22 +666,45 @@ class TestExternalRelease(CustomTestCase):
         self.assertTrue(external.cuda_graphs and external.overlap_schedule)
         self.assertEqual(launch_refusals(external, ResolvedConfig(model_path="m")), [])
 
-    def test_builtin_runner_keeps_the_direct_path_outside_tp_pp_dp_attention(self):
-        """Context parallelism and expert parallelism (with EPLB and elastic
-        EP) have not landed: the built-in runner keeps every step on the
-        direct path for them, while TP, PP and DP attention take the API."""
-        landed = dict(tp_size=2, pp_size=2, attn_dp_size=2, attn_cp_size=1, dcp_size=1)
+    def test_builtin_runner_keeps_the_direct_path_for_dcp_and_elastic_ep(self):
+        """Prefill CP, EP and EPLB take the API on the built-in runner; decode
+        CP and elastic EP keep the direct path, and so does the expert
+        balancedness report, which returns metrics from each forward."""
         cases = {
             "": {},
-            "context parallelism": dict(attn_cp_size=2),
             "decode context parallelism": dict(dcp_size=2),
-            "expert parallelism": dict(moe_ep_size=2),
+            "elastic EP": dict(elastic_ep_backend="mooncake"),
+            "per-forward captures": dict(balancedness=True),
         }
-        for case, sizes in cases.items():
+        for case, options in cases.items():
             with self.subTest(case=case):
-                refusals = _native_refusals(**{**landed, "moe_ep_size": 1, **sizes})
-                want = case.removeprefix("decode ")
-                self.assertEqual(refusals, [want] if want else [])
+                self.assertEqual(_native_refusals(**options), [case] if case else [])
+
+    def test_external_refusals_say_how_to_launch_without_the_feature(self):
+        """Context parallelism, expert parallelism and two-batch overlap stay
+        refused for external runners in this release, with the flag to drop."""
+        external = capabilities_in_this_release(
+            RunnerCapabilities.all_supported(), native=False
+        )
+        reasons = launch_refusals(
+            external,
+            ResolvedConfig(
+                model_path="m",
+                moe_ep_size=4,
+                attn_cp_size=2,
+                dcp_size=2,
+                two_batch_overlap=True,
+            ),
+        )
+        self.assertEqual(
+            reasons,
+            [
+                "expert parallelism (ep_size=4; pass --ep-size 1)",
+                "context parallelism (attn_cp_size=2 dcp_size=2; pass "
+                "--attn-cp-size 1 --dcp-size 1)",
+                "two-batch overlap (drop --enable-two-batch-overlap)",
+            ],
+        )
 
     def test_graphs_are_refused_per_undeclared_phase(self):
         both = ResolvedConfig(model_path="m", cuda_graph_phases=("decode", "prefill"))
@@ -629,7 +731,7 @@ class TestExternalRelease(CustomTestCase):
         self.assertEqual(launch_refusals(caps, cfg), [])
 
 
-def _native_refusals(**parallel):
+def _native_refusals(*, dcp_size=1, elastic_ep_backend=None, balancedness=False):
     from unittest.mock import patch
 
     from sglang.srt.model_runner_plugins import native_steps
@@ -642,14 +744,22 @@ def _native_refusals(**parallel):
     )
     exec_ = SimpleNamespace(
         features=features,
-        moe=SimpleNamespace(expert_distribution_recorder_mode=None),
+        moe=SimpleNamespace(
+            # EPLB statistics alone keep the API.
+            expert_distribution_recorder_mode="stat",
+            elastic_ep_backend=elastic_ep_backend,
+        ),
         dllm=SimpleNamespace(dllm_algorithm=None),
     )
     model_runner = SimpleNamespace(
         is_generation=True, is_multimodal=False, is_draft_worker=False
     )
     getters = dict(
-        get_parallel=SimpleNamespace(**parallel),
+        reports_expert_balancedness=balancedness,
+        # Prefill CP and EP sizes are not consulted.
+        get_parallel=SimpleNamespace(
+            dcp_size=dcp_size, attn_cp_size=2, moe_ep_size=2, tp_size=2
+        ),
         get_schedule=SimpleNamespace(disable_overlap_schedule=True),
         get_spec=SimpleNamespace(speculative_algorithm=None),
         get_lora=SimpleNamespace(enable_lora=False),

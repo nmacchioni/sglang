@@ -43,6 +43,7 @@ _EVERY_LAUNCH_FEATURE = ResolvedConfig(
     moe_ep_size=2,
     attn_cp_size=2,
     dcp_size=2,
+    two_batch_overlap=True,
     cuda_graph_phases=("decode", "prefill"),
     overlap_schedule=True,
     speculative_algorithm="EAGLE",

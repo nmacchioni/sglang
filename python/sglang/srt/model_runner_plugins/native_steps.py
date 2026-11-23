@@ -28,12 +28,14 @@ from sglang.srt.model_runner_plugins.api import (
     Step,
     StepOutput,
 )
+from sglang.srt.model_runner_plugins.steps import dp_prefill_graph_bucket
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
     get_parallel,
     get_schedule,
     get_spec,
+    reports_expert_balancedness,
 )
 from sglang.srt.utils.device import is_confidential_compute
 
@@ -96,16 +98,25 @@ def native_step_refusals(model_runner: ModelRunner) -> list[str]:
 
     Tensor parallelism runs through the API: every TP rank lowers the same
     batch from the same replicated schedule, so each member reaches the same
-    graph decision and SGLang adds no collective to agree on it. Under DP
-    attention and pipeline parallelism the decisions come from the existing
-    MLP-sync gather and the stage schedule, which ``Step.dp`` and ``pp_in``
-    carry; two-batch overlap steps keep the direct path."""
+    graph decision and SGLang adds no collective to agree on it. Prefill context
+    parallelism and expert parallelism are the same: whether an extend step is
+    sharded across the CP group, and how tokens are dispatched to experts, are
+    functions of that batch (and, under DP attention, of the MLP-sync gather).
+    Under DP attention and pipeline parallelism the decisions come from the
+    existing MLP-sync gather and the stage schedule, which ``Step.dp`` (with
+    the two-batch-overlap split) and ``pp_in`` carry. EPLB rebalances inside
+    the native forward, on the same forward count on every rank as today.
+
+    Elastic EP keeps the direct path: on a rank fault the forward rebalances
+    and runs again, and scale-up rewrites the DP layout and recaptures graphs,
+    decisions taken inside the forward rather than at SGLang's rendezvous.
+    Decode context parallelism keeps it too, until a DCP configuration (MLA or
+    DSA models) proves the step path bitwise against it."""
     reasons = []
-    parallel = get_parallel()
-    if parallel.attn_cp_size > 1 or parallel.dcp_size > 1:
-        reasons.append("context parallelism")
-    if parallel.moe_ep_size > 1:
-        reasons.append("expert parallelism")
+    if get_parallel().dcp_size > 1:
+        reasons.append("decode context parallelism")
+    if get_exec().moe.elastic_ep_backend is not None:
+        reasons.append("elastic EP")
     if not get_schedule().disable_overlap_schedule and is_confidential_compute():
         # Host copies then run on a worker thread, unordered with the streams
         # a release event could be recorded on.
@@ -120,7 +131,9 @@ def native_step_refusals(model_runner: ModelRunner) -> list[str]:
         or features.enable_return_routed_experts
         or features.enable_prefill_weight_versions
         or features.enable_encoder_swa_bounded_replay
-        or get_exec().moe.expert_distribution_recorder_mode is not None
+        # The recorder alone (EPLB statistics, dumps on request) returns
+        # nothing per forward; the balancedness report does.
+        or reports_expert_balancedness()
     ):
         reasons.append("per-forward captures")
     if get_exec().dllm.dllm_algorithm is not None:
@@ -140,6 +153,9 @@ def native_graph_choice(
 ) -> GraphChoice:
     """The graph ``ModelRunner.forward`` will replay for ``forward_batch``: the
     same eligibility checks, in the same order, as ``_forward_raw``."""
+    from sglang.srt.model_executor.model_runner import (
+        _prefill_cuda_graph_allows_context_parallel,
+    )
     from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 
     mode = forward_batch.forward_mode
@@ -156,11 +172,18 @@ def native_graph_choice(
             phase=GraphPhase.DECODE, bucket=_bucket(decode, rows, decode.capture_bs)
         )
     prefill = model_runner.prefill_cuda_graph_runner
+    if prefill is None or isinstance(prefill, EagerRunner):
+        return EAGER
+    dp_bucket = dp_prefill_graph_bucket(forward_batch)
+    if dp_bucket is not None:
+        # Under DP attention the forward pads every rank, idle and decode ranks
+        # included, to the shared bucket before it asks the graph runner; the
+        # rendezvous's vote is that every rank can replay it.
+        return GraphChoice(phase=GraphPhase.PREFILL, bucket=dp_bucket)
     if (
         mode.is_extend()
-        and prefill is not None
-        and not isinstance(prefill, EagerRunner)
         and prefill.can_run_graph(forward_batch)
+        and _prefill_cuda_graph_allows_context_parallel(prefill, forward_batch)
     ):
         global_num_tokens = forward_batch.global_num_tokens_cpu
         rows = (
@@ -183,14 +206,31 @@ def _bucket(runner, rows: int, captured) -> int:
 
 
 def native_execute(*, model_runner: ModelRunner, plan: NativePlan) -> StepOutput:
-    out = model_runner.forward(
-        plan.forward_batch, pp_proxy_tensors=plan.pp_proxy_tensors
-    )
+    forward_batch = plan.forward_batch
+    out = model_runner.forward(forward_batch, pp_proxy_tensors=plan.pp_proxy_tensors)
     if out.can_run_graph == plan.graph.is_eager:
         raise RuntimeError(
             f"Step.graph said {_describe(plan.graph)} but the native forward "
             f"{'replayed a graph' if out.can_run_graph else 'ran eager'}"
         )
+    if (
+        plan.graph.phase is GraphPhase.PREFILL
+        and forward_batch.global_num_tokens_cpu is not None
+    ):
+        # The forward padded every rank to one bucket (MAX_LEN), as the Step said.
+        padding, padded = (
+            forward_batch.dp_padding_mode,
+            forward_batch.global_num_tokens_cpu,
+        )
+        if (
+            padding is None
+            or not padding.is_max_len()
+            or set(padded) != {plan.graph.bucket}
+        ):
+            raise RuntimeError(
+                f"Step.graph said {_describe(plan.graph)} on every DP rank but "
+                f"the native forward padded the ranks to {padded} ({padding})"
+            )
     if (
         out.expert_distribution_metrics is not None
         or out.routed_experts_output is not None

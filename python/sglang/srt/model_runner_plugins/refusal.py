@@ -26,6 +26,7 @@ _LABELS = {
     Feature.DP_ATTENTION: "data-parallel attention",
     Feature.EXPERT_PARALLEL: "expert parallelism",
     Feature.CONTEXT_PARALLEL: "context parallelism",
+    Feature.TWO_BATCH_OVERLAP: "two-batch overlap",
     Feature.CUDA_GRAPHS: "CUDA graphs",
     Feature.OVERLAP_SCHEDULE: "overlap scheduling",
     Feature.SPECULATIVE_DECODING: "speculative decoding",
@@ -89,9 +90,9 @@ def launch_uses(cfg: ResolvedConfig) -> Uses:
     if cfg.attn_dp_size > 1:
         uses[Feature.DP_ATTENTION] = f"attn_dp_size={cfg.attn_dp_size}"
     if cfg.moe_ep_size > 1:
-        uses[Feature.EXPERT_PARALLEL] = f"ep_size={cfg.moe_ep_size}"
+        uses[Feature.EXPERT_PARALLEL] = f"ep_size={cfg.moe_ep_size}; pass --ep-size 1"
     cp = [
-        f"{name}={size}"
+        (f"{name}={size}", f"--{name.replace('_', '-')} 1")
         for name, size in (
             ("attn_cp_size", cfg.attn_cp_size),
             ("dcp_size", cfg.dcp_size),
@@ -99,7 +100,11 @@ def launch_uses(cfg: ResolvedConfig) -> Uses:
         if size > 1
     ]
     if cp:
-        uses[Feature.CONTEXT_PARALLEL] = " ".join(cp)
+        uses[Feature.CONTEXT_PARALLEL] = (
+            f"{' '.join(v for v, _ in cp)}; pass {' '.join(f for _, f in cp)}"
+        )
+    if cfg.two_batch_overlap:
+        uses[Feature.TWO_BATCH_OVERLAP] = "drop --enable-two-batch-overlap"
     if cfg.cuda_graph_phases:
         flags = " ".join(f"--disable-{p}-cuda-graph" for p in cfg.cuda_graph_phases)
         uses[Feature.CUDA_GRAPHS] = f"pass {flags}"

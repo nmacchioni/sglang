@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import zlib
 from typing import TYPE_CHECKING, Optional, Union
 
 import torch
@@ -44,7 +45,13 @@ class StepTrace:
             "tp_rank": parallel.tp_rank,
             "pp_rank": parallel.pp_rank,
             "attn_dp_rank": parallel.attn_dp_rank,
+            "attn_cp_rank": parallel.attn_cp_rank,
+            "moe_ep_rank": parallel.moe_ep_rank,
         }
+        # Under expert parallelism: which expert placement each forward ran
+        # with, so a rebalance (EPLB) shows up between two records.
+        self._expert_layout = parallel.moe_ep_size > 1
+        self._prefill_cp = parallel.attn_cp_size > 1
         self._prefix = os.path.join(directory, f"steps-{os.getpid()}")
         self._save_logits = save_logits
         self._count = 0
@@ -96,6 +103,22 @@ class StepTrace:
                 if graph is None or graph.is_eager
                 else [graph.phase.value, graph.bucket]
             ),
+            # Two-batch overlap: this rank's split, and whether the eager
+            # forward built the two micro-batches (graph replays split inside).
+            "tbo_split_seq_index": forward_batch.tbo_split_seq_index,
+            "tbo_children": forward_batch.tbo_children is not None,
+            # Prefill context parallelism sharded this extend across the CP
+            # group (the forward's own test, on the batch it ran).
+            "cp_sharded": self._cp_sharded(forward_batch),
+            # Under DP attention: the padding the forward applied, and the
+            # per-rank rows after it.
+            "dp_padding": (
+                None
+                if forward_batch.dp_padding_mode is None
+                else forward_batch.dp_padding_mode.name
+            ),
+            "padded_num_tokens": forward_batch.global_num_tokens_cpu,
+            "expert_layout": self._expert_layout_crc(),
         }
         with open(f"{self._prefix}.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -115,3 +138,22 @@ class StepTrace:
                 f"{self._prefix}-{self._count:05d}.pt",
             )
         self._count += 1
+
+    def _cp_sharded(self, forward_batch: ForwardBatch) -> bool:
+        if not self._prefill_cp:
+            return False
+        from sglang.srt.layers.cp.utils import is_cp_active
+
+        return is_cp_active(forward_batch)
+
+    def _expert_layout_crc(self) -> Optional[int]:
+        if not self._expert_layout:
+            return None
+        from sglang.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+        )
+
+        metadata = get_global_expert_location_metadata()
+        if metadata is None:
+            return None
+        return zlib.crc32(metadata.physical_to_logical_map_cpu.numpy().tobytes())

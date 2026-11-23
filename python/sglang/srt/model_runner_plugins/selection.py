@@ -61,7 +61,12 @@ def check_model_runner_at_launch() -> None:
 # What an external runner can execute in this release, whatever it declares:
 # text with SGLang sampling, with tensor parallelism, overlap scheduling and
 # CUDA graphs when declared. Features of later blocks stay refused until SGLang
-# can drive them through the API.
+# can drive them through the API. Among them, for this release's parallel
+# features: context parallelism shards KV across ranks in layouts KVLayout
+# cannot describe; expert parallelism needs SGLang's expert placement (EPLB,
+# redundant experts) and rebalance control, which the API does not carry yet;
+# two-batch overlap and DP attention need Step.dp, and no external runner is
+# driven under the MLP-sync rendezvous yet.
 _EXTERNAL_FEATURES = frozenset(
     {
         Feature.TENSOR_PARALLEL,
@@ -100,6 +105,7 @@ def resolved_config(model_config: ModelConfig) -> ResolvedConfig:
         moe_ep_size=parallel.moe_ep_size,
         attn_cp_size=parallel.attn_cp_size,
         dcp_size=parallel.dcp_size,
+        two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
         cuda_graph_phases=tuple(
             phase
             for phase in Phase.ALL
