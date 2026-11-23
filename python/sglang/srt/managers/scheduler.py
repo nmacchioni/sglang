@@ -1289,8 +1289,9 @@ class Scheduler(
             else:
                 self.draft_worker.prewarm_sampling()
 
-    def finalize_model_capacity(self):
-        """Settle the final KV capacity after capture (startup phase: finalize)."""
+    def finalize_model_capacity(self, *, agree_stages: bool = True):
+        """Settle the final KV capacity after capture (startup phase: finalize);
+        ``agree_stages=False`` leaves the PP stage agreement to the caller."""
         model_runner = self.tp_worker.model_runner
         if model_runner.token_to_kv_pool.post_capture_active:
             tic = time.perf_counter()
@@ -1302,7 +1303,8 @@ class Scheduler(
                 )
             )
             self.kv_cache_allocation_time += time.perf_counter() - tic
-        kv_cache_builder.agree_on_stage_request_capacity(tp_worker=self.tp_worker)
+        if agree_stages:
+            self.agree_stage_capacity()
 
         if get_model().is_startup_weight_load_overlap:
             self.tp_worker.finalize_startup_weight_load()
@@ -1322,6 +1324,11 @@ class Scheduler(
             and get_exec().moe.ep_join_mode == "recover"
         ):
             model_runner.post_capture_elastic_ep_recover()
+
+    def agree_stage_capacity(self):
+        """Pipeline stages keep the smallest request capacity, once each pool is
+        final and before its request limits are read."""
+        kv_cache_builder.agree_on_stage_request_capacity(tp_worker=self.tp_worker)
 
     def init_model_worker(self):
         if self.model_runner_startup is None:

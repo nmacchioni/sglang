@@ -18,6 +18,7 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_runner_plugins.api import (
     EAGER,
+    DPInfo,
     GraphChoice,
     KVTables,
     LogitRows,
@@ -67,10 +68,19 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         return "position scoring"
     if forward_batch.input_candidate_selectors is not None:
         return "input candidate selectors"
-    if forward_batch.global_num_tokens_cpu is not None:
-        return "MLP-sync padding"
+    if forward_batch.tbo_split_seq_index is not None:
+        return "two-batch overlap"
     if forward_batch.input_ids_from_graph:
         return "input ids read inside the decode graph"
+    if (
+        forward_batch.global_num_tokens_cpu is not None
+        and forward_batch.is_extend_in_batch
+        and forward_batch.can_run_dp_prefill_cuda_graph
+    ):
+        # The forward pads every DP rank to a shared prefill graph bucket and
+        # turns idle and decode ranks into dummy extends, after the Step is
+        # built. The vote is the rendezvous's, so every rank falls back alike.
+        return "a prefill graph step under DP attention"
     return None
 
 
@@ -92,8 +102,13 @@ def build_step(
     page_table: torch.Tensor,
     graph: GraphChoice = EAGER,
     inputs_ready: Optional[Any] = None,
+    pp_in: Optional[dict[str, torch.Tensor]] = None,
+    last_stage: bool = True,
 ) -> Step:
-    """The step ``forward_batch`` describes; every tensor is one of its own."""
+    """The step ``forward_batch`` describes; every tensor is one of its own.
+
+    Raises ``RendezvousMismatch`` when the batch is not the one this rank
+    published at the MLP-sync rendezvous, before any collective runs."""
     mode = _STEP_MODES[forward_batch.forward_mode]
     extend = mode in (StepMode.EXTEND, StepMode.MIXED)
     return Step(
@@ -112,11 +127,37 @@ def build_step(
         ),
         kv=KVTables(write_slots=forward_batch.out_cache_loc, page_table=page_table),
         outputs=OutputSpec(
-            logit_rows=LogitRows.NONE if mode is StepMode.IDLE else LogitRows.LAST,
-            prompt_logprobs=reads_prompt_logprobs(forward_batch),
+            logit_rows=(
+                LogitRows.LAST
+                if last_stage and mode is not StepMode.IDLE
+                else LogitRows.NONE
+            ),
+            prompt_logprobs=last_stage and reads_prompt_logprobs(forward_batch),
+            pp_out=not last_stage,
         ),
         graph=graph,
         inputs_ready=inputs_ready,
+        dp=dp_info(forward_batch),
+        pp_in=pp_in,
+    )
+
+
+def dp_info(forward_batch: ForwardBatch) -> Optional[DPInfo]:
+    """The MLP-sync rendezvous's decisions for this step; None without one."""
+    from sglang.srt.layers.dp_attention import dp_slot_in
+
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    if global_num_tokens is None:
+        return None
+    return DPInfo(
+        rank=dp_slot_in(global_num_tokens),
+        global_num_tokens=tuple(global_num_tokens),
+        global_num_tokens_for_logprob=tuple(
+            forward_batch.global_num_tokens_for_logprob_cpu
+        ),
+        extend_in_batch=forward_batch.is_extend_in_batch,
+        decode_graph=forward_batch.can_run_decode_cuda_graph,
+        prefill_graph=forward_batch.can_run_dp_prefill_cuda_graph,
     )
 
 
@@ -131,6 +172,8 @@ def logits_output_from_step(
             raise ValueError("vocabulary-sharded logits need a TP group to gather")
         logits = gather_vocab(logits)
     logits_output = LogitsProcessorOutput(next_token_logits=logits)
+    if out.pp_out is not None:
+        raise ValueError("a last-stage step returned pp_out")
     if out.logprobs is not None:
         write_prompt_logprobs(out.logprobs, logits_output)
     return logits_output

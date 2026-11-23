@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+_RENDEZVOUS_FAULT_TP_RANK = envs.SGLANG_TEST_RENDEZVOUS_FAULT_TP_RANK.get()
 
 # The MLP-sync gather carries each attention-DP group's listener drain state
 # (see DPDrainColumn).
@@ -632,6 +633,12 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
+    if (
+        _RENDEZVOUS_FAULT_TP_RANK == parallel.tp_rank
+        and local_batch is not None
+        and local_batch.forward_mode.is_decode()
+    ):
+        num_tokens += 1
     can_run_decode_cuda_graph = _local_decode_cuda_graph_vote(
         local_batch=local_batch, disable_cuda_graph=disable_cuda_graph
     )

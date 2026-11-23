@@ -636,15 +636,11 @@ class TpModelWorker(BaseTpWorker):
         """One forward at the worker boundary: through the selected model
         runner's steps when it takes the batch, else the direct path."""
         steps = self.step_forward
-        via_steps = (
-            steps is not None
-            and pp_proxy_tensors is None
-            and steps.takes(forward_batch)
-        )
+        via_steps = steps is not None and steps.takes(forward_batch)
         trace = self.step_trace
         tic = trace.start() if trace is not None else 0.0
         if via_steps:
-            out = steps.forward(forward_batch)
+            out = steps.forward(forward_batch, pp_proxy_tensors)
         else:
             out = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
@@ -837,10 +833,7 @@ class TpModelWorker(BaseTpWorker):
             self._maybe_finalize_elastic_cuda_graph_scale()
             return batch_result
         else:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            out = self.forward_model(forward_batch, pp_proxy_tensors)
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             routed_experts_output = merge_relayed_routed_experts(
                 output=out.routed_experts_output, relayed=relayed_routed_experts

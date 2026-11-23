@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 
@@ -34,6 +34,7 @@ from sglang.srt.model_runner_plugins.native import (
     NativeStartupHost,
     SGLangRunnerPlugin,
 )
+from sglang.srt.model_runner_plugins.native_results import admission_limits
 from sglang.srt.model_runner_plugins.registry import load_model_runner
 from sglang.srt.model_runner_plugins.selection import (
     describe_runner,
@@ -132,7 +133,12 @@ class ModelRunnerStartup:
                     "release, close)."
                 )
             plugin = ExternalRunner(name=name, plugin=runner.plugin, host=native_host)
-        return cls(runner_name=name, plugin=plugin, capabilities=capabilities)
+        return cls(
+            runner_name=name,
+            plugin=plugin,
+            capabilities=capabilities,
+            settle=lambda final: settle_capacity(native_host, final),
+        )
 
     def __init__(
         self,
@@ -140,9 +146,14 @@ class ModelRunnerStartup:
         runner_name: str,
         plugin: ModelRunnerLifecycle,
         capabilities: RunnerCapabilities = RunnerCapabilities(),
+        settle: Optional[Callable[[KVLayout], KVLayout]] = None,
     ):
         self.runner_name = runner_name
         self._plugin = plugin
+        # SGLang's step after finalize: PP stages agree on capacity, then
+        # admission limits are read off the settled pools. None leaves the
+        # runner's own limits.
+        self._settle = settle
         self._capabilities = capabilities
         # The buckets passed to capture(); SGLang replays external steps in them.
         self._buckets = GraphBuckets()
@@ -205,6 +216,7 @@ class ModelRunnerStartup:
             lowering=lowering,
             direct_fallback=not self.is_external,
             tp_group=_tp_group_or_none(),
+            last_stage=_is_last_stage(),
         )
         logger.info("Model runner %r runs steps through its API", self.runner_name)
         return self._step_forward
@@ -229,6 +241,8 @@ class ModelRunnerStartup:
             final = self._checked(
                 "finalize", self._plugin.finalize(inputs.capacity), KVLayout
             )
+            if self._settle is not None:
+                final = self._settle(final)
             _check_final_layout(allocated, final)
             self.layout = final
             self.phase = StartupPhase.FINALIZED
@@ -275,6 +289,13 @@ class ModelRunnerStartup:
         return result
 
 
+def settle_capacity(host: NativeStartupHost, final: KVLayout) -> KVLayout:
+    """Agree on capacity across pipeline stages after ``finalize``, then set the
+    admission limits SGLang admits against from the agreed pools."""
+    host.agree_stage_capacity()
+    return msgspec.structs.replace(final, limits=admission_limits(host.tp_worker))
+
+
 def parallel_layout() -> ParallelLayout:
     """The groups SGLang built for this rank (``init_parallel_runtime`` has run)."""
     parallel = get_parallel()
@@ -288,6 +309,11 @@ def parallel_layout() -> ParallelLayout:
         attn_dp_rank=parallel.attn_dp_rank,
         attn_dp_size=parallel.attn_dp_size,
     )
+
+
+def _is_last_stage() -> bool:
+    parallel = get_parallel()
+    return parallel.pp_size == 1 or parallel.pp_group.is_last_rank
 
 
 def _tp_group_or_none():
