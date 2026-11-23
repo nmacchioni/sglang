@@ -1,8 +1,9 @@
 """The built-in ``sglang`` model runner plugin.
 
 It declares everything SGLang's own runner supports. Its lifecycle delegates to
-the scheduler's native startup phases, in the native order; execution stays on
-the direct path.
+the scheduler's native startup phases, in the native order. Its steps run
+today's ``ModelRunner.forward`` on the batch SGLang lowered for the ``Step``;
+configurations outside the Step subset keep the direct path.
 """
 
 from __future__ import annotations
@@ -17,17 +18,27 @@ from sglang.srt.model_runner_plugins.api import (
     KVLayout,
     LoadContext,
     LoadResult,
+    ProjectRequest,
     RefusedCombination,
     ResolvedConfig,
     RunnerCapabilities,
     RuntimeConfig,
+    Step,
+    StepOutput,
 )
 from sglang.srt.model_runner_plugins.native_results import (
     native_kv_layout,
     native_load_result,
 )
+from sglang.srt.model_runner_plugins.native_steps import (
+    NativePlan,
+    NativeStepLowering,
+    native_execute,
+)
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.managers.tp_worker import TpModelWorker
 
 _NATIVE_CAPABILITIES = RunnerCapabilities.all_supported(
@@ -38,6 +49,7 @@ _NATIVE_CAPABILITIES = RunnerCapabilities.all_supported(
             hint="pass --disable-radix-cache",
         ),
     ),
+    native_prompt_logprobs=True,
 )
 
 
@@ -67,6 +79,7 @@ class SGLangRunnerPlugin:
     def __init__(self, host: Optional[NativeStartupHost] = None):
         # None when built for describe() alone (the launcher, admission).
         self._host = host
+        self.lowering = NativeStepLowering()
 
     def describe(self, cfg: ResolvedConfig) -> RunnerCapabilities:
         return _NATIVE_CAPABILITIES
@@ -95,6 +108,24 @@ class SGLangRunnerPlugin:
         host = self._require_host()
         host.finalize_model_capacity()
         return native_kv_layout(tp_worker=host.tp_worker, with_limits=True)
+
+    def plan(self, step: Step) -> NativePlan:
+        return NativePlan(forward_batch=self.lowering.forward_batch_of(step))
+
+    def execute(self, plan: NativePlan) -> StepOutput:
+        return native_execute(
+            model_runner=self._require_host().tp_worker.model_runner, plan=plan
+        )
+
+    def project(self, req: ProjectRequest) -> torch.Tensor:
+        raise RuntimeError(
+            "The built-in runner returns prompt logprobs natively; it has no project()"
+        )
+
+    def release(self, out: StepOutput, after: object) -> None:
+        # Native outputs live in per-forward tensors, or in graph buffers whose
+        # reuse native replay already orders.
+        pass
 
     def close(self) -> None:
         # Native workers own no teardown beyond process exit; drop the handle.

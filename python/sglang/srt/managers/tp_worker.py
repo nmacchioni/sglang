@@ -54,6 +54,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_time_usage,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_runner_plugins.step_trace import StepTrace
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -74,8 +75,9 @@ from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
     from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+    from sglang.srt.model_runner_plugins.step_forward import StepForward
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +285,10 @@ class BaseTpWorker(ABC):
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
 
+    # Set after startup under --model-runner; None runs every forward directly.
+    step_forward: Optional[StepForward] = None
+    step_trace: Optional[StepTrace] = None
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -393,6 +399,7 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self.enable_spec = get_spec().speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+        self.step_trace = StepTrace.maybe_create()
 
     def alloc_memory_pool(
         self,
@@ -617,6 +624,41 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
+    def set_step_forward(self, step_forward: Optional[StepForward]) -> None:
+        """Run this worker's forwards through the --model-runner Step API."""
+        self.step_forward = step_forward
+
+    def forward_model(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> ModelRunnerOutput:
+        """One forward at the worker boundary: through the selected model
+        runner's steps when it takes the batch, else the direct path."""
+        steps = self.step_forward
+        via_steps = (
+            steps is not None
+            and pp_proxy_tensors is None
+            and steps.takes(forward_batch)
+        )
+        trace = self.step_trace
+        tic = trace.start() if trace is not None else 0.0
+        if via_steps:
+            out = steps.forward(forward_batch)
+        else:
+            out = self.model_runner.forward(
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+        if trace is not None:
+            trace.record(
+                tic=tic,
+                runner=steps.runner_name if via_steps else None,
+                execute_seconds=steps.last_execute_seconds if via_steps else None,
+                forward_batch=forward_batch,
+                logits_output=out.logits_output,
+            )
+        return out
+
     def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:
         if self.model_runner._elastic_cuda_graph_enabled():
             self.model_runner.maybe_join_ep_ranks()
@@ -686,10 +728,7 @@ class TpModelWorker(BaseTpWorker):
         )
 
         if self.pp_group.is_last_rank:
-            out = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            out = self.forward_model(forward_batch, pp_proxy_tensors)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             if folded is not None:
                 from sglang.srt.model_executor.encoder_swa_replay import (

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import msgspec
 
@@ -21,16 +21,19 @@ from sglang.srt.model_runner_plugins.api import (
     KVLayout,
     LoadContext,
     LoadResult,
+    ModelRunnerExecutor,
     ModelRunnerLifecycle,
     RuntimeConfig,
 )
+from sglang.srt.model_runner_plugins.external import ExternalRunner
 from sglang.srt.model_runner_plugins.native import (
     NativeStartupHost,
     SGLangRunnerPlugin,
 )
 from sglang.srt.model_runner_plugins.registry import load_model_runner
 from sglang.srt.model_runner_plugins.selection import (
-    external_runner_unavailable_message,
+    describe_runner,
+    resolved_config,
 )
 from sglang.srt.runtime_context import (
     get_device,
@@ -39,6 +42,11 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_runner_plugins.step_forward import StepForward
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +105,7 @@ class ModelRunnerStartup:
 
     @classmethod
     def maybe_create(
-        cls, *, native_host: NativeStartupHost
+        cls, *, native_host: NativeStartupHost, model_config: ModelConfig
     ) -> Optional[ModelRunnerStartup]:
         """None without ``--model-runner``, so the default path runs no lifecycle."""
         name = get_exec().kernel.model_runner
@@ -106,16 +114,77 @@ class ModelRunnerStartup:
         if use_mlx():
             # The MLX worker keeps its own startup path in v1.
             return None
-        if not load_model_runner(name).is_native:
-            raise RuntimeError(external_runner_unavailable_message(name))
-        return cls(runner_name=name, plugin=SGLangRunnerPlugin(host=native_host))
+        runner = load_model_runner(name)
+        capabilities = describe_runner(runner, resolved_config(model_config))
+        if runner.is_native:
+            plugin = SGLangRunnerPlugin(host=native_host)
+        else:
+            if not isinstance(runner.plugin, ModelRunnerExecutor):
+                raise TypeError(
+                    f"Model runner {name!r} lacks the lifecycle and step methods "
+                    "(load, allocate, capture, finalize, plan, execute, project, "
+                    "release, close)."
+                )
+            plugin = ExternalRunner(name=name, plugin=runner.plugin, host=native_host)
+        return cls(
+            runner_name=name,
+            plugin=plugin,
+            native_prompt_logprobs=capabilities.native_prompt_logprobs,
+        )
 
-    def __init__(self, *, runner_name: str, plugin: ModelRunnerLifecycle):
+    def __init__(
+        self,
+        *,
+        runner_name: str,
+        plugin: ModelRunnerLifecycle,
+        native_prompt_logprobs: bool = False,
+    ):
         self.runner_name = runner_name
         self._plugin = plugin
+        self._native_prompt_logprobs = native_prompt_logprobs
         self.phase = StartupPhase.NEW
         self.load_result: Optional[LoadResult] = None
         self.layout: Optional[KVLayout] = None
+        self._step_forward: Optional[StepForward] = None
+
+    @property
+    def is_external(self) -> bool:
+        return isinstance(self._plugin, ExternalRunner)
+
+    def create_tp_worker(self, **worker_kwargs) -> TpModelWorker:
+        """The target worker over an external runner (``is_external`` only)."""
+        return self._plugin.create_tp_worker(**worker_kwargs)
+
+    def step_forward(self, *, tp_worker: TpModelWorker) -> Optional[StepForward]:
+        """The worker's forwards through the runner's steps, after startup; None
+        when the built-in runner keeps every step on the direct path."""
+        from sglang.srt.model_runner_plugins.native_steps import native_step_refusals
+        from sglang.srt.model_runner_plugins.step_forward import StepForward
+
+        model_runner = tp_worker.model_runner
+        if self.is_external:
+            executor, lowering = self._plugin.plugin, None
+        else:
+            refusals = native_step_refusals(model_runner)
+            if refusals:
+                logger.info(
+                    "Model runner %r keeps the direct path for every step: %s",
+                    self.runner_name,
+                    ", ".join(refusals),
+                )
+                return None
+            executor, lowering = self._plugin, self._plugin.lowering
+        self._step_forward = StepForward(
+            runner_name=self.runner_name,
+            executor=executor,
+            page_table=model_runner.req_to_token_pool.req_to_token,
+            vocab_size=model_runner.model_config.vocab_size,
+            native_prompt_logprobs=self._native_prompt_logprobs,
+            lowering=lowering,
+            direct_fallback=not self.is_external,
+        )
+        logger.info("Model runner %r runs steps through its API", self.runner_name)
+        return self._step_forward
 
     def run(self, inputs: StartupInputs) -> KVLayout:
         """Run every startup phase; the final layout carries admission limits."""
@@ -157,6 +226,8 @@ class ModelRunnerStartup:
             self.phase = StartupPhase.CLOSED
             return
         self.phase = StartupPhase.CLOSED
+        if self._step_forward is not None:
+            self._step_forward.close()
         self._plugin.close()
 
     def _close_after_failure(self) -> None:

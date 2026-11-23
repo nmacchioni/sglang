@@ -2641,6 +2641,11 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    # Test and benchmark hook: each TP worker appends one JSON line per forward
+    # (path taken, step mode, host time) to <dir>/steps-<pid>.jsonl.
+    SGLANG_MODEL_RUNNER_STEP_TRACE_DIR = EnvStr(None)
+    # With the trace on, also save each step's inputs and raw pre-sampling logits.
+    SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS = EnvBool(False)
     # Read by the NVIDIA megakernel plugin, not by SGLang: a comma-separated
     # slot list that replaces the plugin's default. Empty runs the stock paths.
     SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())

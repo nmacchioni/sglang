@@ -53,6 +53,9 @@ _EVERY_LAUNCH_FEATURE = ResolvedConfig(
     hicache=True,
     memory_saver=True,
     radix_cache=True,
+    unified_memory=True,
+    advanced_kv=("mla",),
+    diffusion_algorithm="LowConfidence",
 )
 _EVERY_REQUEST_OPTION = RequestOptions(
     prompt_logprobs=True,

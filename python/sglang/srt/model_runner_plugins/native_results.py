@@ -53,7 +53,7 @@ def native_kv_layout(*, tp_worker: TpModelWorker, with_limits: bool) -> KVLayout
         page_size=pool.page_size,
         num_slots=pool.size,
         full_attention=_full_attention_layers(pool),
-        limits=_admission_limits(tp_worker) if with_limits else None,
+        limits=admission_limits(tp_worker) if with_limits else None,
     )
 
 
@@ -77,7 +77,7 @@ def _full_attention_layers(pool) -> tuple[FullAttentionLayer, ...]:
     )
 
 
-def _admission_limits(tp_worker: TpModelWorker) -> AdmissionLimits:
+def admission_limits(tp_worker: TpModelWorker) -> AdmissionLimits:
     # get_worker_info is the native source of these limits (and logs the
     # short-pool warning once); this reads it instead of recomputing.
     info = tp_worker.get_worker_info()
