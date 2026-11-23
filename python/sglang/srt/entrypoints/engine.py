@@ -113,6 +113,7 @@ from sglang.srt.managers.tokenizer_manager import (
     get_tokenizer_worker_class,
 )
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
+from sglang.srt.model_runner_plugins.selection import check_model_runner_at_launch
 from sglang.srt.observability import metrics_collector
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -1242,6 +1243,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # the validation stage writes through late resolution, which refuses a
         # record that is already published.
         try:
+            # Validates the resolved bags, so it runs after publish.
+            check_model_runner_at_launch()
             _check_rust_server_warmups()
             # Allocate ports for inter-process communications
             if port_args is None:

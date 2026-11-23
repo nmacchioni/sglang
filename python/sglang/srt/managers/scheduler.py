@@ -363,6 +363,7 @@ from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_o
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
+from sglang.srt.model_runner_plugins.selection import ModelRunnerAdmission
 from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdder
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
     resolve_uocr_decode_graph_io,
@@ -533,6 +534,8 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # None without --model-runner, and in stub schedulers built via __new__.
+    model_runner_admission: Optional[ModelRunnerAdmission] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
@@ -606,6 +609,7 @@ class Scheduler(
 
         # Init model configs
         self.init_model_config()
+        self.init_model_runner_admission()
 
         # Init ZBAL, switch allocator should before any torch alloc action
         self.init_zbal_on_npu()
@@ -890,6 +894,12 @@ class Scheduler(
                 if get_exec().dllm.dllm_algorithm is not None
                 else None
             )
+
+    def init_model_runner_admission(self) -> None:
+        """Per-request refusal for the runner --model-runner selects; None without it."""
+        self.model_runner_admission = ModelRunnerAdmission.maybe_create(
+            model_config=self.model_config
+        )
 
     def init_metrics_collector(self) -> None:
         self.metrics_collector_context = SchedulerMetricsCollector.init_new(
@@ -3785,6 +3795,9 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if self._refused_by_model_runner(req):
+            return
+
         if recv_req.return_routed_experts:
             error_msg = None
             if recv_req.routed_experts_start_len < 0:
@@ -4002,6 +4015,16 @@ class Scheduler(
                 req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _refused_by_model_runner(self, req: Req) -> bool:
+        """Reject a normalized request the selected model runner cannot serve."""
+        if self.model_runner_admission is None:
+            return False
+        error_msg = self.model_runner_admission.check(req)
+        if error_msg is None:
+            return False
+        self._reject_bad_request(req, error_msg)
+        return True
 
     def _reject_bad_request(self, req: Req, error_msg: str) -> None:
         """Return a validation error as a 400 without running the model."""
@@ -4248,6 +4271,8 @@ class Scheduler(
 
         # Copy more attributes
         req.logprob_start_len = -1
+        if self._refused_by_model_runner(req):
+            return
         self._add_request_to_queue(req)
 
     def handle_batch_embedding_request(

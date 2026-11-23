@@ -283,6 +283,10 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the AMD monokernels from the sgl-amd-mono package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = False
+    model_runner: A[
+        Optional[str],
+        "Select a model runner plugin by name: 'sglang' for the built-in runner, or the name of an installed 'sglang.srt.model_runners' entry point. When unset, SGLang runs its built-in path and enumerates no runner plugins. SGLANG_PLUGINS, when set, must list an external runner's name. A launch configuration or request the runner does not support is refused with every reason listed. Experimental feature.",
+    ] = None
     prefill_attention_backend: A[
         Optional[str],
         Arg(
