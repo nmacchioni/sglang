@@ -237,6 +237,7 @@ class ModelRunnerStartup:
             native_kv=native_kv,
             wait_for_kv_loads=wait_for_kv_loads,
             speculative=get_spec().speculative_algorithm is not None,
+            pooling=not model_runner.model_config.is_generation,
         )
         if not self.is_external:
             self._attach_native_draft_steps(tp_worker)
