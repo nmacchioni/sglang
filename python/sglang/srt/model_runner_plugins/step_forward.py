@@ -26,6 +26,8 @@ from sglang.srt.model_runner_plugins.api import (
     OutputBuffer,
     ProjectRequest,
     SamplingOwner,
+    Step,
+    StepMode,
     StepOutput,
 )
 from sglang.srt.model_runner_plugins.lifetimes import OutputLease, OutputLifetimes
@@ -106,6 +108,10 @@ class StepForward:
         # SGLang's sampling of that batch takes them.
         self._next_ids: Optional[tuple[ForwardBatch, torch.Tensor]] = None
         self.last_sampling_owner = SamplingOwner.SGLANG
+        # A denoising pass's batch, step and plan, executed again by the next
+        # pass over the same batch; how many times the last plan ran.
+        self._denoise_plan: Optional[tuple[ForwardBatch, Step, Any]] = None
+        self.last_plan_runs = 0
         self._input_logprobs = InputLogprobProcessor(vocab_size)
         self._lifetimes = OutputLifetimes(
             runner_name=runner_name,
@@ -150,37 +156,8 @@ class StepForward:
         self._lifetimes.step_started()
         if self._wait_for_kv_loads is not None:
             self._wait_for_kv_loads()
-        graph = (
-            EAGER if self._choose_graph is None else self._choose_graph(forward_batch)
-        )
-        owner = (
-            SamplingOwner.PLUGIN
-            if self._fused_sampling
-            and self._last_stage
-            and runner_may_sample(forward_batch)
-            else SamplingOwner.SGLANG
-        )
-        step = build_step(
-            forward_batch=forward_batch,
-            page_table=self._page_table,
-            graph=graph,
-            inputs_ready=self._record_inputs_ready(forward_batch),
-            pp_in=None if pp_proxy_tensors is None else pp_proxy_tensors.tensors,
-            last_stage=self._last_stage,
-            pooling=self._pooling,
-            adapters=(
-                None
-                if self._adapter_slots is None
-                else self._adapter_slots(forward_batch)
-            ),
-            sampling_owner=owner,
-            **self._sub_pool_tables(forward_batch),
-        )
-        if self._lowering is None:
-            plan = self._executor.plan(step)
-        else:
-            with self._lowering.bind(step=step, forward_batch=forward_batch):
-                plan = self._executor.plan(step)
+        step, plan = self._planned(forward_batch, pp_proxy_tensors)
+        graph, owner = step.graph, step.sampling_owner
         self._lifetimes.before_execute()
         tic = time.perf_counter()
         out = self._executor.execute(plan)
@@ -223,6 +200,10 @@ class StepForward:
                 f"a step that asked for them ({step.outputs.hidden.value})"
             )
         logits_output = logits_output_from_step(out, gather_vocab=self._gather_vocab)
+        if step.mode is StepMode.DENOISE:
+            # The diffusion algorithm reads every row's logits.
+            logits_output.full_logits = logits_output.next_token_logits
+            logits_output.next_token_logits = None
         if step.outputs.prompt_logprobs and not self._native_prompt_logprobs:
             self._project_prompt_logprobs(
                 plan=plan, forward_batch=forward_batch, logits_output=logits_output
@@ -230,6 +211,55 @@ class StepForward:
         return ModelRunnerOutput(
             logits_output=logits_output, can_run_graph=not graph.is_eager
         )
+
+    def _planned(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> tuple[Step, Any]:
+        """The step ``forward_batch`` describes and its plan. A denoising pass
+        over a batch already planned executes that plan again: SGLang rewrote
+        its input_ids in place."""
+        reused = self._denoise_plan
+        if reused is not None and reused[0] is forward_batch:
+            self.last_plan_runs += 1
+            return reused[1], reused[2]
+        graph = (
+            EAGER if self._choose_graph is None else self._choose_graph(forward_batch)
+        )
+        owner = (
+            SamplingOwner.PLUGIN
+            if self._fused_sampling
+            and self._last_stage
+            and runner_may_sample(forward_batch)
+            else SamplingOwner.SGLANG
+        )
+        step = build_step(
+            forward_batch=forward_batch,
+            page_table=self._page_table,
+            graph=graph,
+            inputs_ready=self._record_inputs_ready(forward_batch),
+            pp_in=None if pp_proxy_tensors is None else pp_proxy_tensors.tensors,
+            last_stage=self._last_stage,
+            pooling=self._pooling,
+            adapters=(
+                None
+                if self._adapter_slots is None
+                else self._adapter_slots(forward_batch)
+            ),
+            sampling_owner=owner,
+            **self._sub_pool_tables(forward_batch),
+        )
+        if self._lowering is None:
+            plan = self._executor.plan(step)
+        else:
+            with self._lowering.bind(step=step, forward_batch=forward_batch):
+                plan = self._executor.plan(step)
+        self._denoise_plan = (
+            (forward_batch, step, plan) if step.mode is StepMode.DENOISE else None
+        )
+        self.last_plan_runs = 1
+        return step, plan
 
     def _sub_pool_tables(self, forward_batch: ForwardBatch) -> dict:
         kv = self._native_kv
@@ -331,3 +361,19 @@ class StepForward:
             logits_metadata=metadata,
         )
         result.write_input_to(logits_output)
+
+
+class DenoiseRunner:
+    """The model runner a diffusion algorithm drives, with its forwards at the
+    worker boundary: each denoising pass is an execution of the batch's plan.
+    Everything else the algorithm reads comes from the built-in runner."""
+
+    def __init__(self, *, model_runner: Any, forward_model: Callable):
+        self._model_runner = model_runner
+        self._forward_model = forward_model
+
+    def forward(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
+        return self._forward_model(forward_batch, pp_proxy_tensors)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model_runner, name)
