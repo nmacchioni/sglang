@@ -186,6 +186,7 @@ class ModelRunnerStartup:
         from sglang.srt.model_runner_plugins.kv_view import PluginKVView
         from sglang.srt.model_runner_plugins.native_kv import NativeKV
         from sglang.srt.model_runner_plugins.native_steps import (
+            native_adapter_slots,
             native_graph_choice,
             native_step_refusals,
         )
@@ -238,6 +239,9 @@ class ModelRunnerStartup:
             wait_for_kv_loads=wait_for_kv_loads,
             speculative=get_spec().speculative_algorithm is not None,
             pooling=not model_runner.model_config.is_generation,
+            adapter_slots=(
+                None if self.is_external else native_adapter_slots(model_runner)
+            ),
         )
         if not self.is_external:
             self._attach_native_draft_steps(tp_worker)

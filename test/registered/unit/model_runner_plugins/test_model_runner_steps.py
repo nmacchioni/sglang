@@ -556,6 +556,47 @@ class TestPoolingAndScoring(CustomTestCase):
         )
 
 
+class TestLoRASteps(CustomTestCase):
+    def test_a_lora_batch_is_a_step_with_each_requests_slot(self):
+        """SGLang assigns the slots in the batch's lowering (loading and
+        evicting first); the Step names them, the base model's for a request
+        without an adapter."""
+        from sglang.srt.model_runner_plugins.native_steps import native_adapter_slots
+
+        batch = _decode_batch()
+        batch.lora_ids = ["b", None]
+        self.assertIsNone(step_refusal(batch))
+        pool = SimpleNamespace(uid_to_buffer_id={None: 1, "b": 0, "a": 2})
+        slots = native_adapter_slots(
+            SimpleNamespace(lora_manager=SimpleNamespace(memory_pool=pool))
+        )
+        adapters = slots(batch)
+        self.assertEqual(adapters.tolist(), [0, 1])
+        step = build_step(
+            forward_batch=batch, page_table=_PAGE_TABLE, adapters=adapters
+        )
+        self.assertIs(step.adapters, adapters)
+        batch.lora_ids = [None, None]
+        self.assertIsNone(slots(batch))
+        self.assertIsNone(native_adapter_slots(SimpleNamespace(lora_manager=None)))
+        with self.assertRaisesRegex(ValueError, "2 requests but 3 adapter slots"):
+            build_step(
+                forward_batch=_decode_batch(),
+                page_table=_PAGE_TABLE,
+                adapters=torch.zeros(3, dtype=torch.int32),
+            )
+
+    def test_lora_keeps_the_direct_path_where_slots_are_assigned_later(self):
+        self.assertEqual(_native_refusals(lora=True), [])
+        self.assertIn(
+            "LoRA under DP attention", _native_refusals(lora=True, attn_dp_size=2)
+        )
+        self.assertIn(
+            "LoRA with speculative decoding",
+            _native_refusals(lora=True, speculative_algorithm="EAGLE3"),
+        )
+
+
 class TestStepSubset(CustomTestCase):
     def test_every_batch_feature_outside_block_3_is_refused(self):
         """A batch the API cannot express must take the direct path (native)
@@ -567,7 +608,6 @@ class TestStepSubset(CustomTestCase):
                 forward_mode=ForwardMode.TARGET_VERIFY
             ),
             "input embeddings": dict(input_embeds=torch.zeros(2, 4)),
-            "LoRA": dict(lora_ids=[None, "adapter"]),
             "beam search": dict(beam=object()),
             "input candidate selectors": dict(input_candidate_selectors=[None, 1]),
             "decode graph": dict(input_ids_from_graph=True),
@@ -918,7 +958,15 @@ class TestExternalRelease(CustomTestCase):
         self.assertEqual(launch_refusals(caps, cfg), [])
 
 
-def _native_refusals(*, dcp_size=1, elastic_ep_backend=None, balancedness=False):
+def _native_refusals(
+    *,
+    dcp_size=1,
+    elastic_ep_backend=None,
+    balancedness=False,
+    lora=False,
+    attn_dp_size=1,
+    speculative_algorithm=None,
+):
     from unittest.mock import patch
 
     from sglang.srt.model_runner_plugins import native_steps
@@ -945,11 +993,18 @@ def _native_refusals(*, dcp_size=1, elastic_ep_backend=None, balancedness=False)
         reports_expert_balancedness=balancedness,
         # Prefill CP and EP sizes are not consulted.
         get_parallel=SimpleNamespace(
-            dcp_size=dcp_size, attn_cp_size=2, moe_ep_size=2, tp_size=2
+            dcp_size=dcp_size,
+            attn_cp_size=2,
+            moe_ep_size=2,
+            tp_size=2,
+            attn_dp_size=attn_dp_size,
         ),
         get_schedule=SimpleNamespace(disable_overlap_schedule=True),
-        get_spec=SimpleNamespace(speculative_algorithm=None),
-        get_lora=SimpleNamespace(enable_lora=False),
+        get_spec=SimpleNamespace(
+            speculative_algorithm=speculative_algorithm,
+            enable_multi_layer_eagle=False,
+        ),
+        get_lora=SimpleNamespace(enable_lora=lora),
         get_exec=exec_,
         use_mlx=False,
     )

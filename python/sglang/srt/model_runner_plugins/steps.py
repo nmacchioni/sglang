@@ -69,8 +69,6 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         return "input embeddings"
     if forward_batch.mm_inputs is not None and any(forward_batch.mm_inputs):
         return "multimodal inputs"
-    if any(lora_id is not None for lora_id in forward_batch.lora_ids or ()):
-        return "LoRA adapters"
     if forward_batch.beam is not None:
         return "beam search"
     if forward_batch.input_candidate_selectors is not None:
@@ -212,6 +210,7 @@ def build_step(
     window: Optional[WindowTables] = None,
     state: Optional[StateTables] = None,
     pooling: bool = False,
+    adapters: Optional[torch.Tensor] = None,
 ) -> Step:
     """The step ``forward_batch`` describes; every tensor is one of its own.
 
@@ -275,6 +274,7 @@ def build_step(
         pp_in=pp_in,
         mask=mask,
         spec=spec,
+        adapters=adapters,
         extra=(
             {}
             if forward_batch.token_type_ids is None

@@ -69,6 +69,9 @@ class StepForward:
         wait_for_kv_loads: Optional[Callable[[], None]] = None,
         speculative: bool = False,
         pooling: bool = False,
+        adapter_slots: Optional[
+            Callable[[ForwardBatch], Optional[torch.Tensor]]
+        ] = None,
     ):
         self.runner_name = runner_name
         self._executor = executor
@@ -92,6 +95,8 @@ class StepForward:
         self._wait_for_kv_loads = wait_for_kv_loads
         # A pooling model: steps return pooled outputs, no logits.
         self._pooling = pooling
+        # Native only, with LoRA: each request's adapter slot in this step.
+        self._adapter_slots = adapter_slots
         self._input_logprobs = InputLogprobProcessor(vocab_size)
         self._lifetimes = OutputLifetimes(
             runner_name=runner_name,
@@ -110,8 +115,9 @@ class StepForward:
         # the step trace.
         self.last_execute_seconds = 0.0
         self.last_graph: GraphChoice = EAGER
-        # The last step's KV tables, for the step trace.
+        # The last step's KV tables and adapter slots, for the step trace.
         self.last_kv: Optional[KVTables] = None
+        self.last_adapters: Optional[torch.Tensor] = None
 
     def takes(self, forward_batch: ForwardBatch) -> bool:
         """Whether ``forward_batch`` runs through the API; False leaves it to
@@ -146,6 +152,11 @@ class StepForward:
             pp_in=None if pp_proxy_tensors is None else pp_proxy_tensors.tensors,
             last_stage=self._last_stage,
             pooling=self._pooling,
+            adapters=(
+                None
+                if self._adapter_slots is None
+                else self._adapter_slots(forward_batch)
+            ),
             **self._sub_pool_tables(forward_batch),
         )
         if self._lowering is None:
@@ -159,6 +170,7 @@ class StepForward:
         self.last_execute_seconds = time.perf_counter() - tic
         self.last_graph = graph
         self.last_kv = step.kv
+        self.last_adapters = step.adapters
         if not isinstance(out, StepOutput):
             raise TypeError(
                 f"Model runner {self.runner_name!r} execute() returned "

@@ -656,6 +656,7 @@ class TpModelWorker(BaseTpWorker):
                 graph=steps.last_graph if via_steps else None,
                 kv=steps.last_kv if via_steps else None,
                 model_runner=self.model_runner,
+                adapters=steps.last_adapters if via_steps else None,
             )
         return out
 
