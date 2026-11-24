@@ -109,6 +109,21 @@ _STANDALONE = [
 # attention with full attention, so its recurrent state is committed as well.
 _MTP_MODEL = "Qwen/Qwen3.5-0.8B"
 _MTP = ["--speculative-algorithm", "NEXTN", *_CHAIN_SHAPE, "--disable-multimodal"]
+# DSpark, native-only: blocks of 7 drafts (8 verified tokens) from a DSpark
+# head, with the accept fused into SGLang's verify; on Triton, as the image's
+# FlashInfer cannot plan this verify on the direct path.
+_DSPARK_TARGET = "Qwen/Qwen3-4B-FP8"
+_DSPARK = [
+    "--trust-remote-code",
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    "deepseek-ai/dspark_qwen3_4b_block7",
+    "--speculative-dspark-block-size",
+    "7",
+    "--attention-backend",
+    "triton",
+]
 
 # name -> (model, server args, sampling)
 _CONFIGS = {
@@ -134,7 +149,12 @@ _CONFIGS = {
     "mtp_eager": (_MTP_MODEL, [*_MTP, *_EAGER], {}),
     "mtp_graphs": (_MTP_MODEL, [*_MTP, *_GRAPHS], {}),
     "mtp_overlap_graphs": (_MTP_MODEL, [*_MTP, *_OVERLAP_GRAPHS], {}),
+    "dspark_graphs": (_DSPARK_TARGET, [*_DSPARK, *_GRAPHS], {}),
+    "dspark_overlap_graphs": (_DSPARK_TARGET, [*_DSPARK, *_OVERLAP_GRAPHS], {}),
 }
+# Accepted inside DSpark's own verify, past the accept trace: each request's
+# accept lengths come from the committed lengths of its consecutive verifies.
+_ACCEPT_FROM_STEPS = {"dspark_graphs", "dspark_overlap_graphs"}
 # Models whose state SGLang's slot-row digest cannot read (recurrent state):
 # their committed state shows in the bitwise logits of every later step.
 _NO_KV_DIGEST = {"mtp_eager", "mtp_graphs", "mtp_overlap_graphs"}
@@ -217,6 +237,30 @@ def _by_inputs(trace) -> dict:
             repeated.add(key)
         by_inputs[key] = record
     return {k: r for k, r in by_inputs.items() if k not in repeated}
+
+
+def _accepts_from_steps(trace, num_draft_tokens):
+    """Per verify, as accept records: each request's accept length is the
+    growth of its committed length by its next verify (a larger growth is a
+    new request in the same row)."""
+    verifies = [
+        r
+        for r in _target_steps(trace)
+        if r["mode"] == "target_verify" and "tensors" in r
+    ]
+    last = {}
+    records = []
+    for record in verifies:
+        rows = record["tensors"]["req_pool_indices"].tolist()
+        lens = record["tensors"]["seq_lens"].tolist()
+        rids, accept_lens = [], []
+        for row, n in zip(rows, lens):
+            if row in last and 0 < n - last[row] <= num_draft_tokens:
+                rids.append(row)
+                accept_lens.append(n - last[row])
+            last[row] = n
+        records.append({"rids": rids, "accept_lens": accept_lens})
+    return records
 
 
 def _accepts(records):
@@ -333,7 +377,12 @@ class _SpeculativeCase(CustomTestCase):
         exact = not sampling
         self._check_repeats(f"{name} direct/direct", direct, again, exact=exact)
         modes = self._check_repeats(f"{name} direct/steps", direct, steps, exact=exact)
-        lens = self._check_speculation(name, steps[2], num_draft_tokens)
+        accepts = (
+            _accepts_from_steps(steps[1], num_draft_tokens)
+            if name in _ACCEPT_FROM_STEPS
+            else steps[2]
+        )
+        lens = self._check_speculation(name, accepts, num_draft_tokens)
         if name in _DRAFT_MODELS:
             drafts = self._check_draft_steps(name, steps[1])
             replayed = sum(
@@ -342,7 +391,7 @@ class _SpeculativeCase(CustomTestCase):
             print(f"[{name}] draft steps {dict(drafts)}, {replayed} replayed graphs")
         print(
             f"[{name}] steps matched bitwise per mode {dict(modes)}; "
-            f"{len(steps[2])} verifies, accept lengths {dict(sorted(lens.items()))}"
+            f"{len(accepts)} verifies, accept lengths {dict(sorted(lens.items()))}"
         )
         return direct, steps
 
@@ -391,6 +440,17 @@ class TestStandaloneAndMTPSteps(_SpeculativeCase):
 
     def test_mtp_overlap_graphs(self):
         self._check_config("mtp_overlap_graphs", num_draft_tokens=4)
+
+
+class TestNativeOnlySteps(_SpeculativeCase):
+    """Native-only algorithms: the target's steps run through the API, the
+    accept fused into the native verify; the draft stays inside its worker."""
+
+    def test_dspark_graphs(self):
+        self._check_config("dspark_graphs")
+
+    def test_dspark_overlap_graphs(self):
+        self._check_config("dspark_overlap_graphs")
 
 
 class TestReferenceRunnerVerify(_SpeculativeCase):

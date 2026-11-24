@@ -48,10 +48,13 @@ if TYPE_CHECKING:
 # Speculative algorithms whose forwards run through the API. The target's verify
 # steps are VERIFY Steps; n-gram drafts on the host, with no draft model; the
 # EAGLE family's draft model runs DRAFT and DRAFT_EXTEND Steps (native_draft).
+# DSpark is native-only: its target's steps are Steps, with its fused accept
+# kept inside the native verify, and its draft stays inside its worker.
+# DFLASH, UNO and frozen-KV MTP keep the direct path (see the 7d commit).
 STEP_SPECULATIVE_ALGORITHMS = frozenset(
     # NEXTN names EAGLE over a model's own MTP layers; STANDALONE drafts with a
     # separate small model through the same draft worker.
-    {"NGRAM", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE"}
+    {"NGRAM", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "DSPARK"}
 )
 
 
@@ -146,6 +149,16 @@ def native_step_refusals(
     elif algorithm is not None and get_spec().enable_multi_layer_eagle:
         # Its own draft worker, whose draft calls are not Steps yet.
         reasons.append("multi-layer EAGLE")
+    elif (
+        algorithm is not None
+        and algorithm.upper() == "DSPARK"
+        and (
+            "Inkling2ForConditionalGeneration"
+            in (model_runner.model_config.hf_config.architectures or ())
+        )
+    ):
+        # Served by the Inkling2 MTP worker, not the DSpark worker.
+        reasons.append("DSPARK on Inkling2")
     if get_lora().enable_lora:
         reasons.append("LoRA")
     features = get_exec().features

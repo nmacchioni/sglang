@@ -457,6 +457,27 @@ class TestVerifyStep(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "go with verify"):
             msgspec.structs.replace(decode, mask=step.mask)
 
+    def test_a_dflash_block_without_a_mask_verifies_one_chain(self):
+        """The DFlash family verifies a linear block, causal over its drafts,
+        without a mask: a VERIFY Step with no mask. Any other verify without a
+        mask has no layout to state and keeps the direct path."""
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        batch = _ngram_verify_batch()
+        batch.spec_info = DFlashVerifyInput(
+            draft_token=batch.input_ids,
+            positions=batch.positions,
+            draft_token_num=3,
+        )
+        self.assertIsNone(step_refusal(batch))
+        step = build_step(forward_batch=batch, page_table=_PAGE_TABLE)
+        self.assertIs(step.mode, StepMode.VERIFY)
+        self.assertIsNone(step.mask)
+
+        tree = _ngram_verify_batch()
+        tree.spec_info.custom_mask = None
+        self.assertIn("without a tree mask", step_refusal(tree))
+
     def test_ragged_verify_keeps_the_direct_path(self):
         batch = _ngram_verify_batch()
         batch.ragged_verify_layout = object()
