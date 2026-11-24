@@ -14,7 +14,7 @@ checks the forward took it.
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional, Union
 
 import msgspec
 
@@ -41,6 +41,7 @@ from sglang.srt.utils.device import is_confidential_compute
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.pooler import EmbeddingPoolerOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -174,13 +175,8 @@ def native_step_refusals(
         reasons.append("per-forward captures")
     if get_exec().dllm.dllm_algorithm is not None:
         reasons.append("diffusion LLMs")
-    if (
-        not model_runner.is_generation
-        or model_runner.is_multimodal
-        or model_runner.is_draft_worker
-        or use_mlx()
-    ):
-        reasons.append("a non-text or draft model")
+    if model_runner.is_multimodal or model_runner.is_draft_worker or use_mlx():
+        reasons.append("a multimodal or draft model")
     return reasons
 
 
@@ -288,8 +284,17 @@ def _describe(graph: GraphChoice) -> str:
     return f"{graph.phase.value} graph of {graph.bucket}"
 
 
-def step_output_of(logits_output: LogitsProcessorOutput) -> StepOutput:
+def step_output_of(
+    logits_output: Union[LogitsProcessorOutput, EmbeddingPoolerOutput],
+) -> StepOutput:
     """The native output as a StepOutput; the Step subset sets no other field."""
+    from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+
+    if isinstance(logits_output, EmbeddingPoolerOutput):
+        return StepOutput(
+            pooled=logits_output.embeddings,
+            pooled_hidden=logits_output.pooled_hidden_states,
+        )
     if (
         logits_output.hidden_states_token_indices is not None
         or logits_output.last_hidden_states is not None

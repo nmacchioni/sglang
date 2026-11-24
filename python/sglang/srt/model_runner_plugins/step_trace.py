@@ -161,11 +161,13 @@ class StepTrace:
         pp_out = (
             logits_output.tensors if isinstance(logits_output, PPProxyTensors) else None
         )
-        outputs = (
-            {"logits": logits_output.next_token_logits}
-            if pp_out is None
-            else {f"pp_out.{name}": t for name, t in sorted(pp_out.items())}
-        )
+        pooled = _pooled(logits_output)
+        if pp_out is not None:
+            outputs = {f"pp_out.{name}": t for name, t in sorted(pp_out.items())}
+        elif pooled is not None:
+            outputs = {"pooled": pooled}
+        else:
+            outputs = {"logits": logits_output.next_token_logits}
         record = {
             "index": self._count,
             **self._ranks,
@@ -178,7 +180,9 @@ class StepTrace:
             "host_us": host_seconds * 1e6,
             "execute_us": None if execute_seconds is None else execute_seconds * 1e6,
             "prompt_logprobs": pp_out is None
+            and pooled is None
             and logits_output.input_token_logprobs is not None,
+            "pooled": pooled is not None,
             "pp_out": None if pp_out is None else sorted(pp_out),
             # Input rows per DP rank, as gathered at the MLP-sync rendezvous.
             "global_num_tokens": forward_batch.original_global_num_tokens_cpu,
@@ -315,3 +319,15 @@ def _sub_pool_tensors(kv: Optional[KVTables], forward_batch: ForwardBatch) -> di
             tensors["state_copy_src"] = kv.state.copy_src
             tensors["state_copy_dst"] = kv.state.copy_dst
     return tensors
+
+
+def _pooled(logits_output) -> Optional[torch.Tensor]:
+    """A pooling model's outputs, as one tensor (per-request ones concatenated)."""
+    from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+
+    if not isinstance(logits_output, EmbeddingPoolerOutput):
+        return None
+    embeddings = logits_output.embeddings
+    if isinstance(embeddings, torch.Tensor):
+        return embeddings
+    return torch.cat([t.reshape(-1) for t in embeddings])

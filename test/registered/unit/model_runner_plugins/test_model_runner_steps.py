@@ -45,6 +45,7 @@ from sglang.srt.model_runner_plugins.api import (
     Rows,
     RunnerCapabilities,
     RuntimeConfig,
+    ScoreRowKind,
     SpecInputs,
     StateTables,
     Step,
@@ -60,7 +61,11 @@ from sglang.srt.model_runner_plugins.native_steps import NativeStepLowering
 from sglang.srt.model_runner_plugins.refusal import launch_refusals
 from sglang.srt.model_runner_plugins.selection import capabilities_in_this_release
 from sglang.srt.model_runner_plugins.step_forward import StepForward
-from sglang.srt.model_runner_plugins.steps import build_step, step_refusal
+from sglang.srt.model_runner_plugins.steps import (
+    build_step,
+    logits_output_from_step,
+    step_refusal,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -484,6 +489,73 @@ class TestVerifyStep(CustomTestCase):
         self.assertIn("ragged", step_refusal(batch))
 
 
+class TestPoolingAndScoring(CustomTestCase):
+    def test_a_pooling_step_asks_for_pooled_outputs_and_no_logits(self):
+        batch = _extend_batch(prefix_lens=[0, 0], extend_lens=[3, 2])
+        batch.token_type_ids = torch.tensor([0, 0, 1, 0, 1])
+        batch.return_pooled_hidden_states = True
+        step = build_step(forward_batch=batch, page_table=_PAGE_TABLE, pooling=True)
+        self.assertTrue(step.outputs.pooled and step.outputs.pooled_hidden)
+        self.assertIs(step.outputs.logit_rows, LogitRows.NONE)
+        self.assertIs(step.extra["token_type_ids"], batch.token_type_ids)
+        # A generation model's step pools nothing, whatever the batch says.
+        plain = build_step(forward_batch=batch, page_table=_PAGE_TABLE)
+        self.assertFalse(plain.outputs.pooled or plain.outputs.pooled_hidden)
+        batch.token_type_ids = torch.tensor([0, 1])
+        with self.assertRaisesRegex(ValueError, "2 rows of token_type_ids"):
+            build_step(forward_batch=batch, page_table=_PAGE_TABLE, pooling=True)
+
+    def test_position_scoring_names_its_rows(self):
+        """Pooled positions are read at the rows, multi-item delimiters one row
+        before each: a runner told the wrong kind scores the wrong tokens."""
+        batch = _extend_batch(prefix_lens=[0, 0], extend_lens=[3, 2])
+        self.assertIsNone(
+            build_step(forward_batch=batch, page_table=_PAGE_TABLE).outputs.score_rows
+        )
+        rows = [torch.tensor([1, 2]), torch.tensor([0])]
+        for field, kind in (
+            ("token_indices_to_pool", ScoreRowKind.AT),
+            ("multi_item_delimiter_indices", ScoreRowKind.BEFORE_DELIMITER),
+        ):
+            with self.subTest(field=field):
+                batch = _extend_batch(prefix_lens=[0, 0], extend_lens=[3, 2])
+                setattr(batch, field, rows)
+                self.assertIsNone(step_refusal(batch))
+                score = build_step(
+                    forward_batch=batch, page_table=_PAGE_TABLE
+                ).outputs.score_rows
+                self.assertIs(score.kind, kind)
+                self.assertEqual(score.rows, tuple(rows))
+
+    def test_pooled_outputs_reach_the_scheduler_as_pooler_output(self):
+        from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+
+        pooled, hidden = torch.ones(2, 3), [torch.zeros(4), torch.zeros(4)]
+        out = logits_output_from_step(
+            StepOutput(pooled=pooled, pooled_hidden=hidden), gather_vocab=None
+        )
+        self.assertIsInstance(out, EmbeddingPoolerOutput)
+        self.assertIs(out.embeddings, pooled)
+        self.assertIs(out.pooled_hidden_states, hidden)
+
+    def test_external_runners_refuse_position_scoring_requests(self):
+        from sglang.srt.model_runner_plugins.refusal import (
+            RequestOptions,
+            admission_refusals,
+            request_uses,
+        )
+
+        reasons = admission_refusals(
+            RunnerCapabilities(),
+            launch={},
+            request=request_uses(RequestOptions(position_scoring=True)),
+        )
+        self.assertEqual(
+            reasons,
+            ["embedding and pooling models (multi-item scoring or pooled positions)"],
+        )
+
+
 class TestStepSubset(CustomTestCase):
     def test_every_batch_feature_outside_block_3_is_refused(self):
         """A batch the API cannot express must take the direct path (native)
@@ -497,7 +569,6 @@ class TestStepSubset(CustomTestCase):
             "input embeddings": dict(input_embeds=torch.zeros(2, 4)),
             "LoRA": dict(lora_ids=[None, "adapter"]),
             "beam search": dict(beam=object()),
-            "position scoring": dict(token_indices_to_pool=[torch.zeros(1)]),
             "input candidate selectors": dict(input_candidate_selectors=[None, 1]),
             "decode graph": dict(input_ids_from_graph=True),
         }

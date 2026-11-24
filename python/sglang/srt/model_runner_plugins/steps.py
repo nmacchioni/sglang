@@ -9,7 +9,7 @@ a few attribute reads and no device work.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
@@ -27,6 +27,8 @@ from sglang.srt.model_runner_plugins.api import (
     OutputSpec,
     PromptLogprobs,
     Rows,
+    ScoreRowKind,
+    ScoreRows,
     SpecInputs,
     StateTables,
     Step,
@@ -40,6 +42,7 @@ from sglang.srt.model_runner_plugins.api import (
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.layers.pooler import EmbeddingPoolerOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _STEP_MODES = {
@@ -70,11 +73,6 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         return "LoRA adapters"
     if forward_batch.beam is not None:
         return "beam search"
-    if (
-        forward_batch.token_indices_to_pool is not None
-        or forward_batch.multi_item_delimiter_indices is not None
-    ):
-        return "position scoring"
     if forward_batch.input_candidate_selectors is not None:
         return "input candidate selectors"
     if forward_batch.input_ids_from_graph:
@@ -213,6 +211,7 @@ def build_step(
     last_stage: bool = True,
     window: Optional[WindowTables] = None,
     state: Optional[StateTables] = None,
+    pooling: bool = False,
 ) -> Step:
     """The step ``forward_batch`` describes; every tensor is one of its own.
 
@@ -254,7 +253,7 @@ def build_step(
         outputs=OutputSpec(
             logit_rows=(
                 LogitRows.NONE
-                if not last_stage or mode is StepMode.IDLE
+                if not last_stage or mode is StepMode.IDLE or pooling
                 else LogitRows.ALL
                 if mode is StepMode.VERIFY
                 else LogitRows.LAST
@@ -266,6 +265,9 @@ def build_step(
                 else HiddenRows.NONE
             ),
             pp_out=not last_stage,
+            pooled=last_stage and pooling,
+            pooled_hidden=pooling and forward_batch.return_pooled_hidden_states,
+            score_rows=score_rows(forward_batch),
         ),
         graph=graph,
         inputs_ready=inputs_ready,
@@ -273,7 +275,26 @@ def build_step(
         pp_in=pp_in,
         mask=mask,
         spec=spec,
+        extra=(
+            {}
+            if forward_batch.token_type_ids is None
+            else {"token_type_ids": forward_batch.token_type_ids}
+        ),
     )
+
+
+def score_rows(forward_batch: ForwardBatch) -> Optional[ScoreRows]:
+    """The rows position scoring reads; None without position scoring."""
+    if forward_batch.token_indices_to_pool is not None:
+        return ScoreRows(
+            kind=ScoreRowKind.AT, rows=tuple(forward_batch.token_indices_to_pool)
+        )
+    if forward_batch.multi_item_delimiter_indices is not None:
+        return ScoreRows(
+            kind=ScoreRowKind.BEFORE_DELIMITER,
+            rows=tuple(forward_batch.multi_item_delimiter_indices),
+        )
+    return None
 
 
 _HIDDEN_ROWS = {
@@ -305,9 +326,15 @@ def dp_info(forward_batch: ForwardBatch) -> Optional[DPInfo]:
 
 def logits_output_from_step(
     out: StepOutput, *, gather_vocab: Optional[Callable[[torch.Tensor], torch.Tensor]]
-) -> LogitsProcessorOutput:
+) -> Union[LogitsProcessorOutput, EmbeddingPoolerOutput]:
     """The scheduler's view of a step's outputs; ``gather_vocab`` turns
     vocabulary-sharded logits into full ones (None: the runner has one rank)."""
+    if out.pooled is not None:
+        from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+
+        return EmbeddingPoolerOutput(
+            embeddings=out.pooled, pooled_hidden_states=out.pooled_hidden
+        )
     logits = None if out.logits is None else out.logits.tensor
     if logits is not None and out.logits.layout is LogitsLayout.VOCAB_SHARDED:
         if gather_vocab is None:

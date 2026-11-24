@@ -61,6 +61,8 @@ class RequestOptions(msgspec.Struct, frozen=True, kw_only=True):
     positional_embed_overrides: bool = False
     lora_id: Optional[str] = None
     multimodal: bool = False
+    # Outputs read at chosen rows: multi-item scoring or pooled positions.
+    position_scoring: bool = False
 
     @classmethod
     def of_req(cls, req: Req) -> RequestOptions:
@@ -78,6 +80,8 @@ class RequestOptions(msgspec.Struct, frozen=True, kw_only=True):
             positional_embed_overrides=req.positional_embed_overrides is not None,
             lora_id=req.lora_id,
             multimodal=req.multimodal_inputs is not None,
+            position_scoring=req.multi_item_delimiter_indices is not None
+            or req.token_indices_to_pool is not None,
         )
 
 
@@ -166,6 +170,8 @@ def request_uses(opts: RequestOptions) -> Uses:
         uses[Feature.LORA] = "lora_path"
     if opts.multimodal:
         uses[Feature.MULTIMODAL] = "image, video or audio items"
+    if opts.position_scoring:
+        uses[Feature.POOLING] = "multi-item scoring or pooled positions"
     return uses
 
 

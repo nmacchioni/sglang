@@ -68,6 +68,7 @@ class StepForward:
         native_kv: Optional[NativeKV] = None,
         wait_for_kv_loads: Optional[Callable[[], None]] = None,
         speculative: bool = False,
+        pooling: bool = False,
     ):
         self.runner_name = runner_name
         self._executor = executor
@@ -89,6 +90,8 @@ class StepForward:
         # External runners with HiCache: the runner stream waits for host loads
         # into the runner's KV before the step (and its inputs_ready) is built.
         self._wait_for_kv_loads = wait_for_kv_loads
+        # A pooling model: steps return pooled outputs, no logits.
+        self._pooling = pooling
         self._input_logprobs = InputLogprobProcessor(vocab_size)
         self._lifetimes = OutputLifetimes(
             runner_name=runner_name,
@@ -98,7 +101,9 @@ class StepForward:
             # target output (verify logits, hidden states) on the runner stream
             # before it returns, so each output is released when the next step
             # starts, with or without overlap scheduling.
-            deferred=overlap and not speculative,
+            # A pooling model's outputs are copied to the host on the runner
+            # stream inside the forward call, and no lease reaches the scheduler.
+            deferred=overlap and not speculative and not pooling,
         )
         self._lease: Optional[OutputLease] = None
         # Host seconds of the last step inside execute(), and its graph, for
@@ -140,6 +145,7 @@ class StepForward:
             inputs_ready=self._record_inputs_ready(forward_batch),
             pp_in=None if pp_proxy_tensors is None else pp_proxy_tensors.tensors,
             last_stage=self._last_stage,
+            pooling=self._pooling,
             **self._sub_pool_tables(forward_batch),
         )
         if self._lowering is None:
@@ -168,6 +174,11 @@ class StepForward:
         if not self._last_stage:
             return ModelRunnerOutput(
                 logits_output=self._pp_out(out), can_run_graph=not graph.is_eager
+            )
+        if step.outputs.pooled and out.pooled is None:
+            raise ValueError(
+                f"Model runner {self.runner_name!r} returned no pooled outputs for "
+                "a pooling model's step"
             )
         if step.outputs.hidden is not HiddenRows.NONE and out.hidden is None:
             raise ValueError(

@@ -730,6 +730,22 @@ class HiddenRows(str, Enum):
     ALL = "all"
 
 
+class ScoreRowKind(str, Enum):
+    # The rows themselves.
+    AT = "at"
+    # The row before each delimiter (multi-item scoring); the request's first
+    # delimiter row scores the query alone.
+    BEFORE_DELIMITER = "before_delimiter"
+
+
+class ScoreRows(msgspec.Struct, frozen=True, kw_only=True):
+    """Position scoring: the input rows of each request whose outputs are read."""
+
+    kind: ScoreRowKind
+    # Per request, int64 host tensors of offsets within the request's rows.
+    rows: tuple[torch.Tensor, ...]
+
+
 class OutputSpec(msgspec.Struct, frozen=True, kw_only=True):
     logit_rows: LogitRows = LogitRows.LAST
     hidden: HiddenRows = HiddenRows.NONE
@@ -739,6 +755,16 @@ class OutputSpec(msgspec.Struct, frozen=True, kw_only=True):
     # A pipeline stage before the last: the step returns StepOutput.pp_out, the
     # tensors SGLang sends to the next stage as its Step.pp_in.
     pp_out: bool = False
+    # A pooling model (embedding, reward, classification, cross-encoder): one
+    # pooled output per request in StepOutput.pooled (per scored row with
+    # ``score_rows``), from the model's own pooler and head; no logits.
+    pooled: bool = False
+    # With ``pooled``: also the hidden states the head read (StepOutput.pooled_hidden).
+    pooled_hidden: bool = False
+    # Position scoring. A generation model returns prompt logprobs at these rows
+    # (StepOutput.logprobs, OutputSpec.prompt_logprobs set); a pooling model a
+    # pooled output per row.
+    score_rows: Optional[ScoreRows] = None
 
 
 class DPInfo(msgspec.Struct, frozen=True, kw_only=True):
@@ -821,9 +847,18 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     # committed positions and to the drafts before it (causal).
     mask: Optional[TreeMask] = None
     spec: Optional[SpecInputs] = None
+    # Declared model inputs beside the tokens, each one row per input row:
+    # "token_type_ids" (cross-encoders, [T] int64).
+    extra: dict[str, torch.Tensor] = {}
 
     def __post_init__(self) -> None:
         num_tokens = self.input_ids.shape[0]
+        for name, tensor in self.extra.items():
+            if tensor.shape[0] != num_tokens:
+                raise ValueError(
+                    f"Step has {num_tokens} input ids but {tensor.shape[0]} rows "
+                    f"of {name}"
+                )
         if self.mode is StepMode.DRAFT:
             # input_ids seed the expansion; positions and write slots cover
             # every expansion step.
@@ -997,6 +1032,13 @@ class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
     hidden: Optional[torch.Tensor] = None
     # DRAFT steps.
     draft: Optional[DraftTree] = None
+    # OutputSpec.pooled: [B, D] (embeddings or head scores), or a list of
+    # per-request tensors when their widths differ (per-request dimensions,
+    # several scored rows per request).
+    pooled: Optional[Any] = None
+    # OutputSpec.pooled_hidden: the hidden states the head read, laid out as
+    # ``pooled``.
+    pooled_hidden: Optional[Any] = None
     # A device event that fires when the outputs are written; SGLang's runner
     # stream waits on it before any consumer. None: the outputs are ordered on
     # the runner stream before execute() returns.
