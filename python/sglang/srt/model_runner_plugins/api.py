@@ -499,7 +499,8 @@ class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class StepMode(str, Enum):
-    """What one step runs; DRAFT and DRAFT_EXTEND do not execute in this version."""
+    """What one step runs. DRAFT and DRAFT_EXTEND execute only on the built-in
+    runner's own draft models in this version."""
 
     EXTEND = "extend"
     DECODE = "decode"
@@ -509,7 +510,11 @@ class StepMode(str, Enum):
     # Speculative decoding: the target scores every draft token of every
     # request (``Step.spec``) under the draft tree's mask (``Step.mask``).
     VERIFY = "verify"
+    # A draft model's k-step top-k expansion, as one call: SGLang builds the
+    # verify tree from the StepOutput.draft it returns.
     DRAFT = "draft"
+    # A draft model's forward over a prompt or the target's accepted tokens,
+    # fed the target's hidden states (SpecInputs.hidden).
     DRAFT_EXTEND = "draft_extend"
 
 
@@ -642,6 +647,12 @@ class SpecInputs(msgspec.Struct, frozen=True, kw_only=True):
     """
 
     num_draft_tokens: int
+    # DRAFT steps: the expansion's depth and its candidates per node.
+    num_steps: Optional[int] = None
+    topk: Optional[int] = None
+    # DRAFT and DRAFT_EXTEND steps: the hidden states the draft reads, from
+    # its target (or its own last step), one row per input row.
+    hidden: Optional[torch.Tensor] = None
 
     def __post_init__(self) -> None:
         if self.num_draft_tokens < 1:
@@ -673,8 +684,19 @@ class LogitRows(str, Enum):
     NONE = "none"
 
 
+class HiddenRows(str, Enum):
+    """Hidden states a step returns (StepOutput.hidden): those its draft model
+    reads -- the final layer's, or the auxiliary layers the draft declares,
+    concatenated (EAGLE3) -- for each request's last input row or every row."""
+
+    NONE = "none"
+    LAST = "last"
+    ALL = "all"
+
+
 class OutputSpec(msgspec.Struct, frozen=True, kw_only=True):
     logit_rows: LogitRows = LogitRows.LAST
+    hidden: HiddenRows = HiddenRows.NONE
     # Some request reads prompt logprobs this step: from StepOutput.logprobs
     # when the runner declares native_prompt_logprobs, else through project().
     prompt_logprobs: bool = False
@@ -764,6 +786,12 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
 
     def __post_init__(self) -> None:
         num_tokens = self.input_ids.shape[0]
+        if self.mode is StepMode.DRAFT:
+            # input_ids seed the expansion; positions and write slots cover
+            # every expansion step.
+            if self.spec is None or self.spec.num_steps is None:
+                raise ValueError("a draft step needs SpecInputs with num_steps")
+            return
         if self.positions.shape[-1] != num_tokens:
             raise ValueError(
                 f"Step has {num_tokens} input ids but "
@@ -790,11 +818,19 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
                 f"a {self.mode.value} step has one input row per request, got "
                 f"{num_tokens} rows for {self.rows.batch_size} requests"
             )
-        if (self.mode is StepMode.VERIFY) != (self.spec is not None) or (
-            self.mask is not None and self.spec is None
+        speculative = self.mode in (
+            StepMode.VERIFY,
+            StepMode.DRAFT,
+            StepMode.DRAFT_EXTEND,
+        )
+        if speculative != (self.spec is not None) or (
+            self.mask is not None and self.mode is not StepMode.VERIFY
         ):
-            raise ValueError("speculative inputs and a tree mask go with verify steps")
-        if self.spec is not None:
+            raise ValueError(
+                "speculative inputs go with verify and draft steps, a tree mask "
+                "with verify steps"
+            )
+        if self.mode is StepMode.VERIFY:
             drafts = self.spec.num_draft_tokens
             if has_queries or num_tokens != self.rows.batch_size * drafts:
                 raise ValueError(
@@ -893,6 +929,18 @@ class PromptLogprobs(msgspec.Struct, frozen=True, kw_only=True):
     copy_done: Optional[Any] = None
 
 
+class DraftTree(msgspec.Struct, frozen=True, kw_only=True):
+    """A draft step's expansion, in SGLang's draft-result layout (the inputs of
+    its verify-tree build): per request, the selected tokens, their parents in
+    the expansion, and which scored candidates were kept."""
+
+    tokens: torch.Tensor
+    parents: torch.Tensor
+    scores: torch.Tensor
+    # The draft's proposal distribution, when SGLang verifies stochastically.
+    probs: Optional[torch.Tensor] = None
+
+
 class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
     """What one step produced.
 
@@ -907,6 +955,10 @@ class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
     # Stages before the last (OutputSpec.pp_out): what SGLang sends to the
     # next stage, which receives it as Step.pp_in.
     pp_out: Optional[dict[str, torch.Tensor]] = None
+    # OutputSpec.hidden; SGLang copies what it keeps past release.
+    hidden: Optional[torch.Tensor] = None
+    # DRAFT steps.
+    draft: Optional[DraftTree] = None
     # A device event that fires when the outputs are written; SGLang's runner
     # stream waits on it before any consumer. None: the outputs are ordered on
     # the runner stream before execute() returns.

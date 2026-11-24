@@ -1,7 +1,7 @@
 import contextlib
 import logging
 import time
-from typing import Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
@@ -148,6 +148,9 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 
+if TYPE_CHECKING:
+    from sglang.srt.model_runner_plugins.native_draft import NativeDraftSteps
+
 logger = logging.getLogger(__name__)
 
 
@@ -191,6 +194,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     draft_runtime: eagle_megakernel.EagleDraftRuntime = (
         eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME
     )
+    # Set after startup under --model-runner sglang: the draft calls run as
+    # DRAFT and DRAFT_EXTEND Steps. None runs them directly.
+    draft_steps: Optional["NativeDraftSteps"] = None
 
     def __init__(
         self,
@@ -779,29 +785,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
         with canary_outside_ctx:
-            # Run draft
-            if can_run_decode_cuda_graph:
+            if self.draft_steps is None:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.cuda_graph_runner.execute(forward_batch)
+                    self._run_draft(forward_batch, can_run_decode_cuda_graph)
                 )
-                if draft_probs is not None:
-                    # draft_probs is the one graph output read after the target
-                    # forward rather than by it, and it points into the graph's
-                    # private memory pool. The pool recycles that block in the
-                    # meantime -- in practice the DSA top-k mask lands there and
-                    # eagle_sample sees -inf. Copy out at the boundary.
-                    draft_probs = draft_probs.clone()
             else:
-                if (
-                    not forward_batch.forward_mode.is_idle()
-                    and self.speculative_num_steps > 1
-                ):
-                    # Skip attention backend init for 1-step draft,
-                    # `draft_forward` only does sample in this case.
-                    self.draft_attn_backend.init_forward_metadata(forward_batch)
-                    forward_batch.mark_forward_metadata_ready()
+                # The expansion as one DRAFT Step of the --model-runner draft.
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
+                    self.draft_steps.draft(
+                        forward_batch,
+                        graph_runner=(
+                            self.cuda_graph_runner
+                            if can_run_decode_cuda_graph
+                            else None
+                        ),
+                        run=lambda: self._run_draft(
+                            forward_batch, can_run_decode_cuda_graph
+                        ),
+                    )
                 )
 
         verify_input = build_eagle_verify_input(
@@ -828,6 +829,33 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Returned rather than stashed on self so the caller owns lifetime.
             return verify_input, parent_list, top_scores_index
         return verify_input
+
+    def _run_draft(self, forward_batch: ForwardBatch, can_run_decode_cuda_graph: bool):
+        """The k-step expansion: one draft graph replay, or the eager loop."""
+        if can_run_decode_cuda_graph:
+            parent_list, top_scores_index, draft_tokens, draft_probs = (
+                self.cuda_graph_runner.execute(forward_batch)
+            )
+            if draft_probs is not None:
+                # draft_probs is the one graph output read after the target
+                # forward rather than by it, and it points into the graph's
+                # private memory pool. The pool recycles that block in the
+                # meantime -- in practice the DSA top-k mask lands there and
+                # eagle_sample sees -inf. Copy out at the boundary.
+                draft_probs = draft_probs.clone()
+        else:
+            if (
+                not forward_batch.forward_mode.is_idle()
+                and self.speculative_num_steps > 1
+            ):
+                # Skip attention backend init for 1-step draft,
+                # `draft_forward` only does sample in this case.
+                self.draft_attn_backend.init_forward_metadata(forward_batch)
+                forward_batch.mark_forward_metadata_ready()
+            parent_list, top_scores_index, draft_tokens, draft_probs = (
+                self.draft_forward(forward_batch)
+            )
+        return parent_list, top_scores_index, draft_tokens, draft_probs
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -1305,7 +1333,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ).long()
 
         with self._draft_canary_ctx(forward_batch):
-            logits_output = self.draft_runner.forward(forward_batch).logits_output
+            if self.draft_steps is None:
+                logits_output = self.draft_runner.forward(forward_batch).logits_output
+            else:
+                # A DRAFT_EXTEND Step of the --model-runner draft.
+                logits_output = self.draft_steps.draft_extend(
+                    forward_batch,
+                    model_runner=self.draft_runner,
+                    selected_rows=False,
+                    run=lambda: self.draft_runner.forward(forward_batch).logits_output,
+                )
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -1364,6 +1401,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
+
+    def _run_draft_extend_for_decode(
+        self, forward_batch: ForwardBatch, select_index, can_run_decode_cuda_graph
+    ):
+        """The draft forward over the accepted tokens: the draft-extend graph
+        (returning each request's last accepted row), or eager (every row)."""
+        if can_run_decode_cuda_graph:
+            return self.cuda_graph_runner_for_draft_extend.execute(
+                forward_batch, select_index
+            )
+        return self.draft_runner.forward(forward_batch).logits_output
 
     def _draft_extend_for_decode(
         self,
@@ -1462,14 +1510,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
         with canary_ctx:
-            if can_run_decode_cuda_graph:
-                draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch, select_index
+            if self.draft_steps is None:
+                draft_logits_output = self._run_draft_extend_for_decode(
+                    forward_batch, select_index, can_run_decode_cuda_graph
                 )
             else:
-                draft_logits_output = self.draft_runner.forward(
-                    forward_batch
-                ).logits_output
+                # A DRAFT_EXTEND Step of the --model-runner draft.
+                draft_logits_output = self.draft_steps.draft_extend(
+                    forward_batch,
+                    graph_runner=(
+                        self.cuda_graph_runner_for_draft_extend
+                        if can_run_decode_cuda_graph
+                        else None
+                    ),
+                    selected_rows=can_run_decode_cuda_graph,
+                    run=lambda: self._run_draft_extend_for_decode(
+                        forward_batch, select_index, can_run_decode_cuda_graph
+                    ),
+                )
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,

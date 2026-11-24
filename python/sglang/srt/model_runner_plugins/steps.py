@@ -20,6 +20,7 @@ from sglang.srt.model_runner_plugins.api import (
     EAGER,
     DPInfo,
     GraphChoice,
+    HiddenRows,
     KVTables,
     LogitRows,
     LogitsLayout,
@@ -58,8 +59,6 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         refusal = _verify_refusal(forward_batch)
         if refusal is not None:
             return refusal
-    if forward_batch.capture_hidden_mode != CaptureHiddenMode.NULL:
-        return "hidden-state capture"
     if (
         forward_batch.input_embeds is not None
         or forward_batch.replace_embeds is not None
@@ -107,6 +106,9 @@ def _verify_refusal(forward_batch: ForwardBatch) -> Optional[str]:
 
 def tree_mask_layout(spec_info) -> Optional[TreeMaskLayout]:
     """The layout of ``spec_info.custom_mask``; None when no layout describes it."""
+    from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+    from sglang.srt.speculative.eagle_info import EagleVerifyInput
+    from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
     if spec_info.custom_mask is None:
@@ -114,7 +116,17 @@ def tree_mask_layout(spec_info) -> Optional[TreeMaskLayout]:
     if isinstance(spec_info, NgramVerifyInput):
         # The n-gram worker always builds a full mask on GPU (USE_FULL_MASK).
         return TreeMaskLayout.FULL
+    if type(spec_info) is EagleVerifyInput:
+        # The EAGLE draft worker builds its tree in the default mode.
+        return _TREE_MASK_LAYOUTS[TreeMaskMode(default_tree_mask_mode())]
     return None
+
+
+_TREE_MASK_LAYOUTS = {
+    0: TreeMaskLayout.FULL,
+    1: TreeMaskLayout.DRAFTS_ONLY,
+    2: TreeMaskLayout.DRAFTS_ONLY_BITPACKED,
+}
 
 
 def dp_prefill_graph_bucket(forward_batch: ForwardBatch) -> Optional[int]:
@@ -230,6 +242,11 @@ def build_step(
                 else LogitRows.LAST
             ),
             prompt_logprobs=last_stage and reads_prompt_logprobs(forward_batch),
+            hidden=(
+                _HIDDEN_ROWS[forward_batch.capture_hidden_mode]
+                if last_stage
+                else HiddenRows.NONE
+            ),
             pp_out=not last_stage,
         ),
         graph=graph,
@@ -239,6 +256,13 @@ def build_step(
         mask=mask,
         spec=spec,
     )
+
+
+_HIDDEN_ROWS = {
+    CaptureHiddenMode.NULL: HiddenRows.NONE,
+    CaptureHiddenMode.LAST: HiddenRows.LAST,
+    CaptureHiddenMode.FULL: HiddenRows.ALL,
+}
 
 
 def dp_info(forward_batch: ForwardBatch) -> Optional[DPInfo]:
@@ -271,7 +295,9 @@ def logits_output_from_step(
         if gather_vocab is None:
             raise ValueError("vocabulary-sharded logits need a TP group to gather")
         logits = gather_vocab(logits)
-    logits_output = LogitsProcessorOutput(next_token_logits=logits)
+    logits_output = LogitsProcessorOutput(
+        next_token_logits=logits, hidden_states=out.hidden
+    )
     if out.pp_out is not None:
         raise ValueError("a last-stage step returned pp_out")
     if out.logprobs is not None:

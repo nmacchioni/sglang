@@ -473,7 +473,6 @@ class TestStepSubset(CustomTestCase):
             "a verify without a uniform draft count": dict(
                 forward_mode=ForwardMode.TARGET_VERIFY
             ),
-            "hidden-state capture": dict(capture_hidden_mode=CaptureHiddenMode.LAST),
             "input embeddings": dict(input_embeds=torch.zeros(2, 4)),
             "LoRA": dict(lora_ids=[None, "adapter"]),
             "beam search": dict(beam=object()),
@@ -596,8 +595,8 @@ class TestStepForward(CustomTestCase):
 
     def test_a_batch_outside_the_subset_fails_for_external_runners_only(self):
         batch = _decode_batch()
-        batch.capture_hidden_mode = CaptureHiddenMode.LAST
-        with self.assertRaisesRegex(ValueError, "fake cannot run a step with hidden"):
+        batch.beam = object()
+        with self.assertRaisesRegex(ValueError, "fake cannot run a step with beam"):
             _external_forward(_FakeExecutor()).takes(batch)
         native = StepForward(
             runner_name="sglang",
@@ -609,6 +608,14 @@ class TestStepForward(CustomTestCase):
         )
         self.assertFalse(native.takes(batch))
         self.assertTrue(native.takes(_decode_batch()))
+
+    def test_a_step_asking_for_hidden_states_needs_them_back(self):
+        """A draft reads the target's hidden states from the step's output; a
+        runner that drops them must fail the step, not hand the draft None."""
+        batch = _decode_batch()
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        with self.assertRaisesRegex(ValueError, "no hidden states.*last"):
+            _external_forward(_FakeExecutor()).forward(batch)
 
     def test_execute_must_return_a_step_output(self):
         executor = _FakeExecutor()
