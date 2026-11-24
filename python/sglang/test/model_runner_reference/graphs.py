@@ -9,7 +9,8 @@ slot 0.
 
 Logits land in one buffer shared by every bucket, as SGLang's own graph runners
 share theirs, so the runner declares logits a shared output and orders each
-overwrite after the previous step's release event.
+overwrite after the previous step's release event. The last graph also takes
+the greedy next ids, which the runner returns when it owns a step's sampling.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ class _BucketGraph:
         model: DenseDecoder,
         rows: int,
         logits: torch.Tensor,
+        next_ids: torch.Tensor,
         pool,
         sharded: bool,
     ):
@@ -50,6 +52,7 @@ class _BucketGraph:
         cos, sin = model.rope(self._positions)
         self._cos, self._sin = torch.zeros_like(cos), torch.zeros_like(sin)
         self._logits = logits[:rows]
+        self._next_ids = next_ids[:rows]
         self._pieces = [
             self._capture(piece, pool)
             for piece in [self._first, *self._middles(), self._last]
@@ -78,6 +81,8 @@ class _BucketGraph:
             self._logits.copy_(self._model.logits_shard(hidden))
         else:
             self._logits.copy_(self._model.logits(hidden))
+            # Greedy decoding inside the graph, for steps the runner samples.
+            torch.argmax(self._logits, dim=-1, out=self._next_ids)
 
     def _project(self, layer: int) -> None:
         q = self._model.pre_attention(
@@ -121,7 +126,7 @@ class _BucketGraph:
         if before_logits is not None:
             before_logits()
         self._pieces[num_layers].replay()
-        return self._logits[:bs]
+        return self._logits[:bs], self._next_ids[:bs]
 
 
 class DecodeGraphs:
@@ -134,11 +139,19 @@ class DecodeGraphs:
             dtype=torch.float32,
             device=model.device,
         )
+        self.next_ids = torch.zeros(
+            max(buckets), dtype=torch.int64, device=model.device
+        )
         pool = torch.cuda.graph_pool_handle()
         # Largest first, so smaller buckets reuse the pool's blocks.
         self._graphs = {
             rows: _BucketGraph(
-                model=model, rows=rows, logits=self.logits, pool=pool, sharded=sharded
+                model=model,
+                rows=rows,
+                logits=self.logits,
+                next_ids=self.next_ids,
+                pool=pool,
+                sharded=sharded,
             )
             for rows in sorted(buckets, reverse=True)
         }
@@ -153,7 +166,8 @@ class DecodeGraphs:
         *,
         bucket: int,
         before_logits: Optional[Callable[[], None]] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The step's logits and greedy next ids, in the shared buffers."""
         graph = self._graphs.get(bucket)
         if graph is None:
             raise ValueError(f"no decode graph was captured for bucket {bucket}")

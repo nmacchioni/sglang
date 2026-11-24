@@ -156,6 +156,7 @@ class StepTrace:
         kv: Optional[KVTables] = None,
         model_runner=None,
         adapters: Optional[torch.Tensor] = None,
+        sampling_owner: Optional[str] = None,
     ) -> None:
         host_seconds = time.perf_counter() - tic
         # A pipeline stage before the last hands the next stage proxy tensors.
@@ -218,6 +219,8 @@ class StepTrace:
                 else list(forward_batch.lora_ids[: forward_batch.batch_size])
             ),
             "adapters": None if adapters is None else adapters.tolist(),
+            # Step path only: who sampled the step ("sglang" or "plugin").
+            "sampling_owner": sampling_owner,
             # Multimodal items the step's requests carry.
             "mm_items": sum(
                 len(mm.mm_items)

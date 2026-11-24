@@ -250,6 +250,29 @@ class PluginOwnedModelRunner(ModelRunner):
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         pass
 
+    def sample(self, logits_output, forward_batch):
+        """SGLang's sampling, with the runner's tokens for a step it sampled
+        (fused sampling) in place of the sampler."""
+        step_forward = self._runner.step_forward
+        next_ids = (
+            None if step_forward is None else step_forward.take_next_ids(forward_batch)
+        )
+        if next_ids is None:
+            return super().sample(logits_output, forward_batch)
+        # The commit stages SGLang runs after any sampler (penalty state, n-gram
+        # embeddings); the batch has no logprobs or logit edits.
+        logits_output.auxiliary_device_output = None
+        next_token_ids = self.sampling_pipeline.sample(
+            logits_output,
+            forward_batch,
+            observer=self.sampling_observer,
+            graph_token_ids=next_ids,
+        )
+        self.ngram_embedding_manager.update_after_decode(
+            next_token_ids=next_token_ids, forward_batch=forward_batch
+        )
+        return next_token_ids
+
     def forward(self, *args, **kwargs):
         raise RuntimeError(
             f"Model runner {self._runner.name!r} runs only through its Step API"

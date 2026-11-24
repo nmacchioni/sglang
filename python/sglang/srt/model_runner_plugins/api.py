@@ -183,6 +183,13 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     # buffers). SGLang keeps no reference to them past ``release``, and releases
     # each before the next ``execute``; any other output is fresh per step.
     shared_outputs: tuple[OutputBuffer, ...] = ()
+    # Fused greedy sampling: SGLang makes the runner the sampling owner
+    # (Step.sampling_owner PLUGIN) of a batch whose every request decodes
+    # greedily with nothing that edits or reads the distribution (logprobs,
+    # grammar, penalties, logit bias, custom logit processors, watermarks), and
+    # takes StepOutput.next_ids as that step's tokens. Any other batch keeps
+    # SGLang as owner. Only full-vocabulary logits.
+    fused_sampling: bool = False
     # Control operations the runner's ``control`` serves; SGLang answers any
     # other with a failed status naming the operation, as today's replies do.
     control_ops: tuple[ControlOp, ...] = ()
@@ -949,6 +956,14 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
                     f"a verify step has {drafts} input rows per request, got "
                     f"{num_tokens} rows for {self.rows.batch_size} requests"
                 )
+        if self.sampling_owner is SamplingOwner.PLUGIN and (
+            self.mode not in (StepMode.EXTEND, StepMode.DECODE, StepMode.MIXED)
+            or self.outputs.logit_rows is not LogitRows.LAST
+        ):
+            raise ValueError(
+                f"a {self.mode.value} step without a logit row per request "
+                "cannot be sampled by the runner"
+            )
         if self.graph.bucket is not None:
             rows = (
                 self.rows.batch_size
@@ -1072,6 +1087,8 @@ class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
     # [T, hidden] device: the input embeddings with multimodal items merged
     # in, from a step that carried Step.mm (a draft model reads them).
     input_embeds: Optional[torch.Tensor] = None
+    # Step.sampling_owner PLUGIN: [B] int64 device, request b's next token.
+    next_ids: Optional[torch.Tensor] = None
     # DRAFT steps.
     draft: Optional[DraftTree] = None
     # OutputSpec.pooled: [B, D] (embeddings or head scores), or a list of

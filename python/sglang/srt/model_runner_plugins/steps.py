@@ -28,6 +28,7 @@ from sglang.srt.model_runner_plugins.api import (
     OutputSpec,
     PromptLogprobs,
     Rows,
+    SamplingOwner,
     ScoreRowKind,
     ScoreRows,
     SpecInputs,
@@ -210,6 +211,7 @@ def build_step(
     state: Optional[StateTables] = None,
     pooling: bool = False,
     adapters: Optional[torch.Tensor] = None,
+    sampling_owner: SamplingOwner = SamplingOwner.SGLANG,
 ) -> Step:
     """The step ``forward_batch`` describes; every tensor is one of its own.
 
@@ -271,6 +273,7 @@ def build_step(
             pooled_hidden=pooling and forward_batch.return_pooled_hidden_states,
             score_rows=score_rows(forward_batch),
         ),
+        sampling_owner=sampling_owner,
         graph=graph,
         inputs_ready=inputs_ready,
         dp=dp_info(forward_batch),
@@ -284,6 +287,24 @@ def build_step(
             if forward_batch.token_type_ids is None
             else {"token_type_ids": forward_batch.token_type_ids}
         ),
+    )
+
+
+def runner_may_sample(forward_batch: ForwardBatch) -> bool:
+    """Whether a runner that fuses greedy sampling may own this batch's
+    sampling: every request greedy, and nothing edits or reads the logits."""
+    from sglang.srt.sampling.sampling_batch_info import adjusts_logits
+
+    info = forward_batch.sampling_info
+    return (
+        forward_batch.forward_mode
+        in (ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.MIXED)
+        and not forward_batch.is_prefill_only
+        and not forward_batch.return_logprob
+        and info is not None
+        and info.is_all_greedy
+        and not adjusts_logits(info, has_grammar=info.grammars is not None)
+        and forward_batch.capture_hidden_mode is CaptureHiddenMode.NULL
     )
 
 

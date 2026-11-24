@@ -45,6 +45,7 @@ from sglang.srt.model_runner_plugins.api import (
     Rows,
     RunnerCapabilities,
     RuntimeConfig,
+    SamplingOwner,
     ScoreRowKind,
     SpecInputs,
     StateTables,
@@ -754,6 +755,101 @@ class TestStepForward(CustomTestCase):
         executor.execute = lambda plan: {"logits": None}
         with self.assertRaisesRegex(TypeError, "expected StepOutput"):
             _external_forward(executor).forward(_decode_batch())
+
+
+def _greedy_info(**overrides):
+    """A SamplingBatchInfo's fields fused sampling reads: all greedy, no edits."""
+    fields = dict(
+        is_all_greedy=True,
+        grammars=None,
+        step_penalties=None,
+        logit_bias=None,
+        has_custom_logit_processor=False,
+        watermark=None,
+    )
+    return SimpleNamespace(**{**fields, **overrides})
+
+
+class _SamplingExecutor(_FakeExecutor):
+    """Returns the argmax as next_ids whenever it owns a step's sampling."""
+
+    def __init__(self, *, drop_ids=False):
+        super().__init__()
+        self.owners = []
+        self._drop_ids = drop_ids
+
+    def execute(self, plan):
+        out = super().execute(plan)
+        owner = plan.step.sampling_owner
+        self.owners.append(owner)
+        if owner is SamplingOwner.PLUGIN and not self._drop_ids:
+            out = msgspec.structs.replace(out, next_ids=out.logits.tensor.argmax(-1))
+        return out
+
+
+class TestFusedSampling(CustomTestCase):
+    def _forward(self, executor):
+        return StepForward(
+            runner_name="fake",
+            executor=executor,
+            page_table=_PAGE_TABLE,
+            vocab_size=_VOCAB,
+            native_prompt_logprobs=False,
+            fused_sampling=True,
+        )
+
+    def test_the_runner_owns_only_batches_nothing_else_samples_from(self):
+        """Any request that reads or edits the distribution keeps SGLang the
+        owner of the whole batch: the runner would drop what it cannot honor."""
+        cases = {
+            "greedy": ({}, {}, SamplingOwner.PLUGIN),
+            "temperature": (dict(is_all_greedy=False), {}, SamplingOwner.SGLANG),
+            "grammar": (dict(grammars=[object()]), {}, SamplingOwner.SGLANG),
+            "penalty": (dict(step_penalties=object()), {}, SamplingOwner.SGLANG),
+            "logit bias": (dict(logit_bias=object()), {}, SamplingOwner.SGLANG),
+            "logprobs": ({}, dict(return_logprob=True), SamplingOwner.SGLANG),
+            "hidden states": (
+                {},
+                dict(capture_hidden_mode=CaptureHiddenMode.LAST),
+                SamplingOwner.SGLANG,
+            ),
+        }
+        for name, (info, fields, owner) in cases.items():
+            with self.subTest(case=name):
+                executor = _SamplingExecutor()
+                batch = _decode_batch()
+                batch.sampling_info = _greedy_info(**info)
+                for field, value in fields.items():
+                    setattr(batch, field, value)
+                steps = self._forward(executor)
+                try:
+                    steps.forward(batch)
+                except ValueError:
+                    pass  # hidden states: the fake returns none, after the owner
+                self.assertEqual(executor.owners, [owner])
+
+    def test_runner_tokens_go_to_the_batch_they_were_sampled_for(self):
+        executor = _SamplingExecutor()
+        steps = self._forward(executor)
+        batch = _decode_batch()
+        batch.sampling_info = _greedy_info()
+        steps.forward(batch)
+        self.assertIsNone(steps.take_next_ids(_decode_batch()))
+        self.assertEqual(
+            steps.take_next_ids(batch).tolist(),
+            executor.lm_head[:2].argmax(-1).tolist(),
+        )
+        self.assertIsNone(steps.take_next_ids(batch))
+        with self.assertRaisesRegex(ValueError, "returned no next_ids"):
+            self._forward(_SamplingExecutor(drop_ids=True)).forward(batch)
+
+    def test_a_step_without_a_row_per_request_cannot_be_runner_sampled(self):
+        with self.assertRaisesRegex(ValueError, "cannot be sampled by the runner"):
+            build_step(
+                forward_batch=_ngram_verify_batch(),
+                page_table=_PAGE_TABLE,
+                sampling_owner=SamplingOwner.PLUGIN,
+            )
 
 
 def _logits_out(tag):

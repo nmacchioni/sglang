@@ -38,6 +38,7 @@ from sglang.srt.model_runner_plugins.api import (
     ResolvedConfig,
     RunnerCapabilities,
     RuntimeConfig,
+    SamplingOwner,
     Step,
     StepOutput,
 )
@@ -94,6 +95,9 @@ class ReferenceRunner:
             shared_outputs=(OutputBuffer.LOGITS,),
             architectures=ARCHITECTURES,
             control_ops=(ControlOp.WEIGHTS_UPDATE_FROM_DISK, ControlOp.WEIGHTS_GET),
+            # Greedy argmax, inside the decode graphs; its argmax over shards
+            # would be wrong, so the vocabulary-sharded variant leaves it to SGLang.
+            fused_sampling=self._logits_layout is LogitsLayout.FULL,
         )
 
     @torch.inference_mode()
@@ -189,6 +193,7 @@ class ReferenceRunner:
             stream.wait_event(step.inputs_ready)
         if step.outputs.logit_rows is LogitRows.NONE:
             return StepOutput()
+        next_ids = None
         if step.graph.is_eager:
             plan.hidden = self._model.hidden_states(step)
             # A verify step scores every draft token.
@@ -201,20 +206,27 @@ class ReferenceRunner:
                 logits = self._model.logits_shard(last)
             else:
                 logits = self._model.logits(last)
+            if step.sampling_owner is SamplingOwner.PLUGIN:
+                next_ids = logits.argmax(dim=-1)
         else:
             if self._logits_held:
                 raise RuntimeError(
                     "SGLang executed a step before releasing the previous output "
                     "of the shared logits buffer"
                 )
-            logits = self._graphs.replay(
+            logits, graph_ids = self._graphs.replay(
                 step, bucket=step.graph.bucket, before_logits=self._wait_logits_free
             )
             self._logits_held = True
+            if step.sampling_owner is SamplingOwner.PLUGIN:
+                # Out of the shared buffer: SGLang feeds them to the next step.
+                next_ids = graph_ids.clone()
         ready = torch.cuda.Event()
         ready.record(stream)
         return StepOutput(
-            logits=Logits(tensor=logits, layout=self._logits_layout), ready=ready
+            logits=Logits(tensor=logits, layout=self._logits_layout),
+            next_ids=next_ids,
+            ready=ready,
         )
 
     def _wait_logits_free(self) -> None:
