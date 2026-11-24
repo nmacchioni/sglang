@@ -563,6 +563,13 @@ class StepMode(str, Enum):
     # A draft model's forward over a prompt or the target's accepted tokens,
     # fed the target's hidden states (SpecInputs.hidden).
     DRAFT_EXTEND = "draft_extend"
+    # A diffusion LLM's denoising pass: each request's block of rows after its
+    # committed prefix (rows as an extend's), attending to the prefix and to
+    # the whole block, one logit row per input row. SGLang may execute the
+    # same plan again after rewriting input_ids in place (the denoised
+    # positions); each execution rewrites the block's KV. Built-in runner only
+    # in this version.
+    DENOISE = "denoise"
 
 
 EXECUTABLE_STEP_MODES = frozenset(
@@ -928,7 +935,10 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
                 f"{window.write_slots.shape[0]} window write slots"
             )
         has_queries = self.rows.query_start is not None
-        if self.mode in (StepMode.EXTEND, StepMode.MIXED) and not has_queries:
+        if (
+            self.mode in (StepMode.EXTEND, StepMode.MIXED, StepMode.DENOISE)
+            and not has_queries
+        ):
             raise ValueError(f"a {self.mode.value} step needs query offsets")
         if self.mode in (StepMode.DECODE, StepMode.IDLE) and (
             has_queries or num_tokens != self.rows.batch_size

@@ -178,8 +178,6 @@ def native_step_refusals(
         or reports_expert_balancedness()
     ):
         reasons.append("per-forward captures")
-    if get_exec().dllm.dllm_algorithm is not None:
-        reasons.append("diffusion LLMs")
     if model_runner.is_draft_worker or use_mlx():
         reasons.append("a draft model")
     return reasons
@@ -322,6 +320,9 @@ def step_output_of(
             copy_done=logits_output.input_logprobs_copy_done,
         )
     logits = logits_output.next_token_logits
+    if logits is None:
+        # A denoising pass: a logit row per input row.
+        logits = logits_output.full_logits
     return StepOutput(
         logits=None if logits is None else Logits(tensor=logits),
         logprobs=logprobs,

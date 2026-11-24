@@ -53,6 +53,7 @@ _STEP_MODES = {
     ForwardMode.MIXED: StepMode.MIXED,
     ForwardMode.IDLE: StepMode.IDLE,
     ForwardMode.TARGET_VERIFY: StepMode.VERIFY,
+    ForwardMode.DLLM_EXTEND: StepMode.DENOISE,
 }
 
 
@@ -218,7 +219,7 @@ def build_step(
     Raises ``RendezvousMismatch`` when the batch is not the one this rank
     published at the MLP-sync rendezvous, before any collective runs."""
     mode = _STEP_MODES[forward_batch.forward_mode]
-    extend = mode in (StepMode.EXTEND, StepMode.MIXED)
+    extend = mode in (StepMode.EXTEND, StepMode.MIXED, StepMode.DENOISE)
     mask = spec = None
     if mode is StepMode.VERIFY:
         spec_info = forward_batch.spec_info
@@ -259,7 +260,7 @@ def build_step(
                 LogitRows.NONE
                 if not last_stage or mode is StepMode.IDLE or pooling
                 else LogitRows.ALL
-                if mode is StepMode.VERIFY
+                if mode in (StepMode.VERIFY, StepMode.DENOISE)
                 else LogitRows.LAST
             ),
             prompt_logprobs=last_stage and reads_prompt_logprobs(forward_batch),

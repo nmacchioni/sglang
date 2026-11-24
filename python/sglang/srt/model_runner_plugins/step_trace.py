@@ -157,6 +157,7 @@ class StepTrace:
         model_runner=None,
         adapters: Optional[torch.Tensor] = None,
         sampling_owner: Optional[str] = None,
+        plan_runs: Optional[int] = None,
     ) -> None:
         host_seconds = time.perf_counter() - tic
         # A pipeline stage before the last hands the next stage proxy tensors.
@@ -168,6 +169,9 @@ class StepTrace:
             outputs = {f"pp_out.{name}": t for name, t in sorted(pp_out.items())}
         elif pooled is not None:
             outputs = {"pooled": pooled}
+        elif logits_output.next_token_logits is None:
+            # A denoising pass: a logit row per input row.
+            outputs = {"logits": logits_output.full_logits}
         else:
             outputs = {"logits": logits_output.next_token_logits}
         record = {
@@ -221,6 +225,9 @@ class StepTrace:
             "adapters": None if adapters is None else adapters.tolist(),
             # Step path only: who sampled the step ("sglang" or "plugin").
             "sampling_owner": sampling_owner,
+            # Step path only: the executions of this step's plan so far (a
+            # denoising pass re-executes its batch's plan).
+            "plan_runs": plan_runs,
             # Multimodal items the step's requests carry.
             "mm_items": sum(
                 len(mm.mm_items)

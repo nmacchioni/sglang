@@ -852,6 +852,48 @@ class TestFusedSampling(CustomTestCase):
             )
 
 
+class _AllRowsExecutor(_FakeExecutor):
+    """A logit row per input row (denoising passes)."""
+
+    def execute(self, plan):
+        self.calls.append(("execute", plan.step.mode))
+        rows = torch.arange(plan.step.input_ids.shape[0]) % self.lm_head.shape[0]
+        return StepOutput(logits=Logits(tensor=self.lm_head[rows]))
+
+
+class TestDenoiseSteps(CustomTestCase):
+    def _block_batch(self):
+        batch = _extend_batch(prefix_lens=[3, 5], extend_lens=[4, 4])
+        batch.forward_mode = ForwardMode.DLLM_EXTEND
+        return batch
+
+    def test_a_diffusion_block_is_a_denoise_step_over_every_row(self):
+        step = build_step(forward_batch=self._block_batch(), page_table=_PAGE_TABLE)
+        self.assertIs(step.mode, StepMode.DENOISE)
+        self.assertIs(step.outputs.logit_rows, LogitRows.ALL)
+        self.assertEqual(step.rows.prefix_lens_cpu, [3, 5])
+
+    def test_passes_over_one_batch_execute_its_plan_again(self):
+        """The algorithm rewrites the block's input_ids in place between
+        passes; the runner plans the block once and executes it per pass."""
+        executor = _AllRowsExecutor()
+        steps = _external_forward(executor)
+        batch = self._block_batch()
+        for _ in range(3):
+            out = steps.forward(batch)
+            self.assertIsNone(out.logits_output.next_token_logits)
+            self.assertEqual(out.logits_output.full_logits.shape[0], 8)
+        self.assertEqual(steps.last_plan_runs, 3)
+        steps.forward(self._block_batch())
+        self.assertEqual(steps.last_plan_runs, 1)
+        self.assertEqual(
+            [c for c in executor.calls if c[0] != "release"],
+            [("plan", StepMode.DENOISE)]
+            + [("execute", StepMode.DENOISE)] * 3
+            + [("plan", StepMode.DENOISE), ("execute", StepMode.DENOISE)],
+        )
+
+
 def _logits_out(tag):
     return StepOutput(logits=Logits(tensor=torch.full((1, _VOCAB), float(tag))))
 

@@ -614,7 +614,15 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu,
             dllm_algo_state,
             can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+        ) = self.dllm_algorithm.run(
+            (
+                self.model_runner
+                if self.step_forward is None and self.step_trace is None
+                else self._denoise_runner()
+            ),
+            forward_batch,
+            algo_states,
+        )
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -622,6 +630,15 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             dllm_algo_state=dllm_algo_state,
             can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def _denoise_runner(self):
+        """The runner a diffusion algorithm drives under --model-runner (or
+        with the step trace on): its denoising passes go through forward_model."""
+        from sglang.srt.model_runner_plugins.step_forward import DenoiseRunner
+
+        return DenoiseRunner(
+            model_runner=self.model_runner, forward_model=self.forward_model
         )
 
     def set_step_forward(self, step_forward: Optional[StepForward]) -> None:
@@ -658,6 +675,7 @@ class TpModelWorker(BaseTpWorker):
                 model_runner=self.model_runner,
                 adapters=steps.last_adapters if via_steps else None,
                 sampling_owner=steps.last_sampling_owner.value if via_steps else None,
+                plan_runs=steps.last_plan_runs if via_steps else None,
             )
         return out
 
