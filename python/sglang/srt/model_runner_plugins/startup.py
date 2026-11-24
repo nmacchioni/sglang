@@ -33,8 +33,11 @@ from sglang.srt.model_runner_plugins.api import (
 from sglang.srt.model_runner_plugins.external import ExternalRunner
 from sglang.srt.model_runner_plugins.native import NativeStartupHost, SGLangRunnerPlugin
 from sglang.srt.model_runner_plugins.native_results import admission_limits
-from sglang.srt.model_runner_plugins.registry import load_model_runner
-from sglang.srt.model_runner_plugins.selection import describe_runner, resolved_config
+from sglang.srt.model_runner_plugins.selection import (
+    describe_runner,
+    resolved_config,
+    selected_model_runner,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -114,14 +117,14 @@ class ModelRunnerStartup:
     def maybe_create(
         cls, *, native_host: NativeStartupHost, model_config: ModelConfig
     ) -> Optional[ModelRunnerStartup]:
-        """None without ``--model-runner``, so the default path runs no lifecycle."""
-        name = get_exec().kernel.model_runner
-        if name is None:
-            return None
+        """None on the direct path, which runs no lifecycle."""
         if use_mlx():
             # The MLX worker keeps its own startup path in v1.
             return None
-        runner = load_model_runner(name)
+        runner = selected_model_runner()
+        if runner is None:
+            return None
+        name = runner.name
         capabilities = describe_runner(runner, resolved_config(model_config))
         if runner.is_native:
             plugin = SGLangRunnerPlugin(host=native_host)

@@ -285,7 +285,7 @@ class ExecKernel(msgspec.Struct):
     ] = False
     model_runner: A[
         Optional[str],
-        "Select a model runner plugin by name: 'sglang' for the built-in runner, or the name of an installed 'sglang.srt.model_runners' entry point. When unset, SGLang runs its built-in path and enumerates no runner plugins. SGLANG_PLUGINS, when set, must list an external runner's name. A launch configuration or request the runner does not support is refused with every reason listed. An installed runner executes text, with tensor parallelism, overlap scheduling, CUDA graphs, the hierarchical cache, PD disaggregation and n-gram speculative decoding when it declares them, in this release. Experimental feature.",
+        "Select a model runner plugin by name: 'sglang' for the built-in runner, 'direct' for SGLang's direct path without the runner API (a rollback while the built-in runner is the default), or the name of an installed 'sglang.srt.model_runners' entry point. When unset, CUDA launches run the built-in runner and other devices the direct path; no runner plugin is enumerated. Configurations and batches the built-in runner's steps do not cover run on the direct path, with the reason logged at startup. SGLANG_PLUGINS, when set, must list an external runner's name. A launch configuration or request the runner does not support is refused with every reason listed. An installed runner executes text, with tensor parallelism, overlap scheduling, CUDA graphs, the hierarchical cache, PD disaggregation and n-gram speculative decoding when it declares them, in this release.",
     ] = None
     prefill_attention_backend: A[
         Optional[str],

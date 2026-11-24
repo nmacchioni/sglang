@@ -19,6 +19,7 @@ import psutil
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.model_runner_reference import with_model_runner
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -118,7 +119,7 @@ class TestRankFailure(CustomTestCase):
             _MODEL,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=_ARGS,
+            other_args=with_model_runner(_ARGS),
             env={**os.environ, **_NO_CRASH_DIAGNOSTICS},
         )
         try:

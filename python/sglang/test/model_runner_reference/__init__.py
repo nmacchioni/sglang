@@ -49,6 +49,13 @@ def install_reference_runner(root: str) -> dict[str, str]:
     return {"PYTHONPATH": root if not path else f"{root}{os.pathsep}{path}"}
 
 
+def with_model_runner(args) -> list[str]:
+    """``args``, with ``--model-runner direct`` unless they name a runner: the
+    built-in runner is the default, so a direct-path run must say so."""
+    args = list(args)
+    return args if "--model-runner" in args else [*args, "--model-runner", "direct"]
+
+
 def read_step_trace(directory: str) -> list[dict]:
     """The records ``SGLANG_MODEL_RUNNER_STEP_TRACE_DIR`` collected, in step
     order, each with its saved tensors under ``"tensors"`` when there are any."""
