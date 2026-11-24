@@ -657,7 +657,8 @@ class TestGraphChoice(CustomTestCase):
 class TestExternalRelease(CustomTestCase):
     def test_external_runners_keep_only_features_of_landed_blocks(self):
         """Whatever an external runner declares, launches outside TP text are
-        refused until their block lands; TP, overlap and graphs have landed."""
+        refused until their block lands; TP, overlap, graphs, HiCache and PD have
+        landed."""
         declared = RunnerCapabilities.all_supported()
         external = capabilities_in_this_release(declared, native=False)
         self.assertIs(capabilities_in_this_release(declared, native=True), declared)
@@ -685,7 +686,6 @@ class TestExternalRelease(CustomTestCase):
                 "data-parallel attention (attn_dp_size=2)",
                 "expert parallelism (ep_size=2; pass --ep-size 1)",
                 "context parallelism (attn_cp_size=2; pass --attn-cp-size 1)",
-                "PD disaggregation (disaggregation_mode=prefill)",
                 "unified memory (drop --enable-unified-memory)",
                 "KV beyond plain full attention (sliding_window; serve this "
                 "model with --model-runner sglang)",
@@ -694,7 +694,7 @@ class TestExternalRelease(CustomTestCase):
         self.assertTrue(external.tensor_parallel)
         self.assertTrue(external.prompt_logprobs and external.top_logprobs)
         self.assertTrue(external.cuda_graphs and external.overlap_schedule)
-        self.assertTrue(external.hicache)
+        self.assertTrue(external.hicache and external.pd_disaggregation)
         self.assertEqual(launch_refusals(external, ResolvedConfig(model_path="m")), [])
 
     def test_builtin_runner_keeps_the_direct_path_for_dcp_and_elastic_ep(self):

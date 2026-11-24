@@ -57,6 +57,8 @@ def read_step_trace(directory: str) -> list[dict]:
         prefix = path[: -len(".jsonl")]
         for line in Path(path).read_text().splitlines():
             record = json.loads(line)
+            # Which process wrote it, e.g. the prefill or decode server.
+            record["source"] = os.path.basename(path)
             saved = f"{prefix}-{record['index']:05d}.pt"
             if os.path.exists(saved):
                 import torch

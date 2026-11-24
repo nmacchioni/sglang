@@ -77,6 +77,9 @@ _EXTERNAL_FEATURES = frozenset(
         # SGLang copies the runner's full-attention KV bytes to and from host
         # memory through the KVLayout (kv_view.py).
         Feature.HICACHE,
+        # PD transfer backends register and move the same bytes, located
+        # through the KVLayout, with SGLang's page leases and checksums.
+        Feature.PD_DISAGGREGATION,
     }
 )
 
