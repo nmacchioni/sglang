@@ -20,6 +20,7 @@ from sglang.srt.layers.logprob_processor import InputLogprobProcessor
 from sglang.srt.model_runner_plugins.api import (
     EAGER,
     GraphChoice,
+    HiddenRows,
     KVTables,
     ModelRunnerExecutor,
     OutputBuffer,
@@ -167,6 +168,11 @@ class StepForward:
         if not self._last_stage:
             return ModelRunnerOutput(
                 logits_output=self._pp_out(out), can_run_graph=not graph.is_eager
+            )
+        if step.outputs.hidden is not HiddenRows.NONE and out.hidden is None:
+            raise ValueError(
+                f"Model runner {self.runner_name!r} returned no hidden states for "
+                f"a step that asked for them ({step.outputs.hidden.value})"
             )
         logits_output = logits_output_from_step(out, gather_vocab=self._gather_vocab)
         if step.outputs.prompt_logprobs and not self._native_prompt_logprobs:

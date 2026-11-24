@@ -46,8 +46,9 @@ if TYPE_CHECKING:
 
 
 # Speculative algorithms whose forwards run through the API. The target's verify
-# steps are VERIFY Steps; n-gram drafts on the host, with no draft model.
-STEP_SPECULATIVE_ALGORITHMS = frozenset({"NGRAM"})
+# steps are VERIFY Steps; n-gram drafts on the host, with no draft model; the
+# EAGLE family's draft model runs DRAFT and DRAFT_EXTEND Steps (native_draft).
+STEP_SPECULATIVE_ALGORITHMS = frozenset({"NGRAM", "EAGLE", "EAGLE3"})
 
 
 class NativeStepLowering:
@@ -138,6 +139,9 @@ def native_step_refusals(
     algorithm = get_spec().speculative_algorithm
     if algorithm is not None and algorithm.upper() not in STEP_SPECULATIVE_ALGORITHMS:
         reasons.append(f"speculative decoding with {algorithm}")
+    elif algorithm is not None and get_spec().enable_multi_layer_eagle:
+        # Its own draft worker, whose draft calls are not Steps yet.
+        reasons.append("multi-layer EAGLE")
     if get_lora().enable_lora:
         reasons.append("LoRA")
     features = get_exec().features
@@ -270,7 +274,7 @@ def _describe(graph: GraphChoice) -> str:
 def step_output_of(logits_output: LogitsProcessorOutput) -> StepOutput:
     """The native output as a StepOutput; the Step subset sets no other field."""
     if (
-        logits_output.hidden_states is not None
+        logits_output.hidden_states_token_indices is not None
         or logits_output.last_hidden_states is not None
         or logits_output.next_token_logits_vocab_shard is not None
         or logits_output.customized_info
@@ -293,5 +297,7 @@ def step_output_of(logits_output: LogitsProcessorOutput) -> StepOutput:
         )
     logits = logits_output.next_token_logits
     return StepOutput(
-        logits=None if logits is None else Logits(tensor=logits), logprobs=logprobs
+        logits=None if logits is None else Logits(tensor=logits),
+        logprobs=logprobs,
+        hidden=logits_output.hidden_states,
     )

@@ -128,12 +128,14 @@ class ModelRunnerStartup:
                     "release, close)."
                 )
             plugin = ExternalRunner(name=name, plugin=runner.plugin, host=native_host)
-        return cls(
+        startup = cls(
             runner_name=name,
             plugin=plugin,
             capabilities=capabilities,
             settle=lambda final: settle_capacity(native_host, final),
         )
+        startup._host = native_host
+        return startup
 
     def __init__(
         self,
@@ -156,6 +158,8 @@ class ModelRunnerStartup:
         self.load_result: Optional[LoadResult] = None
         self.layout: Optional[KVLayout] = None
         self._step_forward: Optional[StepForward] = None
+        # The scheduler, whose speculative worker holds the draft; None in tests.
+        self._host: Optional[NativeStartupHost] = None
 
     @property
     def is_external(self) -> bool:
@@ -223,10 +227,34 @@ class ModelRunnerStartup:
             wait_for_kv_loads=wait_for_kv_loads,
             speculative=get_spec().speculative_algorithm is not None,
         )
+        if not self.is_external:
+            self._attach_native_draft_steps(tp_worker)
         if tp_worker.step_trace is not None:
             tp_worker.step_trace.bind_kv_pool(model_runner.token_to_kv_pool)
         logger.info("Model runner %r runs steps through its API", self.runner_name)
         return self._step_forward
+
+    def _attach_native_draft_steps(self, tp_worker: TpModelWorker) -> None:
+        """The built-in draft runner's calls as DRAFT and DRAFT_EXTEND Steps,
+        when the speculative worker drives an EAGLE-family draft model."""
+        from sglang.srt.model_runner_plugins.native_draft import NativeDraftSteps
+        from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+
+        spec_worker = None if self._host is None else self._host.draft_worker
+        draft = None if spec_worker is None else spec_worker.draft_worker
+        if not isinstance(draft, EagleDraftWorker):
+            return
+        draft.draft_steps = NativeDraftSteps(
+            runner_name=self.runner_name,
+            page_table=draft.draft_runner.req_to_token_pool.req_to_token,
+            topk=draft.topk,
+            num_steps=draft.speculative_num_steps,
+            num_draft_tokens=draft.speculative_num_draft_tokens,
+            trace=tp_worker.step_trace,
+        )
+        logger.info(
+            "Model runner %r runs its draft through DRAFT steps", self.runner_name
+        )
 
     def run(self, inputs: StartupInputs) -> KVLayout:
         """Run every startup phase; the final layout carries admission limits."""

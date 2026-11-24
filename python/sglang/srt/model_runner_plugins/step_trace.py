@@ -110,6 +110,39 @@ class StepTrace:
     def start(self) -> float:
         return time.perf_counter()
 
+    def record_draft(
+        self,
+        *,
+        tic: float,
+        runner: str,
+        execute_seconds: float,
+        step,
+        forward_batch: ForwardBatch,
+        out,
+    ) -> None:
+        """One DRAFT or DRAFT_EXTEND Step of a built-in draft model."""
+        graph = step.graph
+        record = {
+            "index": self._count,
+            **self._ranks,
+            "path": "step",
+            "runner": runner,
+            "role": "draft",
+            "mode": step.mode.value,
+            "batch_size": step.rows.batch_size,
+            "num_tokens": int(step.input_ids.shape[0]),
+            "host_us": (time.perf_counter() - tic) * 1e6,
+            "execute_us": execute_seconds * 1e6,
+            "replayed_graph": not graph.is_eager,
+            "step_graph": None if graph.is_eager else [graph.phase.value, graph.bucket],
+            "draft_tokens": None,
+        }
+        if out.draft is not None and self._save_logits:
+            record["draft_tokens"] = out.draft.tokens.tolist()
+        with open(f"{self._prefix}.jsonl", "a") as f:
+            f.write(json.dumps(record) + "\n")
+        self._count += 1
+
     def record(
         self,
         *,

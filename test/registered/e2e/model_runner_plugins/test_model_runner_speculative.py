@@ -14,6 +14,10 @@ separate configurations. N-gram trees sample through a tree-sampling kernel
 that does not build for sm103a in the image this was proven on, so stochastic
 rejection is covered by the chain draft's configurations.
 
+EAGLE3 runs its draft model through the API as well: each round's expansion
+is one DRAFT Step and each draft forward over the target's tokens a
+DRAFT_EXTEND Step fed the target's hidden states.
+
 The reference runner (an independent plugin) verifies n-gram drafts itself:
 it repeats across launches, and its accepts reproduce its own non-speculative
 greedy decode, token for token.
@@ -55,13 +59,54 @@ _EAGER = [
 _GRAPHS = ["--disable-overlap-schedule", "--cuda-graph-max-bs-decode", "4"]
 _OVERLAP_GRAPHS = ["--cuda-graph-max-bs-decode", "4"]
 _NGRAM = ["--speculative-algorithm", "NGRAM", "--speculative-num-draft-tokens", "8"]
+# A chain of 3 drafts (4 verified tokens), and a tree of 6 nodes from top-2
+# expansion; the tree runs on the Triton backend, as the image's FlashInfer
+# cannot plan this tree verify on the direct path.
+_EAGLE3_HEAD = "GavinLucky/SGLang-EAGLE3-Qwen3-0.6B-SpecForge"
+_EAGLE3 = [
+    "--speculative-algorithm",
+    "EAGLE3",
+    "--speculative-draft-model-path",
+    _EAGLE3_HEAD,
+    "--speculative-num-steps",
+    "3",
+]
+_CHAIN = [
+    *_EAGLE3,
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
+]
+_TREE = [
+    *_EAGLE3,
+    "--speculative-eagle-topk",
+    "2",
+    "--speculative-num-draft-tokens",
+    "6",
+    "--attention-backend",
+    "triton",
+]
+_SAMPLED = {"temperature": 0.8, "top_p": 0.95, "sampling_seed": 7}
 
 # name -> (model, server args, sampling)
 _CONFIGS = {
     "ngram_eager": (_MODEL, [*_NGRAM, *_EAGER], {}),
     "ngram_graphs": (_MODEL, [*_NGRAM, *_GRAPHS], {}),
     "ngram_overlap_graphs": (_MODEL, [*_NGRAM, *_OVERLAP_GRAPHS], {}),
+    "eagle3_eager": (_MODEL, [*_CHAIN, *_EAGER], {}),
+    "eagle3_graphs": (_MODEL, [*_CHAIN, *_GRAPHS], {}),
+    "eagle3_overlap_graphs": (_MODEL, [*_CHAIN, *_OVERLAP_GRAPHS], {}),
+    "eagle3_tree_graphs": (_MODEL, [*_TREE, *_GRAPHS], {}),
+    # Stochastic rejection of a sampled chain against the target distribution.
+    "eagle3_rejection_sampling": (
+        _MODEL,
+        [*_CHAIN, *_GRAPHS, "--speculative-use-rejection-sampling"],
+        _SAMPLED,
+    ),
 }
+# Configurations whose draft model runs as DRAFT and DRAFT_EXTEND Steps.
+_DRAFT_MODELS = {name for name in _CONFIGS if name.startswith("eagle3")}
 
 # Repetitive text, so n-gram drafts match; plain text, so some are rejected.
 _PROMPTS = [
@@ -159,11 +204,16 @@ class _SpeculativeCase(CustomTestCase):
 
         def run():
             first = _generate(prompts[:1], sampling)
-            outputs = [
-                first,
-                _generate(prompts[:2], sampling),
-                _generate(prompts, sampling),
-            ]
+            if sampling:
+                # Seeded sampling repeats per request, not across batch rows:
+                # one request at a time.
+                outputs = [first] + [_generate([p], sampling) for p in prompts[1:]]
+            else:
+                outputs = [
+                    first,
+                    _generate(prompts[:2], sampling),
+                    _generate(prompts, sampling),
+                ]
             # Reuses the first request's KV, generated tokens included: what its
             # verifies wrote and SGLang moved to the accepted positions.
             committed = prompts[0] + first[0]["output_ids"][:-1]
@@ -172,15 +222,23 @@ class _SpeculativeCase(CustomTestCase):
 
         return run
 
-    def _check_repeats(self, name, want, got):
+    def _check_repeats(self, name, want, got, *, exact=True):
+        """``exact``: outputs and accepts repeat. Stochastic rejection draws its
+        uniforms from the process RNG, which launch-time health requests
+        advance by a varying count, so a sampled run only matches step by
+        step until its first different draw."""
         (want_out, want_trace, want_acc), (got_out, got_trace, got_acc) = want, got
-        self.assertEqual(
-            [_output_ids(o) for o in got_out], [_output_ids(o) for o in want_out], name
-        )
-        self.assertEqual(_accepts(got_acc), _accepts(want_acc), name)
+        if exact:
+            self.assertEqual(
+                [_output_ids(o) for o in got_out],
+                [_output_ids(o) for o in want_out],
+                name,
+            )
+            self.assertEqual(_accepts(got_acc), _accepts(want_acc), name)
         want_steps, got_steps = _by_inputs(want_trace), _by_inputs(got_trace)
         common = want_steps.keys() & got_steps.keys()
-        self.assertGreaterEqual(len(common), 0.9 * len(want_steps), name)
+        if exact:
+            self.assertGreaterEqual(len(common), 0.9 * len(want_steps), name)
         modes = Counter()
         for key in common:
             a, b = want_steps[key], got_steps[key]
@@ -195,7 +253,8 @@ class _SpeculativeCase(CustomTestCase):
             a, b = want_steps[key], got_steps[key]
             self.assertEqual(a["prefix_kv_crc"], b["prefix_kv_crc"], name)
             crcs += len(a["prefix_kv_crc"] or ())
-        self.assertGreater(crcs, 0, f"{name}: no committed prefix was compared")
+        if exact:
+            self.assertGreater(crcs, 0, f"{name}: no committed prefix was compared")
         return modes
 
     def _check_speculation(self, name, accepts, num_draft_tokens):
@@ -216,6 +275,17 @@ class _SpeculativeCase(CustomTestCase):
         self.assertGreater(followed, 0, name)
         return lens
 
+    def _check_draft_steps(self, name, trace):
+        """The draft model ran as Steps: one DRAFT (the whole expansion) per
+        verify, and DRAFT_EXTEND after each target extend and verify."""
+        drafts = Counter(r["mode"] for r in trace if r.get("role") == "draft")
+        target = Counter(r["mode"] for r in _target_steps(trace))
+        self.assertEqual(drafts["draft"], target["target_verify"], name)
+        self.assertEqual(
+            drafts["draft_extend"], target["target_verify"] + target["extend"], name
+        )
+        return drafts
+
     def _check_config(self, name, *, num_draft_tokens=8):
         model, args, sampling = _CONFIGS[name]
         workload = self._workload(model, sampling)
@@ -225,9 +295,16 @@ class _SpeculativeCase(CustomTestCase):
 
         self.assertEqual({r["path"] for r in direct[1] + again[1]}, {"direct"})
         self.assertEqual({r["path"] for r in steps[1]}, {"step"})
-        self._check_repeats(f"{name} direct/direct", direct, again)
-        modes = self._check_repeats(f"{name} direct/steps", direct, steps)
+        exact = not sampling
+        self._check_repeats(f"{name} direct/direct", direct, again, exact=exact)
+        modes = self._check_repeats(f"{name} direct/steps", direct, steps, exact=exact)
         lens = self._check_speculation(name, steps[2], num_draft_tokens)
+        if name in _DRAFT_MODELS:
+            drafts = self._check_draft_steps(name, steps[1])
+            replayed = sum(
+                r["replayed_graph"] for r in steps[1] if r.get("role") == "draft"
+            )
+            print(f"[{name}] draft steps {dict(drafts)}, {replayed} replayed graphs")
         print(
             f"[{name}] steps matched bitwise per mode {dict(modes)}; "
             f"{len(steps[2])} verifies, accept lengths {dict(sorted(lens.items()))}"
@@ -244,6 +321,24 @@ class TestNgramSteps(_SpeculativeCase):
 
     def test_overlap_graphs(self):
         self._check_config("ngram_overlap_graphs")
+
+
+class TestEagle3Steps(_SpeculativeCase):
+    def test_eager(self):
+        self._check_config("eagle3_eager", num_draft_tokens=4)
+
+    def test_graphs(self):
+        self._check_config("eagle3_graphs", num_draft_tokens=4)
+
+    def test_overlap_graphs(self):
+        self._check_config("eagle3_overlap_graphs", num_draft_tokens=4)
+
+    def test_tree(self):
+        # A path of the tree verifies at most num_steps drafts plus the bonus.
+        self._check_config("eagle3_tree_graphs", num_draft_tokens=4)
+
+    def test_rejection_sampling(self):
+        self._check_config("eagle3_rejection_sampling", num_draft_tokens=4)
 
 
 class TestReferenceRunnerVerify(_SpeculativeCase):
