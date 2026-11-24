@@ -781,6 +781,8 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     pp_in: Optional[dict[str, torch.Tensor]] = None
     # VERIFY steps: the draft tree's attention mask, and the draft layout.
     # ``rows.seq_lens`` are then the committed lengths, before the drafts.
+    # A verify without a mask verifies one chain: each draft attends to the
+    # committed positions and to the drafts before it (causal).
     mask: Optional[TreeMask] = None
     spec: Optional[SpecInputs] = None
 

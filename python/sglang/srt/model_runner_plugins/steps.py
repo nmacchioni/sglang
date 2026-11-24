@@ -99,14 +99,25 @@ def _verify_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         return "a ragged verify (draft counts per request)"
     if spec_info is None or getattr(spec_info, "num_tokens_per_req", -1) < 1:
         return "a verify without a uniform draft count"
-    if tree_mask_layout(spec_info) is None:
+    if spec_info.custom_mask is None and not verifies_a_chain(spec_info):
+        return "a verify without a tree mask"
+    if spec_info.custom_mask is not None and tree_mask_layout(spec_info) is None:
         return "a verify tree mask in no TreeMaskLayout"
     return None
+
+
+def verifies_a_chain(spec_info) -> bool:
+    """Whether a verify without a mask attends causally over one draft chain
+    (the DFlash family's linear blocks)."""
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+    return isinstance(spec_info, DFlashVerifyInput)
 
 
 def tree_mask_layout(spec_info) -> Optional[TreeMaskLayout]:
     """The layout of ``spec_info.custom_mask``; None when no layout describes it."""
     from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
     from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
     from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -115,6 +126,9 @@ def tree_mask_layout(spec_info) -> Optional[TreeMaskLayout]:
         return None
     if isinstance(spec_info, NgramVerifyInput):
         # The n-gram worker always builds a full mask on GPU (USE_FULL_MASK).
+        return TreeMaskLayout.FULL
+    if isinstance(spec_info, DFlashVerifyInput):
+        # Per request [D, seq_len + D], as the DFlash family builds it.
         return TreeMaskLayout.FULL
     if type(spec_info) is EagleVerifyInput:
         # The EAGLE draft worker builds its tree in the default mode.
@@ -209,8 +223,12 @@ def build_step(
     mask = spec = None
     if mode is StepMode.VERIFY:
         spec_info = forward_batch.spec_info
-        mask = TreeMask(
-            tensor=spec_info.custom_mask, layout=tree_mask_layout(spec_info)
+        mask = (
+            None
+            if spec_info.custom_mask is None
+            else TreeMask(
+                tensor=spec_info.custom_mask, layout=tree_mask_layout(spec_info)
+            )
         )
         spec = SpecInputs(num_draft_tokens=spec_info.num_tokens_per_req)
     return Step(
