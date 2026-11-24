@@ -180,8 +180,8 @@ def native_step_refusals(
         reasons.append("per-forward captures")
     if get_exec().dllm.dllm_algorithm is not None:
         reasons.append("diffusion LLMs")
-    if model_runner.is_multimodal or model_runner.is_draft_worker or use_mlx():
-        reasons.append("a multimodal or draft model")
+    if model_runner.is_draft_worker or use_mlx():
+        reasons.append("a draft model")
     return reasons
 
 
@@ -306,7 +306,6 @@ def step_output_of(
         or logits_output.next_token_logits_vocab_shard is not None
         or logits_output.customized_info
         or logits_output.beam_normalizer is not None
-        or logits_output.mm_input_embeds is not None
     ):
         raise RuntimeError(
             "a native forward on the Step path produced outputs StepOutput lacks"
@@ -327,6 +326,7 @@ def step_output_of(
         logits=None if logits is None else Logits(tensor=logits),
         logprobs=logprobs,
         hidden=logits_output.hidden_states,
+        input_embeds=logits_output.mm_input_embeds,
     )
 
 

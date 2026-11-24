@@ -218,6 +218,12 @@ class StepTrace:
                 else list(forward_batch.lora_ids[: forward_batch.batch_size])
             ),
             "adapters": None if adapters is None else adapters.tolist(),
+            # Multimodal items the step's requests carry.
+            "mm_items": sum(
+                len(mm.mm_items)
+                for mm in forward_batch.mm_inputs or ()
+                if mm is not None
+            ),
             # Step path only: the window and state tables the Step carried.
             **_sub_pool_summary(kv),
             # Step path, with saved tensors: per request with a cached prefix
