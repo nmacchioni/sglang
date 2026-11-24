@@ -16,7 +16,10 @@ from sglang.srt.model_runner_plugins.api import (
     Capacity,
     FullAttentionLayer,
     GraphBuckets,
+    KVBuffer,
+    KVKind,
     KVLayout,
+    KVSubPool,
     LoadContext,
     LoadResult,
     MemoryNeeds,
@@ -223,7 +226,28 @@ class TestResultValidation(CustomTestCase):
                 KVLayout(
                     page_size=1, num_slots=4096, full_attention=(moved,), limits=_LIMITS
                 ),
-                "moved full-attention KV layers",
+                "moved KV buffers within an epoch",
+            ),
+            (
+                KVLayout(
+                    page_size=1,
+                    num_slots=4096,
+                    full_attention=(_LAYER,),
+                    sub_pools=(
+                        KVSubPool(
+                            kind=KVKind.SLIDING_WINDOW,
+                            num_items=1024,
+                            buffers=(
+                                KVBuffer(
+                                    layer_id=1, name="k", ptr=1 << 30, item_bytes=256
+                                ),
+                            ),
+                            window=512,
+                        ),
+                    ),
+                    limits=_LIMITS,
+                ),
+                "moved KV buffers within an epoch",
             ),
             (
                 KVLayout(
@@ -426,6 +450,124 @@ class TestNativeRunner(CustomTestCase):
                 for layer_id, k, v in zip((3, 4), pool.k_buffer, pool.v_buffer)
             ),
         )
+
+
+def _mha_pool(*, size, layer_ids, page_size=1):
+    pool = MHATokenToKVPool.__new__(MHATokenToKVPool)
+    pool.page_size, pool.size, pool.use_hnd = page_size, size, False
+    pool.model_layer_ids = tuple(layer_ids)
+    rows = size + page_size
+    pool.k_buffer = [torch.zeros(rows, 1, 4, dtype=torch.float16) for _ in layer_ids]
+    pool.v_buffer = [torch.zeros(rows, 1, 4, dtype=torch.float16) for _ in layer_ids]
+    return pool
+
+
+class _MambaPool:
+    """Two state tensors per layer, as MambaPool registers them for PD."""
+
+    def __init__(self, *, slots, layer_ids):
+        self.layer_ids = layer_ids
+        self.tensors = [
+            torch.zeros(slots, 3, dtype=torch.float32)
+            for _ in range(2 * len(layer_ids))
+        ]
+
+    def get_contiguous_buf_infos(self):
+        return (
+            [t.data_ptr() for t in self.tensors],
+            [t.nbytes for t in self.tensors],
+            [t[0].nbytes for t in self.tensors],
+        )
+
+    def get_state_layer_ids(self):
+        # Tensor-major, then layer, as MambaPool flattens its state list.
+        return list(self.layer_ids) * 2
+
+
+class TestNativeKVDescription(CustomTestCase):
+    """The built-in runner describes the pools its steps index, and keeps the
+    direct path for a pool it cannot describe rather than run a Step whose
+    KVTables leave out KV the forward reads."""
+
+    def _layout(self, model_runner):
+        model_runner.token_to_kv_pool.page_size = 1
+        return native_kv_layout(
+            tp_worker=SimpleNamespace(model_runner=model_runner), with_limits=False
+        )
+
+    def test_sliding_window_layers_are_a_sub_pool_with_their_own_slot_count(self):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+        from sglang.srt.model_runner_plugins.native_kv import NativeKV
+
+        pool = SWAKVPool.__new__(SWAKVPool)
+        pool.full_kv_pool = _mha_pool(size=16, layer_ids=(5,))
+        pool.swa_kv_pool = _mha_pool(size=8, layer_ids=(0, 1, 2))
+        pool.full_to_swa_index_mapping = torch.zeros(17, dtype=torch.int64)
+        pool.size = 16
+        runner = SimpleNamespace(token_to_kv_pool=pool, sliding_window_size=512)
+
+        layout = self._layout(runner)
+
+        self.assertEqual([layer.layer_id for layer in layout.full_attention], [5])
+        (window,) = layout.sub_pools
+        self.assertEqual((window.kind, window.window), (KVKind.SLIDING_WINDOW, 512))
+        # The window pool's own slots, its padding page included.
+        self.assertEqual(window.num_items, 9)
+        self.assertEqual(
+            [(b.layer_id, b.name) for b in window.buffers],
+            [(i, n) for i in (0, 1, 2) for n in ("k", "v")],
+        )
+        self.assertEqual(window.buffers[2].ptr, pool.swa_kv_pool.k_buffer[1].data_ptr())
+        # A window kept per request has no full-to-window slot map to hand over.
+        pool.full_to_swa_index_mapping = None
+        self.assertEqual(NativeKV(runner).refusal, "a sliding window kept per request")
+        self.assertEqual(self._layout(runner).sub_pools, ())
+
+    def test_recurrent_state_is_a_sub_pool_of_request_slots(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.model_runner_plugins.native_kv import NativeKV
+
+        pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = _mha_pool(size=16, layer_ids=(3,))
+        pool.mamba_pool = _MambaPool(slots=5, layer_ids=(0, 1))
+        pool.use_mla, pool.size = False, 16
+        state = SimpleNamespace(ckpt_pool=None, own_state=None)
+        runner = SimpleNamespace(
+            token_to_kv_pool=pool,
+            token_to_kv_pool_allocator=SimpleNamespace(state=state),
+            req_to_token_pool=SimpleNamespace(state_sub_pool="mamba"),
+            runner_ids=SimpleNamespace(
+                state_ids=lambda sub_pool: SimpleNamespace(write=None)
+            ),
+        )
+
+        (state_pool,) = self._layout(runner).sub_pools
+
+        self.assertEqual(
+            (state_pool.kind, state_pool.num_items), (KVKind.RECURRENT_STATE, 5)
+        )
+        self.assertEqual(
+            [(b.layer_id, b.name) for b in state_pool.buffers],
+            [(0, "state0"), (1, "state0"), (0, "state1"), (1, "state1")],
+        )
+        self.assertEqual(state_pool.buffers[0].item_bytes, 12)
+        # Quantized checkpoints, and state slots behind a remapping table, have
+        # no description: those models keep the direct path.
+        state.ckpt_pool = object()
+        self.assertIn("quantized checkpoints", NativeKV(runner).refusal)
+        state.ckpt_pool = None
+        runner.runner_ids = SimpleNamespace(
+            state_ids=lambda sub_pool: SimpleNamespace(write=lambda ids: ids)
+        )
+        self.assertEqual(NativeKV(runner).refusal, "remapped recurrent-state slots")
+
+    def test_an_undescribed_pool_keeps_the_direct_path(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.model_runner_plugins.native_kv import NativeKV
+
+        pool = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        runner = SimpleNamespace(token_to_kv_pool=pool)
+        self.assertEqual(NativeKV(runner).refusal, "KV pool MLATokenToKVPool")
 
 
 def _stub_scheduler(startup):

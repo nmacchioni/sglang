@@ -40,9 +40,11 @@ from sglang.srt.model_runner_plugins.api import (
     Rows,
     RunnerCapabilities,
     RuntimeConfig,
+    StateTables,
     Step,
     StepMode,
     StepOutput,
+    WindowTables,
 )
 from sglang.srt.model_runner_plugins.external import ExternalRunner
 from sglang.srt.model_runner_plugins.graphs import bucket_graph_choice
@@ -159,7 +161,15 @@ class TestStepView(CustomTestCase):
             batch=2,
             queries=False,
             graph=GraphChoice(),
+            window_slots=None,
         ):
+            window = (
+                None
+                if window_slots is None
+                else WindowTables(
+                    write_slots=torch.zeros(window_slots), slot_map=_PAGE_TABLE[0]
+                )
+            )
             rows = Rows(
                 req_pool_indices=torch.zeros(batch, dtype=torch.int64),
                 seq_lens=torch.ones(batch, dtype=torch.int64),
@@ -170,17 +180,29 @@ class TestStepView(CustomTestCase):
                 input_ids=torch.zeros(tokens, dtype=torch.int64),
                 positions=torch.zeros(positions, dtype=torch.int64),
                 rows=rows,
-                kv=KVTables(write_slots=torch.zeros(slots), page_table=_PAGE_TABLE),
+                kv=KVTables(
+                    write_slots=torch.zeros(slots),
+                    page_table=_PAGE_TABLE,
+                    window=window,
+                ),
                 outputs=OutputSpec(),
                 graph=graph,
             )
 
         step(StepMode.DECODE)
+        step(StepMode.DECODE, window_slots=2)
         step(StepMode.DECODE, graph=GraphChoice(phase=GraphPhase.DECODE, bucket=2))
         step(StepMode.EXTEND, tokens=5, slots=5, positions=5, queries=True)
         for build, error in (
             (lambda: step(StepMode.DECODE, positions=3), "positions"),
             (lambda: step(StepMode.DECODE, slots=1), "write slots"),
+            (lambda: step(StepMode.DECODE, window_slots=1), "window write slots"),
+            (
+                lambda: StateTables(
+                    req_to_state=torch.zeros(2), copy_src=torch.zeros(1)
+                ),
+                "sources and destinations",
+            ),
             (lambda: step(StepMode.EXTEND), "query offsets"),
             (lambda: step(StepMode.MIXED), "query offsets"),
             (lambda: step(StepMode.DECODE, queries=True), "one input row"),
@@ -658,7 +680,8 @@ class TestExternalRelease(CustomTestCase):
                 "expert parallelism (ep_size=2; pass --ep-size 1)",
                 "context parallelism (attn_cp_size=2; pass --attn-cp-size 1)",
                 "unified memory (drop --enable-unified-memory)",
-                "KV beyond plain full attention (sliding_window)",
+                "KV beyond plain full attention (sliding_window; serve this "
+                "model with --model-runner sglang)",
             ],
         )
         self.assertTrue(external.tensor_parallel)

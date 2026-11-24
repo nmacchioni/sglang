@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.model_runner_plugins.api import (
     AdmissionLimits,
-    FullAttentionLayer,
     KVLayout,
     LoadResult,
     MemoryNeeds,
@@ -48,32 +47,16 @@ def native_load_result(
 
 
 def native_kv_layout(*, tp_worker: TpModelWorker, with_limits: bool) -> KVLayout:
-    pool = tp_worker.model_runner.token_to_kv_pool
+    from sglang.srt.model_runner_plugins.native_kv import NativeKV
+
+    model_runner = tp_worker.model_runner
+    kv = NativeKV(model_runner)
     return KVLayout(
-        page_size=pool.page_size,
-        num_slots=pool.size,
-        full_attention=_full_attention_layers(pool),
+        page_size=model_runner.token_to_kv_pool.page_size,
+        num_slots=model_runner.token_to_kv_pool.size,
+        full_attention=kv.full_attention(),
+        sub_pools=kv.sub_pools(),
         limits=admission_limits(tp_worker) if with_limits else None,
-    )
-
-
-def _full_attention_layers(pool) -> tuple[FullAttentionLayer, ...]:
-    # Imported here: the launcher imports this package for describe() alone.
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-
-    # Exactly the slot-row MHA pool; SWA, hybrid, MLA and HND pools wait for
-    # their sub-pool descriptions.
-    if type(pool) is not MHATokenToKVPool or pool.use_hnd:
-        return ()
-    return tuple(
-        FullAttentionLayer(
-            layer_id=layer_id,
-            k_ptr=k.data_ptr(),
-            v_ptr=v.data_ptr(),
-            k_slot_bytes=k.stride(0) * k.element_size(),
-            v_slot_bytes=v.stride(0) * v.element_size(),
-        )
-        for layer_id, k, v in zip(pool.model_layer_ids, pool.k_buffer, pool.v_buffer)
     )
 
 

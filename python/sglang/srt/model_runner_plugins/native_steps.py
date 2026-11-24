@@ -92,7 +92,9 @@ def native_plan(*, step: Step, forward_batch: ForwardBatch) -> NativePlan:
     )
 
 
-def native_step_refusals(model_runner: ModelRunner) -> list[str]:
+def native_step_refusals(
+    model_runner: ModelRunner, *, kv_refusal: Optional[str] = None
+) -> list[str]:
     """Why the built-in runner keeps today's path for every step; empty when
     its steps run through the API. Fixed for the runner's lifetime.
 
@@ -111,8 +113,12 @@ def native_step_refusals(model_runner: ModelRunner) -> list[str]:
     and runs again, and scale-up rewrites the DP layout and recaptures graphs,
     decisions taken inside the forward rather than at SGLang's rendezvous.
     Decode context parallelism keeps it too, until a DCP configuration (MLA or
-    DSA models) proves the step path bitwise against it."""
+    DSA models) proves the step path bitwise against it. So do KV pools that
+    ``KVLayout`` and ``KVTables`` do not describe yet (``kv_refusal``): MLA,
+    index caches, packed and quantized layouts, per-request windows."""
     reasons = []
+    if kv_refusal is not None:
+        reasons.append(f"{kv_refusal} (no KVLayout description)")
     if get_parallel().dcp_size > 1:
         reasons.append("decode context parallelism")
     if get_exec().moe.elastic_ep_backend is not None:

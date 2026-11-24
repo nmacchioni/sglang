@@ -30,16 +30,10 @@ from sglang.srt.model_runner_plugins.api import (
     RuntimeConfig,
 )
 from sglang.srt.model_runner_plugins.external import ExternalRunner
-from sglang.srt.model_runner_plugins.native import (
-    NativeStartupHost,
-    SGLangRunnerPlugin,
-)
+from sglang.srt.model_runner_plugins.native import NativeStartupHost, SGLangRunnerPlugin
 from sglang.srt.model_runner_plugins.native_results import admission_limits
 from sglang.srt.model_runner_plugins.registry import load_model_runner
-from sglang.srt.model_runner_plugins.selection import (
-    describe_runner,
-    resolved_config,
-)
+from sglang.srt.model_runner_plugins.selection import describe_runner, resolved_config
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -173,6 +167,7 @@ class ModelRunnerStartup:
     def step_forward(self, *, tp_worker: TpModelWorker) -> Optional[StepForward]:
         """The worker's forwards through the runner's steps, after startup; None
         when the built-in runner keeps every step on the direct path."""
+        from sglang.srt.model_runner_plugins.native_kv import NativeKV
         from sglang.srt.model_runner_plugins.native_steps import (
             native_graph_choice,
             native_step_refusals,
@@ -188,11 +183,12 @@ class ModelRunnerStartup:
                     "scheduling with asynchronous host copies (confidential "
                     "computing); pass --disable-overlap-schedule"
                 )
-            executor, lowering = self._plugin.plugin, None
+            executor, lowering, native_kv = self._plugin.plugin, None, None
             buckets = self._buckets
             choose_graph = lambda batch: _external_graph(batch, buckets=buckets)
         else:
-            refusals = native_step_refusals(model_runner)
+            native_kv = NativeKV(model_runner)
+            refusals = native_step_refusals(model_runner, kv_refusal=native_kv.refusal)
             if refusals:
                 logger.info(
                     "Model runner %r keeps the direct path for every step: %s",
@@ -217,6 +213,7 @@ class ModelRunnerStartup:
             direct_fallback=not self.is_external,
             tp_group=_tp_group_or_none(),
             last_stage=_is_last_stage(),
+            native_kv=native_kv,
         )
         logger.info("Model runner %r runs steps through its API", self.runner_name)
         return self._step_forward
@@ -250,10 +247,12 @@ class ModelRunnerStartup:
             self._close_after_failure()
             raise
         logger.info(
-            "Model runner %r started: %d KV slots, %d full-attention layers, %s",
+            "Model runner %r started: %d KV slots, %d full-attention layers, "
+            "sub-pools %s, %s",
             self.runner_name,
             final.num_slots,
             len(final.full_attention),
+            [(p.kind.value, p.num_items, len(p.buffers)) for p in final.sub_pools],
             final.limits,
         )
         return final
@@ -344,9 +343,9 @@ def _check_final_layout(allocated: KVLayout, final: KVLayout) -> None:
             f"{allocated.epoch}/{allocated.page_size} -> "
             f"{final.epoch}/{final.page_size}"
         )
-    if final.full_attention != allocated.full_attention:
+    if final.placement() != allocated.placement():
         # Sizes may change in finalize; addresses and strides may not.
-        raise ValueError("finalize() moved full-attention KV layers")
+        raise ValueError("finalize() moved KV buffers within an epoch")
 
 
 def _buckets(graphs, phase: str) -> tuple[int, ...]:
