@@ -785,6 +785,7 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+        self.init_model_runner_control()
 
         # Init LoRA drainer for fair scheduling
         self.init_lora_drainer()
@@ -1433,6 +1434,16 @@ class Scheduler(
         self.random_seed = self.tp_worker.random_seed
         self.device = self.tp_worker.device
         self.forward_stream = self.tp_worker.model_runner.forward_stream
+
+    def init_model_runner_control(self) -> None:
+        """Route runner control requests through the --model-runner's control();
+        no-op without it."""
+        if self.model_runner_startup is not None:
+            self.model_runner_startup.wrap_control(
+                dispatcher=self._request_dispatcher,
+                weight_updater=self.weight_updater,
+                wait_for_launched_forward=self.wait_for_launched_forward,
+            )
 
     def init_model_runner_steps(self) -> None:
         """Route the target worker's forwards through the --model-runner steps."""

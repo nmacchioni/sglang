@@ -161,14 +161,7 @@ class DenseDecoder:
         self.config = shard_config(config, tp)
         self.tp = tp
         self.device = device
-        if "lm_head.weight" not in weights:
-            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
-        self.w = {
-            name: _shard(name, t, tp).to(config.dtype).contiguous()
-            for name, t in weights.items()
-            if name != "lm_head.weight"
-        }
-        self.w["lm_head.weight"] = self._vocab_shard(weights["lm_head.weight"])
+        self.w = self._rank_weights(weights)
         config = self.config
         half = config.head_dim // 2
         self._inv_freq = 1.0 / (
@@ -176,6 +169,59 @@ class DenseDecoder:
             ** (torch.arange(0, half, device=device).float() * 2 / config.head_dim)
         )
         self.kv: Optional[PagedKV] = None
+
+    def _rank_weights(
+        self, weights: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """This rank's slices of checkpoint ``weights``, in the served dtype."""
+        if "lm_head.weight" not in weights:
+            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+        dtype = self.full_config.dtype
+        ranked = {
+            name: _shard(name, t, self.tp).to(dtype).contiguous()
+            for name, t in weights.items()
+            if name != "lm_head.weight"
+        }
+        ranked["lm_head.weight"] = self._vocab_shard(weights["lm_head.weight"])
+        return ranked
+
+    def load_in_place(self, weights: dict[str, torch.Tensor]) -> None:
+        """Copy a checkpoint of the same shapes into the loaded weights: their
+        addresses, which captured graphs read, stay."""
+        ranked = self._rank_weights(weights)
+        if ranked.keys() != self.w.keys():
+            raise ValueError(
+                "the checkpoint's tensors differ from the loaded ones: "
+                f"{sorted(ranked.keys() ^ self.w.keys())[:4]}"
+            )
+        for name, t in ranked.items():
+            if t.shape != self.w[name].shape:
+                raise ValueError(
+                    f"{name} is {tuple(t.shape)} in the checkpoint, "
+                    f"{tuple(self.w[name].shape)} loaded"
+                )
+        for name, t in ranked.items():
+            self.w[name].copy_(t)
+
+    def full_weight(self, name: str) -> torch.Tensor:
+        """Checkpoint tensor ``name`` whole, gathered across the TP group."""
+        t = self.w[name]
+        module = name.rsplit(".", 2)[-2] if name.count(".") >= 2 else ""
+        dim = (
+            0
+            if module in _COLUMN_PARALLEL or name == "lm_head.weight"
+            else 1
+            if module in _ROW_PARALLEL and not name.endswith(".bias")
+            else None
+        )
+        if self.tp.size == 1 or dim is None:
+            return t
+        parts = [torch.empty_like(t) for _ in range(self.tp.size)]
+        torch.distributed.all_gather(parts, t.contiguous(), group=self.tp.device)
+        full = torch.cat(parts, dim=dim)
+        if name == "lm_head.weight":
+            full = full[: self.full_config.vocab_size]
+        return full
 
     def bytes_per_slot(self) -> int:
         c = self.config

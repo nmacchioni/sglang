@@ -19,6 +19,9 @@ import torch
 from sglang.srt.model_runner_plugins.api import (
     MODEL_RUNNER_API_VERSION,
     Capacity,
+    ControlOp,
+    ControlRequest,
+    ControlResult,
     FullAttentionLayer,
     GraphBuckets,
     GraphPhase,
@@ -90,7 +93,28 @@ class ReferenceRunner:
             cuda_graph_phases=(GraphPhase.DECODE,),
             shared_outputs=(OutputBuffer.LOGITS,),
             architectures=ARCHITECTURES,
+            control_ops=(ControlOp.WEIGHTS_UPDATE_FROM_DISK, ControlOp.WEIGHTS_GET),
         )
+
+    @torch.inference_mode()
+    def control(self, req: ControlRequest) -> ControlResult:
+        if req.op is ControlOp.WEIGHTS_UPDATE_FROM_DISK:
+            path = resolve_checkpoint(req.args["model_path"])
+            if load_config(path) != self._model.full_config:
+                return ControlResult(
+                    success=False,
+                    message=f"{path} is not a checkpoint of the served model's shape",
+                )
+            self._model.load_in_place(load_weights(path, device=self._model.device))
+            logger.info("Reference runner loaded weights from %s", path)
+            return ControlResult(message="Succeeded to update model weights.")
+        if req.op is ControlOp.WEIGHTS_GET:
+            name = req.args["name"]
+            if name not in self._model.w:
+                return ControlResult(success=False, message=f"no weight named {name}")
+            weight = self._model.full_weight(name)[: req.args["truncate_size"]]
+            return ControlResult(value=weight.float().cpu().tolist())
+        raise ValueError(f"the reference runner does not declare {req.op.value}")
 
     def load(self, ctx: LoadContext) -> LoadResult:
         device = torch.device(ctx.device, ctx.gpu_id)

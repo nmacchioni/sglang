@@ -14,9 +14,15 @@ the step trace of both roles:
   after each transfer reads that KV, and its logits and every continuation
   are bitwise equal to the same runner serving without PD;
 - an asymmetric topology (prefill TP2, decode TP1), built-in runner, the same
-  way.
+  way;
+- release and resume of the weights and graph memory on both roles between two
+  rounds of the workload, then a weight reload, with the memory saver and decode
+  graphs on, through the built-in runner's control: the second round serves
+  what the first did, replaying the resumed graphs.
 """
 
+import glob
+import json
 import os
 import statistics
 import tempfile
@@ -36,6 +42,8 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_server,
     terminate_and_kill_process_tree,
@@ -94,6 +102,15 @@ def _compare_logits(want_steps, got_steps, *, modes):
     return matched, differ
 
 
+def _read_controls(trace_dir):
+    """The control trace of every process, as (file, record) pairs."""
+    records = []
+    for path in sorted(glob.glob(os.path.join(trace_dir, "controls-*.jsonl"))):
+        with open(path) as f:
+            records += [(os.path.basename(path), json.loads(x)) for x in f]
+    return records
+
+
 def _roles(trace):
     """The trace split by role: the decode's file is the one with decode steps."""
     by_pid = {}
@@ -133,7 +150,9 @@ class _PDRuns(PDDisaggregationServerBase):
         # One request at a time, so every launch builds the same batches.
         return [self._generate(url, p) for p in _PROMPTS]
 
-    def _serve_pd(self, *, prefill_args, decode_args, env=None):
+    def _serve_pd(
+        self, *, prefill_args, decode_args, env=None, common=_COMMON, workload=None
+    ):
         cls = type(self)
         trace_dir = tempfile.mkdtemp()
         saved = dict(os.environ)
@@ -144,15 +163,16 @@ class _PDRuns(PDDisaggregationServerBase):
                 "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
             }
         )
-        cls.extra_prefill_args = [*_COMMON, *prefill_args]
-        cls.extra_decode_args = [*_COMMON, *decode_args]
+        cls.extra_prefill_args = [*common, *prefill_args]
+        cls.extra_decode_args = [*common, *decode_args]
         try:
             cls.launch_all()
-            out = self._workload(cls.lb_url)
+            out = (workload or self._workload)(cls.lb_url)
         finally:
             self._stop()
             os.environ.clear()
             os.environ.update(saved)
+        self.controls = _read_controls(trace_dir)
         return out, read_step_trace(trace_dir)
 
     def _serve_alone(self, other_args, env=None):
@@ -259,6 +279,69 @@ class TestModelRunnerPD(_PDRuns):
             "builtin PD, recurrent state", model="ibm-granite/granite-4.0-h-350m"
         )
         self.assertTrue(all(r["kv_state"] is not None for r in decode))
+
+    def test_builtin_runner_pd_release_and_resume(self):
+        # Weights and graphs only: with NIXL a released KV pool stays registered
+        # (it has no deregistration), and the transfers after its resume fail
+        # the KV checksum on the direct path too.
+        common = [a for a in _COMMON if a != "--disable-decode-cuda-graph"]
+        args = [
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
+            "--enable-memory-saver",
+            "--cuda-graph-max-bs-decode",
+            "4",
+        ]
+        runner = [*args, "--model-runner", "sglang"]
+
+        def control(url, path, payload):
+            response = requests.post(
+                f"{url}/{path}", json=payload, headers=ADMIN_HEADERS_FOR_TEST
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        def release_and_resume(lb_url):
+            before = self._workload(lb_url)
+            tags = {"tags": ["weights", "cuda_graph"]}
+            for url in (self.prefill_url, self.decode_url):
+                control(url, "release_memory_occupation", tags)
+                control(url, "resume_memory_occupation", tags)
+                # Released weights come back uninitialized, as in an RL loop.
+                control(url, "update_weights_from_disk", {"model_path": _MODEL})
+            return before, self._workload(lb_url)
+
+        (direct_before, direct_after), _ = self._serve_pd(
+            prefill_args=args,
+            decode_args=args,
+            common=common,
+            workload=release_and_resume,
+        )
+        (before, after), steps = self._serve_pd(
+            prefill_args=runner,
+            decode_args=runner,
+            common=common,
+            workload=release_and_resume,
+        )
+        self._assert_same_tokens(direct_before, direct_after)
+        self._assert_same_tokens(direct_before, before)
+        self._assert_same_tokens(direct_before, after)
+        prefill, decode = _roles(steps)
+        self.assertEqual({r["path"] for r in prefill + decode}, {"step"})
+        by_process = {}
+        for source, record in self.controls:
+            by_process.setdefault(source, []).append((record["op"], record["success"]))
+        # Both roles, through the runner's control().
+        self.assertEqual(
+            sorted(by_process.values()),
+            [[("release", True), ("resume", True), ("weights_update_from_disk", True)]]
+            * 2,
+        )
+        second_round = decode[len(decode) // 2 :]
+        replayed = sum(r["replayed_graph"] for r in second_round)
+        print(
+            f"[builtin PD release/resume] controls {by_process}; decode graph "
+            f"replays after resume {replayed}/{len(second_round)}"
+        )
+        self.assertGreater(replayed, 0)
 
     def test_reference_runner_kv_moves_through_its_kv_layout(self):
         runner = ["--model-runner", REFERENCE_RUNNER]

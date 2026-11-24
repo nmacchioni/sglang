@@ -79,6 +79,38 @@ class OutputBuffer(str, Enum):
     PROMPT_LOGPROBS = "prompt_logprobs"
 
 
+class ControlOp(str, Enum):
+    """An operation SGLang asks a runner to run between steps (``control``).
+
+    Each maps to one or more of SGLang's control requests; the arguments a
+    runner reads for each are listed on :class:`ControlRequest`.
+    """
+
+    # Load new weights from a checkpoint on disk, in place.
+    WEIGHTS_UPDATE_FROM_DISK = "weights_update_from_disk"
+    # Load new weights SGLang received from a trainer (tensors, a process
+    # group, CUDA IPC handles), and the session and group calls around them.
+    WEIGHTS_UPDATE_FROM_TENSOR = "weights_update_from_tensor"
+    WEIGHTS_UPDATE_FROM_DISTRIBUTED = "weights_update_from_distributed"
+    WEIGHTS_UPDATE_FROM_IPC = "weights_update_from_ipc"
+    WEIGHTS_UPDATE_SESSION = "weights_update_session"
+    WEIGHTS_UPDATE_GROUP = "weights_update_group"
+    # Read back one weight by its checkpoint name.
+    WEIGHTS_GET = "weights_get"
+    # Checksums of the loaded weights.
+    WEIGHTS_CHECKSUM = "weights_checksum"
+    # Send the weights to another instance, or save them.
+    WEIGHTS_EXPORT = "weights_export"
+    # Free device memory between steps (weights, KV, graphs), and take it back.
+    # Releasing KV ends the KVLayout epoch; resuming starts the next one.
+    RELEASE = "release"
+    RESUME = "resume"
+    # Record, stop or dump per-expert routing statistics.
+    EXPERT_STATS = "expert_stats"
+    # Elastic EP: change the expert-parallel group at runtime.
+    RECONFIGURE_PARALLEL = "reconfigure_parallel"
+
+
 class RefusedCombination(msgspec.Struct, frozen=True, kw_only=True):
     """Features that are each supported but not together.
 
@@ -147,6 +179,9 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     # buffers). SGLang keeps no reference to them past ``release``, and releases
     # each before the next ``execute``; any other output is fresh per step.
     shared_outputs: tuple[OutputBuffer, ...] = ()
+    # Control operations the runner's ``control`` serves; SGLang answers any
+    # other with a failed status naming the operation, as today's replies do.
+    control_ops: tuple[ControlOp, ...] = ()
 
     @classmethod
     def all_supported(
@@ -161,6 +196,7 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
             refused_combinations=refused_combinations,
             native_prompt_logprobs=native_prompt_logprobs,
             shared_outputs=shared_outputs,
+            control_ops=tuple(ControlOp),
         )
 
     def supports(self, feature: Feature) -> bool:
@@ -1048,3 +1084,43 @@ class ModelRunnerExecutor(ModelRunnerLifecycle, Protocol):
     # it (a stream wait, not a host sync). None: every consumer is complete or
     # ordered on the runner stream before this call.
     def release(self, out: StepOutput, after: Optional[Any]) -> None: ...
+
+
+class ControlRequest(msgspec.Struct, frozen=True, kw_only=True):
+    """One control operation, called on every rank of the runner's groups in
+    lockstep, between steps: SGLang has waited for every launched step first.
+
+    ``args`` by operation:
+
+    - WEIGHTS_UPDATE_FROM_DISK: ``model_path`` (str), ``load_format`` (str or
+      None). The runner loads the checkpoint in place: buffers a captured
+      graph reads keep their addresses.
+    - WEIGHTS_GET: ``name`` (a checkpoint tensor name), ``truncate_size``
+      (int): the result's ``value`` is the first ``truncate_size`` rows of
+      the whole (unsharded) tensor, as a nested list of floats.
+
+    The built-in runner reads SGLang's own request for every other operation;
+    no external runner can declare them in this version.
+    """
+
+    op: ControlOp
+    args: dict[str, Any] = {}
+
+
+class ControlResult(msgspec.Struct, frozen=True, kw_only=True):
+    """A control operation's outcome on this rank. SGLang maps a failure onto
+    the status of the reply the operation answers."""
+
+    success: bool = True
+    message: str = "Success"
+    value: Optional[Any] = None
+    # RESUME of the KV: the layout of the epoch that starts. Addresses may
+    # differ from the last epoch's; sizes may not.
+    layout: Optional[KVLayout] = None
+
+
+@runtime_checkable
+class ModelRunnerController(ModelRunnerExecutor, Protocol):
+    """A runner that declares ``RunnerCapabilities.control_ops``."""
+
+    def control(self, req: ControlRequest) -> ControlResult: ...

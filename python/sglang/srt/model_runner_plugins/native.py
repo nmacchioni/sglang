@@ -8,11 +8,16 @@ configurations outside the Step subset keep the direct path.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Optional, Protocol
+
+import msgspec
 
 from sglang.srt.model_runner_plugins.api import (
     MODEL_RUNNER_API_VERSION,
     Capacity,
+    ControlOp,
+    ControlRequest,
+    ControlResult,
     Feature,
     GraphBuckets,
     KVLayout,
@@ -27,6 +32,7 @@ from sglang.srt.model_runner_plugins.api import (
     Step,
     StepOutput,
 )
+from sglang.srt.model_runner_plugins.control import NativeControlBinding
 from sglang.srt.model_runner_plugins.native_results import (
     native_kv_layout,
     native_load_result,
@@ -86,6 +92,10 @@ class SGLangRunnerPlugin:
         # None when built for describe() alone (the launcher, admission).
         self._host = host
         self.lowering = NativeStepLowering()
+        self.control_binding = NativeControlBinding()
+        # Releasing the KV ends its epoch; the resume that follows starts the next.
+        self._kv_released = False
+        self._epoch = 0
 
     def describe(self, cfg: ResolvedConfig) -> RunnerCapabilities:
         return _NATIVE_CAPABILITIES
@@ -137,6 +147,35 @@ class SGLangRunnerPlugin:
         # is the native replay fence, so ``after`` adds nothing to wait on.
         pass
 
+    def control(self, req: ControlRequest) -> ControlResult:
+        # The native handler does the work, rank agreement and PD queue
+        # deregistration included; its reply keeps today's format.
+        reply = self.control_binding.run(req)
+        success = _reply_success(reply)
+        layout = None
+        if success and req.op in (ControlOp.RELEASE, ControlOp.RESUME):
+            layout = self._kv_epoch_after(req)
+        return ControlResult(success=success, value=reply, layout=layout)
+
+    def _kv_epoch_after(self, req: ControlRequest) -> Optional[KVLayout]:
+        """The layout of the epoch a KV resume starts; None for anything else."""
+        from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+
+        tags = self.control_binding.request_of(req).tags
+        if tags and GPU_MEMORY_TYPE_KV_CACHE not in tags:
+            return None
+        if req.op is ControlOp.RELEASE:
+            self._kv_released = True
+            return None
+        if not self._kv_released:
+            return None
+        self._kv_released = False
+        self._epoch += 1
+        layout = native_kv_layout(
+            tp_worker=self._require_host().tp_worker, with_limits=False
+        )
+        return msgspec.structs.replace(layout, epoch=self._epoch)
+
     def close(self) -> None:
         # Native workers own no teardown beyond process exit; drop the handle.
         self._host = None
@@ -148,3 +187,10 @@ class SGLangRunnerPlugin:
                 "scheduler that created it (or after close())."
             )
         return self._host
+
+
+def _reply_success(reply: Any) -> bool:
+    """A native control reply's status; replies without one report success."""
+    if reply is None or "success" not in type(reply).__struct_fields__:
+        return True
+    return bool(reply.success)
