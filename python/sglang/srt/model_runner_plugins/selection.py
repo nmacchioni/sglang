@@ -9,6 +9,7 @@ import msgspec
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_runner_plugins.api import (
     UNGATED_FEATURES,
+    ControlOp,
     Feature,
     ResolvedConfig,
     RunnerCapabilities,
@@ -95,6 +96,14 @@ _EXTERNAL_FEATURES = frozenset(
 EXTERNAL_SPECULATIVE_ALGORITHMS = frozenset({"NGRAM"})
 
 
+# Control operations an external runner can serve: those with arguments of
+# their own (ControlRequest.args), which the reference runner proves. The
+# others read SGLang's requests and native internals.
+EXTERNAL_CONTROL_OPS = frozenset(
+    {ControlOp.WEIGHTS_UPDATE_FROM_DISK, ControlOp.WEIGHTS_GET}
+)
+
+
 def external_launch_refusals(
     capabilities: RunnerCapabilities, cfg: ResolvedConfig
 ) -> list[str]:
@@ -125,6 +134,9 @@ def capabilities_in_this_release(
             for f in Feature
             if f not in UNGATED_FEATURES and f not in _EXTERNAL_FEATURES
         },
+        control_ops=tuple(
+            op for op in capabilities.control_ops if op in EXTERNAL_CONTROL_OPS
+        ),
     )
 
 

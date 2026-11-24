@@ -22,6 +22,7 @@ from sglang.srt.model_runner_plugins.api import (
     KVLayout,
     LoadContext,
     LoadResult,
+    ModelRunnerController,
     ModelRunnerExecutor,
     ModelRunnerLifecycle,
     ParallelLayout,
@@ -46,8 +47,12 @@ from sglang.srt.utils.device import is_confidential_compute
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_components.weight_updater import (
+        SchedulerWeightUpdaterManager,
+    )
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_runner_plugins.step_forward import StepForward
+    from sglang.srt.utils.common import TypeBasedDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +131,12 @@ class ModelRunnerStartup:
                     f"Model runner {name!r} lacks the lifecycle and step methods "
                     "(load, allocate, capture, finalize, plan, execute, project, "
                     "release, close)."
+                )
+            if capabilities.control_ops and not isinstance(
+                runner.plugin, ModelRunnerController
+            ):
+                raise TypeError(
+                    f"Model runner {name!r} declares control_ops but has no control()."
                 )
             plugin = ExternalRunner(name=name, plugin=runner.plugin, host=native_host)
         startup = cls(
@@ -255,6 +266,37 @@ class ModelRunnerStartup:
         logger.info(
             "Model runner %r runs its draft through DRAFT steps", self.runner_name
         )
+
+    def wrap_control(
+        self,
+        *,
+        dispatcher: TypeBasedDispatcher,
+        weight_updater: SchedulerWeightUpdaterManager,
+        wait_for_launched_forward: Callable[[], None],
+    ) -> None:
+        """Route the scheduler's runner control requests through the runner's
+        ``control``, after startup."""
+        from sglang.srt.model_runner_plugins.control import ModelRunnerControl
+
+        def after_weights_update(req, success: bool, message: str):
+            if success:
+                weight_updater.record_weight_version_after_update(req.weight_version)
+            return weight_updater.flush_cache_after_weight_update(req, success, message)
+
+        def set_layout(layout: KVLayout) -> None:
+            self.layout = layout
+
+        native = not self.is_external
+        ModelRunnerControl(
+            runner_name=self.runner_name,
+            controller=self._plugin if native else self._plugin.plugin,
+            declared=frozenset(self._capabilities.control_ops),
+            native=self._plugin.control_binding if native else None,
+            layout=lambda: self.layout,
+            set_layout=set_layout,
+            after_weights_update=after_weights_update,
+            wait_for_launched_forward=wait_for_launched_forward,
+        ).wrap(dispatcher)
 
     def run(self, inputs: StartupInputs) -> KVLayout:
         """Run every startup phase; the final layout carries admission limits."""
