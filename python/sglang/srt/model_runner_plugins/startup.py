@@ -242,7 +242,10 @@ class ModelRunnerStartup:
             adapter_slots=(
                 None if self.is_external else native_adapter_slots(model_runner)
             ),
+            fused_sampling=self._capabilities.fused_sampling,
         )
+        if self.is_external:
+            self._plugin.step_forward = self._step_forward
         if not self.is_external:
             self._attach_native_draft_steps(tp_worker)
         if tp_worker.step_trace is not None:

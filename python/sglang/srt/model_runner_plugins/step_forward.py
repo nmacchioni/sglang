@@ -25,12 +25,14 @@ from sglang.srt.model_runner_plugins.api import (
     ModelRunnerExecutor,
     OutputBuffer,
     ProjectRequest,
+    SamplingOwner,
     StepOutput,
 )
 from sglang.srt.model_runner_plugins.lifetimes import OutputLease, OutputLifetimes
 from sglang.srt.model_runner_plugins.steps import (
     build_step,
     logits_output_from_step,
+    runner_may_sample,
     step_refusal,
 )
 
@@ -72,6 +74,7 @@ class StepForward:
         adapter_slots: Optional[
             Callable[[ForwardBatch], Optional[torch.Tensor]]
         ] = None,
+        fused_sampling: bool = False,
     ):
         self.runner_name = runner_name
         self._executor = executor
@@ -97,6 +100,12 @@ class StepForward:
         self._pooling = pooling
         # Native only, with LoRA: each request's adapter slot in this step.
         self._adapter_slots = adapter_slots
+        # The runner samples greedy batches itself (RunnerCapabilities).
+        self._fused_sampling = fused_sampling
+        # The last runner-sampled step's batch and StepOutput.next_ids, until
+        # SGLang's sampling of that batch takes them.
+        self._next_ids: Optional[tuple[ForwardBatch, torch.Tensor]] = None
+        self.last_sampling_owner = SamplingOwner.SGLANG
         self._input_logprobs = InputLogprobProcessor(vocab_size)
         self._lifetimes = OutputLifetimes(
             runner_name=runner_name,
@@ -144,6 +153,13 @@ class StepForward:
         graph = (
             EAGER if self._choose_graph is None else self._choose_graph(forward_batch)
         )
+        owner = (
+            SamplingOwner.PLUGIN
+            if self._fused_sampling
+            and self._last_stage
+            and runner_may_sample(forward_batch)
+            else SamplingOwner.SGLANG
+        )
         step = build_step(
             forward_batch=forward_batch,
             page_table=self._page_table,
@@ -157,6 +173,7 @@ class StepForward:
                 if self._adapter_slots is None
                 else self._adapter_slots(forward_batch)
             ),
+            sampling_owner=owner,
             **self._sub_pool_tables(forward_batch),
         )
         if self._lowering is None:
@@ -171,6 +188,7 @@ class StepForward:
         self.last_graph = graph
         self.last_kv = step.kv
         self.last_adapters = step.adapters
+        self.last_sampling_owner = owner
         if not isinstance(out, StepOutput):
             raise TypeError(
                 f"Model runner {self.runner_name!r} execute() returned "
@@ -187,6 +205,13 @@ class StepForward:
             return ModelRunnerOutput(
                 logits_output=self._pp_out(out), can_run_graph=not graph.is_eager
             )
+        if owner is SamplingOwner.PLUGIN:
+            if out.next_ids is None or out.next_ids.shape[0] != step.rows.batch_size:
+                raise ValueError(
+                    f"Model runner {self.runner_name!r} owns this step's sampling "
+                    f"but returned no next_ids for its {step.rows.batch_size} requests"
+                )
+            self._next_ids = (forward_batch, out.next_ids)
         if step.outputs.pooled and out.pooled is None:
             raise ValueError(
                 f"Model runner {self.runner_name!r} returned no pooled outputs for "
@@ -214,6 +239,14 @@ class StepForward:
             "window": kv.window_tables(forward_batch),
             "state": kv.state_tables(forward_batch),
         }
+
+    def take_next_ids(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+        """The tokens the runner sampled for ``forward_batch``, once; None when
+        SGLang owns that step's sampling."""
+        if self._next_ids is None or self._next_ids[0] is not forward_batch:
+            return None
+        next_ids, self._next_ids = self._next_ids[1], None
+        return next_ids
 
     def take_lease(self) -> Optional[OutputLease]:
         """The last step's output for the scheduler to mark consumed (overlap

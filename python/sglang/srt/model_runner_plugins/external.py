@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_runner_plugins.external_worker import (
         ExternalTpModelWorker,
     )
+    from sglang.srt.model_runner_plugins.step_forward import StepForward
 
 
 class ExternalRunner:
@@ -55,6 +56,8 @@ class ExternalRunner:
         # The layout SGLang sizes against: the plugin's, at the agreed slot count.
         self.layout: Optional[KVLayout] = None
         self._allocated_slots = 0
+        # The worker's steps, once startup built them (fused sampling reads them).
+        self.step_forward: Optional[StepForward] = None
 
     def load(self, ctx: LoadContext) -> LoadResult:
         self.load_result = self._checked("load", self.plugin.load(ctx), LoadResult)
