@@ -20,10 +20,14 @@ from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMod
 from sglang.srt.model_runner_plugins.api import (
     AdmissionLimits,
     Capacity,
+    FullAttentionLayer,
     GraphBuckets,
     GraphChoice,
     GraphPhase,
+    KVBuffer,
+    KVKind,
     KVLayout,
+    KVSubPool,
     KVTables,
     LoadContext,
     LoadResult,
@@ -670,6 +674,8 @@ class TestExternalRelease(CustomTestCase):
                 overlap_schedule=True,
                 advanced_kv=("sliding_window",),
                 unified_memory=True,
+                hicache=True,
+                disaggregation_mode="prefill",
             ),
         )
         self.assertEqual(
@@ -679,6 +685,7 @@ class TestExternalRelease(CustomTestCase):
                 "data-parallel attention (attn_dp_size=2)",
                 "expert parallelism (ep_size=2; pass --ep-size 1)",
                 "context parallelism (attn_cp_size=2; pass --attn-cp-size 1)",
+                "PD disaggregation (disaggregation_mode=prefill)",
                 "unified memory (drop --enable-unified-memory)",
                 "KV beyond plain full attention (sliding_window; serve this "
                 "model with --model-runner sglang)",
@@ -687,6 +694,7 @@ class TestExternalRelease(CustomTestCase):
         self.assertTrue(external.tensor_parallel)
         self.assertTrue(external.prompt_logprobs and external.top_logprobs)
         self.assertTrue(external.cuda_graphs and external.overlap_schedule)
+        self.assertTrue(external.hicache)
         self.assertEqual(launch_refusals(external, ResolvedConfig(model_path="m")), [])
 
     def test_builtin_runner_keeps_the_direct_path_for_dcp_and_elastic_ep(self):
@@ -852,6 +860,43 @@ class _Host:
 
 
 class TestExternalStartup(CustomTestCase):
+    def test_sglang_views_only_uniform_full_attention_slot_rows(self):
+        """Host copies and transfers read a runner's KV as one row of slot bytes
+        per slot and layer; a layout they cannot read that way is refused for
+        them, not misread."""
+        from sglang.srt.model_runner_plugins.kv_view import kv_view_refusal
+
+        def layer(i, k_bytes=256):
+            return FullAttentionLayer(
+                layer_id=i,
+                k_ptr=1 << 20,
+                v_ptr=1 << 21,
+                k_slot_bytes=k_bytes,
+                v_slot_bytes=256,
+            )
+
+        def layout(*layers, sub_pools=()):
+            return KVLayout(
+                page_size=1, num_slots=8, full_attention=layers, sub_pools=sub_pools
+            )
+
+        self.assertIsNone(kv_view_refusal(layout(layer(0), layer(1))))
+        self.assertEqual(
+            kv_view_refusal(layout(layer(0), layer(1, k_bytes=512))),
+            "full-attention layers with unequal slot sizes",
+        )
+        self.assertEqual(kv_view_refusal(layout()), "KV beyond full-attention layers")
+        window = KVSubPool(
+            kind=KVKind.SLIDING_WINDOW,
+            num_items=4,
+            buffers=(KVBuffer(layer_id=1, name="k", ptr=1 << 22, item_bytes=256),),
+            window=2,
+        )
+        self.assertEqual(
+            kv_view_refusal(layout(layer(0), sub_pools=(window,))),
+            "KV beyond full-attention layers",
+        )
+
     def _run(self, plugin, agree_min=lambda slots: slots, page_size=1):
         runner = ExternalRunner(
             name="fake", plugin=plugin, host=_Host(plugin.calls), agree_min=agree_min

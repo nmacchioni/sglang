@@ -167,6 +167,7 @@ class ModelRunnerStartup:
     def step_forward(self, *, tp_worker: TpModelWorker) -> Optional[StepForward]:
         """The worker's forwards through the runner's steps, after startup; None
         when the built-in runner keeps every step on the direct path."""
+        from sglang.srt.model_runner_plugins.kv_view import PluginKVView
         from sglang.srt.model_runner_plugins.native_kv import NativeKV
         from sglang.srt.model_runner_plugins.native_steps import (
             native_graph_choice,
@@ -184,10 +185,14 @@ class ModelRunnerStartup:
                     "computing); pass --disable-overlap-schedule"
                 )
             executor, lowering, native_kv = self._plugin.plugin, None, None
+            kv_pool = model_runner.token_to_kv_pool
+            wait_for_kv_loads = (
+                kv_pool.wait_for_loads if isinstance(kv_pool, PluginKVView) else None
+            )
             buckets = self._buckets
             choose_graph = lambda batch: _external_graph(batch, buckets=buckets)
         else:
-            native_kv = NativeKV(model_runner)
+            native_kv, wait_for_kv_loads = NativeKV(model_runner), None
             refusals = native_step_refusals(model_runner, kv_refusal=native_kv.refusal)
             if refusals:
                 logger.info(
@@ -214,7 +219,10 @@ class ModelRunnerStartup:
             tp_group=_tp_group_or_none(),
             last_stage=_is_last_stage(),
             native_kv=native_kv,
+            wait_for_kv_loads=wait_for_kv_loads,
         )
+        if tp_worker.step_trace is not None:
+            tp_worker.step_trace.bind_kv_pool(model_runner.token_to_kv_pool)
         logger.info("Model runner %r runs steps through its API", self.runner_name)
         return self._step_forward
 

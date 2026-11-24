@@ -65,6 +65,7 @@ class StepForward:
         tp_group: Optional[Any] = None,
         last_stage: bool = True,
         native_kv: Optional[NativeKV] = None,
+        wait_for_kv_loads: Optional[Callable[[], None]] = None,
     ):
         self.runner_name = runner_name
         self._executor = executor
@@ -83,6 +84,9 @@ class StepForward:
         self._last_stage = last_stage
         # Native only: the window and state tables beside the full-attention ones.
         self._native_kv = native_kv
+        # External runners with HiCache: the runner stream waits for host loads
+        # into the runner's KV before the step (and its inputs_ready) is built.
+        self._wait_for_kv_loads = wait_for_kv_loads
         self._input_logprobs = InputLogprobProcessor(vocab_size)
         self._lifetimes = OutputLifetimes(
             runner_name=runner_name,
@@ -118,6 +122,8 @@ class StepForward:
         from sglang.srt.model_executor.model_runner import ModelRunnerOutput
 
         self._lifetimes.step_started()
+        if self._wait_for_kv_loads is not None:
+            self._wait_for_kv_loads()
         graph = (
             EAGER if self._choose_graph is None else self._choose_graph(forward_batch)
         )

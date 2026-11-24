@@ -83,6 +83,7 @@ class ReferenceRunner:
             top_logprobs=True,
             overlap_schedule=True,
             cuda_graphs=True,
+            hicache=True,
             cuda_graph_phases=(GraphPhase.DECODE,),
             shared_outputs=(OutputBuffer.LOGITS,),
             architectures=ARCHITECTURES,
