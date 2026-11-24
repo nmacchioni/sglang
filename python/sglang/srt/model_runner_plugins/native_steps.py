@@ -48,7 +48,11 @@ if TYPE_CHECKING:
 # Speculative algorithms whose forwards run through the API. The target's verify
 # steps are VERIFY Steps; n-gram drafts on the host, with no draft model; the
 # EAGLE family's draft model runs DRAFT and DRAFT_EXTEND Steps (native_draft).
-STEP_SPECULATIVE_ALGORITHMS = frozenset({"NGRAM", "EAGLE", "EAGLE3"})
+STEP_SPECULATIVE_ALGORITHMS = frozenset(
+    # NEXTN names EAGLE over a model's own MTP layers; STANDALONE drafts with a
+    # separate small model through the same draft worker.
+    {"NGRAM", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE"}
+)
 
 
 class NativeStepLowering:

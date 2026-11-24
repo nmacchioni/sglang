@@ -88,6 +88,27 @@ _TREE = [
     "triton",
 ]
 _SAMPLED = {"temperature": 0.8, "top_p": 0.95, "sampling_seed": 7}
+_CHAIN_SHAPE = [
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
+]
+# A separate small draft model of the target's family.
+_STANDALONE_TARGET = "Qwen/Qwen3-1.7B"
+_STANDALONE = [
+    "--speculative-algorithm",
+    "STANDALONE",
+    "--speculative-draft-model-path",
+    _MODEL,
+    *_CHAIN_SHAPE,
+]
+# The model's own MTP layer (EAGLE over NEXTN); Qwen3.5 interleaves linear
+# attention with full attention, so its recurrent state is committed as well.
+_MTP_MODEL = "Qwen/Qwen3.5-0.8B"
+_MTP = ["--speculative-algorithm", "NEXTN", *_CHAIN_SHAPE, "--disable-multimodal"]
 
 # name -> (model, server args, sampling)
 _CONFIGS = {
@@ -104,9 +125,23 @@ _CONFIGS = {
         [*_CHAIN, *_GRAPHS, "--speculative-use-rejection-sampling"],
         _SAMPLED,
     ),
+    "standalone_graphs": (_STANDALONE_TARGET, [*_STANDALONE, *_GRAPHS], {}),
+    "standalone_overlap_graphs": (
+        _STANDALONE_TARGET,
+        [*_STANDALONE, *_OVERLAP_GRAPHS],
+        {},
+    ),
+    "mtp_eager": (_MTP_MODEL, [*_MTP, *_EAGER], {}),
+    "mtp_graphs": (_MTP_MODEL, [*_MTP, *_GRAPHS], {}),
+    "mtp_overlap_graphs": (_MTP_MODEL, [*_MTP, *_OVERLAP_GRAPHS], {}),
 }
+# Models whose state SGLang's slot-row digest cannot read (recurrent state):
+# their committed state shows in the bitwise logits of every later step.
+_NO_KV_DIGEST = {"mtp_eager", "mtp_graphs", "mtp_overlap_graphs"}
 # Configurations whose draft model runs as DRAFT and DRAFT_EXTEND Steps.
-_DRAFT_MODELS = {name for name in _CONFIGS if name.startswith("eagle3")}
+_DRAFT_MODELS = {
+    name for name in _CONFIGS if name.startswith(("eagle3", "standalone", "mtp"))
+}
 
 # Repetitive text, so n-gram drafts match; plain text, so some are rejected.
 _PROMPTS = [
@@ -253,7 +288,7 @@ class _SpeculativeCase(CustomTestCase):
             a, b = want_steps[key], got_steps[key]
             self.assertEqual(a["prefix_kv_crc"], b["prefix_kv_crc"], name)
             crcs += len(a["prefix_kv_crc"] or ())
-        if exact:
+        if exact and name.split(" ")[0] not in _NO_KV_DIGEST:
             self.assertGreater(crcs, 0, f"{name}: no committed prefix was compared")
         return modes
 
@@ -339,6 +374,23 @@ class TestEagle3Steps(_SpeculativeCase):
 
     def test_rejection_sampling(self):
         self._check_config("eagle3_rejection_sampling", num_draft_tokens=4)
+
+
+class TestStandaloneAndMTPSteps(_SpeculativeCase):
+    def test_standalone_graphs(self):
+        self._check_config("standalone_graphs", num_draft_tokens=4)
+
+    def test_standalone_overlap_graphs(self):
+        self._check_config("standalone_overlap_graphs", num_draft_tokens=4)
+
+    def test_mtp_eager(self):
+        self._check_config("mtp_eager", num_draft_tokens=4)
+
+    def test_mtp_graphs(self):
+        self._check_config("mtp_graphs", num_draft_tokens=4)
+
+    def test_mtp_overlap_graphs(self):
+        self._check_config("mtp_overlap_graphs", num_draft_tokens=4)
 
 
 class TestReferenceRunnerVerify(_SpeculativeCase):
