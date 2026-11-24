@@ -40,6 +40,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils.device import is_confidential_compute
 
@@ -220,6 +221,7 @@ class ModelRunnerStartup:
             last_stage=_is_last_stage(),
             native_kv=native_kv,
             wait_for_kv_loads=wait_for_kv_loads,
+            speculative=get_spec().speculative_algorithm is not None,
         )
         if tp_worker.step_trace is not None:
             tp_worker.step_trace.bind_kv_pool(model_runner.token_to_kv_pool)

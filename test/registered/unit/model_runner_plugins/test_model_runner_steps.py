@@ -8,6 +8,7 @@ import contextlib
 import unittest
 from types import SimpleNamespace
 
+import msgspec
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,10 +45,12 @@ from sglang.srt.model_runner_plugins.api import (
     Rows,
     RunnerCapabilities,
     RuntimeConfig,
+    SpecInputs,
     StateTables,
     Step,
     StepMode,
     StepOutput,
+    TreeMaskLayout,
     WindowTables,
 )
 from sglang.srt.model_runner_plugins.external import ExternalRunner
@@ -409,13 +412,67 @@ class TestVocabShardedLogits(CustomTestCase):
         self.assertTrue(logits.is_contiguous())
 
 
+def _ngram_verify_batch(num_drafts=3):
+    from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+    batch = _decode_batch()
+    batch.forward_mode = ForwardMode.TARGET_VERIFY
+    rows = 2 * num_drafts
+    batch.input_ids = torch.arange(rows)
+    batch.positions = torch.arange(rows)
+    batch.out_cache_loc = torch.arange(rows) + 20
+    seq_lens = batch.seq_lens.tolist()
+    batch.spec_info = NgramVerifyInput(
+        draft_token=batch.input_ids,
+        custom_mask=torch.ones(
+            sum(num_drafts * (n + num_drafts) for n in seq_lens), dtype=torch.bool
+        ),
+        positions=batch.positions,
+        draft_token_num=num_drafts,
+    )
+    return batch
+
+
+class TestVerifyStep(CustomTestCase):
+    def test_ngram_verify_is_a_verify_step_over_every_draft(self):
+        """The layout external runners attend by: D drafts per request after its
+        committed length, the full tree mask, a logit row per draft."""
+        batch = _ngram_verify_batch(num_drafts=3)
+        self.assertIsNone(step_refusal(batch))
+        step = build_step(forward_batch=batch, page_table=_PAGE_TABLE)
+        self.assertIs(step.mode, StepMode.VERIFY)
+        self.assertEqual(step.spec.num_draft_tokens, 3)
+        self.assertIs(step.mask.tensor, batch.spec_info.custom_mask)
+        self.assertIs(step.mask.layout, TreeMaskLayout.FULL)
+        self.assertIs(step.outputs.logit_rows, LogitRows.ALL)
+        self.assertIs(step.rows.seq_lens, batch.seq_lens)
+        self.assertIsNone(step.rows.query_start)
+        self.assertFalse(step.outputs.prompt_logprobs)
+
+    def test_verify_step_needs_its_drafts_and_mask_on_verify_only(self):
+        step = build_step(forward_batch=_ngram_verify_batch(), page_table=_PAGE_TABLE)
+        with self.assertRaisesRegex(ValueError, "4 input rows per request, got 6 rows"):
+            msgspec.structs.replace(step, spec=SpecInputs(num_draft_tokens=4))
+        decode = build_step(forward_batch=_decode_batch(), page_table=_PAGE_TABLE)
+        with self.assertRaisesRegex(ValueError, "go with verify"):
+            msgspec.structs.replace(decode, mask=step.mask)
+
+    def test_ragged_verify_keeps_the_direct_path(self):
+        batch = _ngram_verify_batch()
+        batch.ragged_verify_layout = object()
+        self.assertIn("ragged", step_refusal(batch))
+
+
 class TestStepSubset(CustomTestCase):
     def test_every_batch_feature_outside_block_3_is_refused(self):
         """A batch the API cannot express must take the direct path (native)
         or fail (external), never run with the feature silently dropped."""
         self.assertIsNone(step_refusal(_decode_batch()))
         cases = {
-            "forward mode": dict(forward_mode=ForwardMode.TARGET_VERIFY),
+            "forward mode": dict(forward_mode=ForwardMode.DRAFT_EXTEND_V2),
+            "a verify without a uniform draft count": dict(
+                forward_mode=ForwardMode.TARGET_VERIFY
+            ),
             "hidden-state capture": dict(capture_hidden_mode=CaptureHiddenMode.LAST),
             "input embeddings": dict(input_embeds=torch.zeros(2, 4)),
             "LoRA": dict(lora_ids=[None, "adapter"]),

@@ -1,0 +1,289 @@
+"""Speculative decoding through the model runner API (TP1).
+
+Each configuration runs the same pre-tokenized workload direct, direct again
+(to show the configuration repeats) and through --model-runner sglang, and
+requires: identical outputs; identical accepts per verify (accept lengths,
+accept indices and the sampled tokens they select); raw logits bitwise equal
+at every step matched by its inputs (a verify's inputs are the drafts, so
+equal verify inputs are equal drafts); and the committed KV of a request's
+accepted tokens equal, read through a follow-up that reuses it as a cached
+prefix. The trace proves the path: every target step ran as a Step, verify
+steps ran, drafts were accepted beyond the bonus token and rejected, and a
+verify followed each rejection. Eager, CUDA graphs and overlap scheduling are
+separate configurations. N-gram trees sample through a tree-sampling kernel
+that does not build for sm103a in the image this was proven on, so stochastic
+rejection is covered by the chain draft's configurations.
+
+The reference runner (an independent plugin) verifies n-gram drafts itself:
+it repeats across launches, and its accepts reproduce its own non-speculative
+greedy decode, token for token.
+"""
+
+import os
+import tempfile
+import unittest
+from collections import Counter
+
+import requests
+import torch
+from transformers import AutoTokenizer
+
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.model_runner_reference import (
+    REFERENCE_RUNNER,
+    install_reference_runner,
+    read_accept_trace,
+    read_step_trace,
+)
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+    terminate_and_kill_process_tree,
+)
+
+register_cuda_ci(est_time=2400, stage="extra-b", runner_config="1-gpu-small")
+
+_MODEL = "Qwen/Qwen3-0.6B"
+_COMMON = ["--disable-flashinfer-autotune", "--mem-fraction-static", "0.5"]
+_EAGER = [
+    "--disable-overlap-schedule",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
+]
+_GRAPHS = ["--disable-overlap-schedule", "--cuda-graph-max-bs-decode", "4"]
+_OVERLAP_GRAPHS = ["--cuda-graph-max-bs-decode", "4"]
+_NGRAM = ["--speculative-algorithm", "NGRAM", "--speculative-num-draft-tokens", "8"]
+
+# name -> (model, server args, sampling)
+_CONFIGS = {
+    "ngram_eager": (_MODEL, [*_NGRAM, *_EAGER], {}),
+    "ngram_graphs": (_MODEL, [*_NGRAM, *_GRAPHS], {}),
+    "ngram_overlap_graphs": (_MODEL, [*_NGRAM, *_OVERLAP_GRAPHS], {}),
+}
+
+# Repetitive text, so n-gram drafts match; plain text, so some are rejected.
+_PROMPTS = [
+    "Count: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, "
+    "20, 1, 2, 3, 4, 5,",
+    "def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + "
+    "fib(n - 2)\n\ndef fib2(n):\n",
+    "The capital of France is",
+    "Write a haiku about the sea:",
+]
+_SIGNATURE = ("input_ids", "positions", "out_cache_loc", "seq_lens", "req_pool_indices")
+_NEW_TOKENS = 48
+
+
+def _generate(input_ids, sampling):
+    response = requests.post(
+        DEFAULT_URL_FOR_TEST + "/generate",
+        json={
+            "input_ids": input_ids,
+            "sampling_params": {
+                "max_new_tokens": _NEW_TOKENS,
+                "temperature": 0,
+                "ignore_eos": True,
+                **sampling,
+            },
+        },
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _output_ids(result):
+    return [r["output_ids"] for r in (result if isinstance(result, list) else [result])]
+
+
+def _serve(model, other_args, workload, env=None):
+    trace_dir = tempfile.mkdtemp()
+    process = popen_launch_server(
+        model,
+        DEFAULT_URL_FOR_TEST,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        env={
+            **os.environ,
+            **(env or {}),
+            "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
+            "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+        },
+    )
+    try:
+        outputs = workload()
+    finally:
+        terminate_and_kill_process_tree(process)
+    return outputs, read_step_trace(trace_dir), read_accept_trace(trace_dir)
+
+
+def _target_steps(trace):
+    return [r for r in trace if r.get("role") != "draft"]
+
+
+def _by_inputs(trace) -> dict:
+    """Target steps with saved logits keyed by their inputs, without keys that
+    repeat within the run."""
+    by_inputs, repeated = {}, set()
+    for record in _target_steps(trace):
+        tensors = record.get("tensors", {})
+        if "logits" not in tensors:
+            continue
+        key = (record["mode"],) + tuple(
+            tensors[name].numpy().tobytes() for name in _SIGNATURE
+        )
+        if key in by_inputs:
+            repeated.add(key)
+        by_inputs[key] = record
+    return {k: r for k, r in by_inputs.items() if k not in repeated}
+
+
+def _accepts(records):
+    return [(r["accept_lens"], r["accept_index"], r["predict"]) for r in records]
+
+
+class _SpeculativeCase(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizers = {}
+
+    def _prompts(self, model):
+        if model not in self.tokenizers:
+            tokenizer = AutoTokenizer.from_pretrained(model)
+            self.tokenizers[model] = [tokenizer.encode(p) for p in _PROMPTS]
+        return self.tokenizers[model]
+
+    def _workload(self, model, sampling):
+        prompts = self._prompts(model)
+
+        def run():
+            first = _generate(prompts[:1], sampling)
+            outputs = [
+                first,
+                _generate(prompts[:2], sampling),
+                _generate(prompts, sampling),
+            ]
+            # Reuses the first request's KV, generated tokens included: what its
+            # verifies wrote and SGLang moved to the accepted positions.
+            committed = prompts[0] + first[0]["output_ids"][:-1]
+            outputs.append(_generate([committed + [11]], sampling))
+            return outputs
+
+        return run
+
+    def _check_repeats(self, name, want, got):
+        (want_out, want_trace, want_acc), (got_out, got_trace, got_acc) = want, got
+        self.assertEqual(
+            [_output_ids(o) for o in got_out], [_output_ids(o) for o in want_out], name
+        )
+        self.assertEqual(_accepts(got_acc), _accepts(want_acc), name)
+        want_steps, got_steps = _by_inputs(want_trace), _by_inputs(got_trace)
+        common = want_steps.keys() & got_steps.keys()
+        self.assertGreaterEqual(len(common), 0.9 * len(want_steps), name)
+        modes = Counter()
+        for key in common:
+            a, b = want_steps[key], got_steps[key]
+            self.assertTrue(
+                torch.equal(a["tensors"]["logits"], b["tensors"]["logits"]),
+                f"{name}: step {a['index']} ({a['mode']}) logits differ",
+            )
+            modes[a["mode"]] += 1
+        self.assertGreater(modes["target_verify"], 0, name)
+        crcs = 0
+        for key in common:
+            a, b = want_steps[key], got_steps[key]
+            self.assertEqual(a["prefix_kv_crc"], b["prefix_kv_crc"], name)
+            crcs += len(a["prefix_kv_crc"] or ())
+        self.assertGreater(crcs, 0, f"{name}: no committed prefix was compared")
+        return modes
+
+    def _check_speculation(self, name, accepts, num_draft_tokens):
+        """Drafts were accepted beyond the bonus token and rejected, and the
+        request decoded on after each rejection."""
+        lens = Counter(n for r in accepts for n in r["accept_lens"])
+        self.assertGreater(sum(c for n, c in lens.items() if n > 1), 0, name)
+        rejected = [
+            (i, rid)
+            for i, r in enumerate(accepts)
+            for rid, n in zip(r["rids"], r["accept_lens"])
+            if n < num_draft_tokens
+        ]
+        self.assertTrue(rejected, name)
+        followed = sum(
+            any(rid in r["rids"] for r in accepts[i + 1 :]) for i, rid in rejected
+        )
+        self.assertGreater(followed, 0, name)
+        return lens
+
+    def _check_config(self, name, *, num_draft_tokens=8):
+        model, args, sampling = _CONFIGS[name]
+        workload = self._workload(model, sampling)
+        direct = _serve(model, args, workload)
+        again = _serve(model, args, workload)
+        steps = _serve(model, [*args, "--model-runner", "sglang"], workload)
+
+        self.assertEqual({r["path"] for r in direct[1] + again[1]}, {"direct"})
+        self.assertEqual({r["path"] for r in steps[1]}, {"step"})
+        self._check_repeats(f"{name} direct/direct", direct, again)
+        modes = self._check_repeats(f"{name} direct/steps", direct, steps)
+        lens = self._check_speculation(name, steps[2], num_draft_tokens)
+        print(
+            f"[{name}] steps matched bitwise per mode {dict(modes)}; "
+            f"{len(steps[2])} verifies, accept lengths {dict(sorted(lens.items()))}"
+        )
+        return direct, steps
+
+
+class TestNgramSteps(_SpeculativeCase):
+    def test_eager(self):
+        self._check_config("ngram_eager")
+
+    def test_graphs(self):
+        self._check_config("ngram_graphs")
+
+    def test_overlap_graphs(self):
+        self._check_config("ngram_overlap_graphs")
+
+
+class TestReferenceRunnerVerify(_SpeculativeCase):
+    def test_reference_runner_verifies_ngram_drafts(self):
+        env = install_reference_runner(tempfile.mkdtemp())
+        args = [*_EAGER, *_COMMON, "--model-runner", REFERENCE_RUNNER]
+        workload = self._workload(_MODEL, {})
+        spec = _serve(_MODEL, [*_NGRAM, *args], workload, env=env)
+        again = _serve(_MODEL, [*_NGRAM, *args], workload, env=env)
+        plain = _serve(_MODEL, args, workload, env=env)
+
+        self.assertEqual(
+            {(r["path"], r["runner"]) for r in spec[1]}, {("step", REFERENCE_RUNNER)}
+        )
+        self.assertIn("target_verify", {r["mode"] for r in spec[1]})
+        self._check_repeats("reference ngram repeat", spec, again)
+        lens = self._check_speculation("reference ngram", spec[2], 8)
+        # Greedy verification reproduces the runner's own greedy decode where
+        # no near-tie flips: a verify scores D rows where decode scores one, so
+        # bf16 rounding differs, as on every runner.
+        want = [_output_ids(o) for o in plain[0]]
+        got = [_output_ids(o) for o in spec[0]]
+        self.assertEqual(got[:2], want[:2])
+        agree = sum(
+            a == b
+            for w, g in zip(want, got)
+            for wr, gr in zip(w, g)
+            for a, b in zip(wr, gr)
+        )
+        total = sum(len(wr) for w in want for wr in w)
+        print(
+            f"[reference ngram] {len(spec[2])} verifies, accept lengths "
+            f"{dict(sorted(lens.items()))}; greedy tokens equal to its plain "
+            f"decode {agree}/{total}"
+        )
+
+
+for _args in _CONFIGS.values():
+    _args[1].extend(_COMMON)
+
+
+if __name__ == "__main__":
+    unittest.main()

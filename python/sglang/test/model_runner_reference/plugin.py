@@ -1,6 +1,7 @@
 """The reference model runner: an independent, pure-PyTorch plugin that owns its
 weights and KV bytes and serves text through the Step API, tensor parallel over
-SGLang's TP group, with overlap scheduling and decode CUDA graphs.
+SGLang's TP group, with overlap scheduling and decode CUDA graphs, and verifies
+speculative drafts (eagerly, under the draft tree's full mask).
 
 Its decode graphs write logits into one buffer shared across steps; it declares
 logits a shared output and honors the lifetime contract: a replay waits on the
@@ -85,6 +86,7 @@ class ReferenceRunner:
             cuda_graphs=True,
             hicache=True,
             pd_disaggregation=True,
+            speculative_decoding=True,
             cuda_graph_phases=(GraphPhase.DECODE,),
             shared_outputs=(OutputBuffer.LOGITS,),
             architectures=ARCHITECTURES,
@@ -165,7 +167,12 @@ class ReferenceRunner:
             return StepOutput()
         if step.graph.is_eager:
             plan.hidden = self._model.hidden_states(step)
-            last = plan.hidden[last_rows(step)]
+            # A verify step scores every draft token.
+            last = (
+                plan.hidden
+                if step.outputs.logit_rows is LogitRows.ALL
+                else plan.hidden[last_rows(step)]
+            )
             if self._logits_layout is LogitsLayout.VOCAB_SHARDED:
                 logits = self._model.logits_shard(last)
             else:

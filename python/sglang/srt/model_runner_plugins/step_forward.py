@@ -66,6 +66,7 @@ class StepForward:
         last_stage: bool = True,
         native_kv: Optional[NativeKV] = None,
         wait_for_kv_loads: Optional[Callable[[], None]] = None,
+        speculative: bool = False,
     ):
         self.runner_name = runner_name
         self._executor = executor
@@ -92,7 +93,11 @@ class StepForward:
             runner_name=runner_name,
             release=executor.release,
             shared=frozenset(shared_outputs),
-            deferred=overlap,
+            # Under speculative decoding the speculative worker consumes every
+            # target output (verify logits, hidden states) on the runner stream
+            # before it returns, so each output is released when the next step
+            # starts, with or without overlap scheduling.
+            deferred=overlap and not speculative,
         )
         self._lease: Optional[OutputLease] = None
         # Host seconds of the last step inside execute(), and its graph, for

@@ -655,6 +655,7 @@ class TpModelWorker(BaseTpWorker):
                 replayed_graph=out.can_run_graph,
                 graph=steps.last_graph if via_steps else None,
                 kv=steps.last_kv if via_steps else None,
+                model_runner=self.model_runner,
             )
         return out
 
