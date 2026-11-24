@@ -243,6 +243,10 @@ class ModelRunnerStartup:
                 None if self.is_external else native_adapter_slots(model_runner)
             ),
             fused_sampling=self._capabilities.fused_sampling,
+            # The built-in runner executes on the runner stream itself.
+            stream_ordered=not self.is_external,
+            traced=tp_worker.step_trace is not None,
+            builtin=not self.is_external,
         )
         if self.is_external:
             self._plugin.step_forward = self._step_forward

@@ -255,7 +255,7 @@ def build_step(
             window=window,
             state=state,
         ),
-        outputs=OutputSpec(
+        outputs=output_spec(
             logit_rows=(
                 LogitRows.NONE
                 if not last_stage or mode is StepMode.IDLE or pooling
@@ -263,32 +263,76 @@ def build_step(
                 if mode in (StepMode.VERIFY, StepMode.DENOISE)
                 else LogitRows.LAST
             ),
-            prompt_logprobs=last_stage and reads_prompt_logprobs(forward_batch),
+            prompt_logprobs=bool(
+                last_stage
+                and forward_batch.return_logprob
+                and reads_prompt_logprobs(forward_batch)
+            ),
             hidden=(
-                _HIDDEN_ROWS[forward_batch.capture_hidden_mode]
+                HIDDEN_ROWS[forward_batch.capture_hidden_mode]
                 if last_stage
                 else HiddenRows.NONE
             ),
             pp_out=not last_stage,
             pooled=last_stage and pooling,
             pooled_hidden=pooling and forward_batch.return_pooled_hidden_states,
-            score_rows=score_rows(forward_batch),
+            score_rows=(
+                None
+                if forward_batch.token_indices_to_pool is None
+                and forward_batch.multi_item_delimiter_indices is None
+                else score_rows(forward_batch)
+            ),
         ),
         sampling_owner=sampling_owner,
         graph=graph,
         inputs_ready=inputs_ready,
-        dp=dp_info(forward_batch),
+        dp=(
+            None
+            if forward_batch.global_num_tokens_cpu is None
+            else dp_info(forward_batch)
+        ),
         pp_in=pp_in,
         mask=mask,
         spec=spec,
         adapters=adapters,
-        mm=mm_items(forward_batch),
+        mm=None if forward_batch.mm_inputs is None else mm_items(forward_batch),
         extra=(
             {}
             if forward_batch.token_type_ids is None
             else {"token_type_ids": forward_batch.token_type_ids}
         ),
     )
+
+
+# OutputSpecs without score rows are immutable and few: one per combination.
+_OUTPUT_SPECS: dict[tuple, OutputSpec] = {}
+
+
+def output_spec(
+    *,
+    logit_rows: LogitRows,
+    prompt_logprobs: bool,
+    hidden: HiddenRows,
+    pp_out: bool,
+    pooled: bool,
+    pooled_hidden: bool,
+    score_rows: Optional[ScoreRows],
+) -> OutputSpec:
+    key = (logit_rows, prompt_logprobs, hidden, pp_out, pooled, pooled_hidden)
+    spec = None if score_rows is not None else _OUTPUT_SPECS.get(key)
+    if spec is None:
+        spec = OutputSpec(
+            logit_rows=logit_rows,
+            prompt_logprobs=prompt_logprobs,
+            hidden=hidden,
+            pp_out=pp_out,
+            pooled=pooled,
+            pooled_hidden=pooled_hidden,
+            score_rows=score_rows,
+        )
+        if score_rows is None:
+            _OUTPUT_SPECS[key] = spec
+    return spec
 
 
 def runner_may_sample(forward_batch: ForwardBatch) -> bool:
@@ -311,7 +355,7 @@ def runner_may_sample(forward_batch: ForwardBatch) -> bool:
 
 def mm_items(forward_batch: ForwardBatch) -> Optional[tuple[MMItem, ...]]:
     """The step's multimodal items, in request order; None without any."""
-    if forward_batch.mm_inputs is None:
+    if forward_batch.mm_inputs is None or not any(forward_batch.mm_inputs):
         return None
     items = tuple(
         MMItem(
@@ -344,7 +388,7 @@ def score_rows(forward_batch: ForwardBatch) -> Optional[ScoreRows]:
     return None
 
 
-_HIDDEN_ROWS = {
+HIDDEN_ROWS = {
     CaptureHiddenMode.NULL: HiddenRows.NONE,
     CaptureHiddenMode.LAST: HiddenRows.LAST,
     CaptureHiddenMode.FULL: HiddenRows.ALL,

@@ -288,6 +288,45 @@ class TestProfileTraceTag(CustomTestCase):
         self.assertFalse(hasattr(fake_self, "_profile_trace_tag"))
 
 
+class TestDecidedGraph(CustomTestCase):
+    """``decide_graph`` (a model runner plugin's Step) answers before the
+    forward, whose own ``can_run_graph`` then reuses the answer. The direct
+    path runs the same ``can_run_graph``, so a decision must never answer for
+    any other batch, nor for its own batch a second time."""
+
+    def _runner(self, verdicts):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        checked = []
+
+        def check(forward_batch):
+            checked.append(forward_batch)
+            return verdicts[forward_batch]
+
+        runner._check_graph = check
+        return runner, checked
+
+    def test_a_decision_answers_once_and_only_for_its_batch(self):
+        a, b = object(), object()
+        verdicts = {a: True, b: False}
+        runner, checked = self._runner(verdicts)
+
+        self.assertTrue(runner.decide_graph(a))
+        verdicts[a] = False
+        # The forward of the decided batch reuses the decision, unchecked.
+        self.assertTrue(runner.can_run_graph(a))
+        self.assertEqual(checked, [a])
+        # Consumed: the same batch is checked again from now on.
+        self.assertFalse(runner.can_run_graph(a))
+
+        # A decision for one batch never answers another one, and is dropped.
+        verdicts[a] = True
+        self.assertTrue(runner.decide_graph(a))
+        verdicts[a] = False
+        self.assertFalse(runner.can_run_graph(b))
+        self.assertFalse(runner.can_run_graph(a))
+        self.assertEqual(checked, [a, a, a, b, a])
+
+
 class TestProfileRunnerName(CustomTestCase):
     """DSPARK / DFLASH drafts capture with the base class at the target's
     shapes, so their traces must not share the target's runner name."""

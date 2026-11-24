@@ -13,8 +13,7 @@ checks the forward took it.
 
 from __future__ import annotations
 
-import contextlib
-from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import msgspec
 
@@ -62,19 +61,34 @@ STEP_SPECULATIVE_ALGORITHMS = frozenset(
 
 
 class NativeStepLowering:
-    """Hands ``plan`` the ``ForwardBatch`` of the step being planned."""
+    """Hands ``plan`` the ``ForwardBatch`` of the step being planned, and the
+    worker boundary the native forward's own output of the last step."""
 
     def __init__(self):
         self._step: Optional[Step] = None
         self._forward_batch: Optional[ForwardBatch] = None
+        # The last StepOutput and the native output it views.
+        self._output: Optional[tuple[StepOutput, Any]] = None
 
-    @contextlib.contextmanager
-    def bind(self, *, step: Step, forward_batch: ForwardBatch) -> Iterator[None]:
+    def bind(self, *, step: Step, forward_batch: ForwardBatch) -> None:
+        """Until ``unbind``: plan() of ``step`` takes back ``forward_batch``."""
         self._step, self._forward_batch = step, forward_batch
-        try:
-            yield
-        finally:
-            self._step = self._forward_batch = None
+
+    def unbind(self) -> None:
+        self._step = self._forward_batch = None
+
+    def produced(self, out: StepOutput, native_output: Any) -> StepOutput:
+        self._output = (out, native_output)
+        return out
+
+    def native_output_of(self, out: StepOutput) -> Any:
+        """The native forward's ModelRunnerOutput ``out`` was made from, once;
+        None for any other StepOutput. Reusing it skips rebuilding the same
+        objects."""
+        kept, self._output = self._output, None
+        if kept is None or kept[0] is not out:
+            return None
+        return kept[1]
 
     def forward_batch_of(self, step: Step) -> ForwardBatch:
         forward_batch = self._forward_batch
@@ -89,9 +103,11 @@ class NativeStepLowering:
         return forward_batch
 
 
-class NativePlan(msgspec.Struct, frozen=True, kw_only=True):
+class NativePlan(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     forward_batch: object
-    graph: GraphChoice = EAGER
+    # None: no Step was materialized, and the forward decides as on the direct
+    # path; otherwise Step.graph, which the forward must take.
+    graph: Optional[GraphChoice] = EAGER
     # The PPProxyTensors over Step.pp_in, on every stage but the first.
     pp_proxy_tensors: Optional[object] = None
 
@@ -188,14 +204,18 @@ def native_graph_choice(
 ) -> GraphChoice:
     """The graph ``ModelRunner.forward`` will replay for ``forward_batch``: the
     same eligibility checks, in the same order, as ``_forward_raw``."""
-    from sglang.srt.model_executor.model_runner import (
-        _prefill_cuda_graph_allows_context_parallel,
-    )
-    from sglang.srt.model_executor.runner.eager_runner import EagerRunner
-
     mode = forward_batch.forward_mode
     decode = model_runner.decode_cuda_graph_runner
-    if mode.is_cuda_graph() and decode and decode.can_run_graph(forward_batch):
+    if (
+        mode.is_cuda_graph()
+        and decode
+        and (
+            # The forward reuses the CUDA graph runner's decision.
+            decode.decide_graph(forward_batch)
+            if isinstance(decode, _native().DecodeCudaGraphRunner)
+            else decode.can_run_graph(forward_batch)
+        )
+    ):
         # Under DP attention every rank replays the bucket of the largest
         # rank's batch, as gathered at the rendezvous.
         rows = (
@@ -203,22 +223,20 @@ def native_graph_choice(
             if decode.require_mlp_tp_gather
             else forward_batch.batch_size
         )
-        return GraphChoice(
-            phase=GraphPhase.DECODE, bucket=_bucket(decode, rows, decode.capture_bs)
-        )
+        return graph_choice(GraphPhase.DECODE, _bucket(decode, rows, decode.capture_bs))
     prefill = model_runner.prefill_cuda_graph_runner
-    if prefill is None or isinstance(prefill, EagerRunner):
+    if prefill is None or isinstance(prefill, _native().EagerRunner):
         return EAGER
     dp_bucket = dp_prefill_graph_bucket(forward_batch)
     if dp_bucket is not None:
         # Under DP attention the forward pads every rank, idle and decode ranks
         # included, to the shared bucket before it asks the graph runner; the
         # rendezvous's vote is that every rank can replay it.
-        return GraphChoice(phase=GraphPhase.PREFILL, bucket=dp_bucket)
+        return graph_choice(GraphPhase.PREFILL, dp_bucket)
     if (
         mode.is_extend()
         and prefill.can_run_graph(forward_batch)
-        and _prefill_cuda_graph_allows_context_parallel(prefill, forward_batch)
+        and _native().prefill_allows_cp(prefill, forward_batch)
     ):
         global_num_tokens = forward_batch.global_num_tokens_cpu
         rows = (
@@ -226,11 +244,53 @@ def native_graph_choice(
             if global_num_tokens is None
             else max(global_num_tokens)
         )
-        return GraphChoice(
-            phase=GraphPhase.PREFILL,
-            bucket=_bucket(prefill, rows, prefill.capture_num_tokens),
+        return graph_choice(
+            GraphPhase.PREFILL, _bucket(prefill, rows, prefill.capture_num_tokens)
         )
     return EAGER
+
+
+# GraphChoice is immutable: one per (phase, bucket), built on first use.
+_GRAPHS: dict[tuple[GraphPhase, int], GraphChoice] = {}
+
+
+def graph_choice(phase: GraphPhase, bucket: int) -> GraphChoice:
+    choice = _GRAPHS.get((phase, bucket))
+    if choice is None:
+        choice = _GRAPHS[(phase, bucket)] = GraphChoice(phase=phase, bucket=bucket)
+    return choice
+
+
+class _NativeTypes:
+    """Model-executor names the per-step code reads, imported once on first
+    use (importing them with this module would cycle through the launcher)."""
+
+    def __init__(self):
+        from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+        from sglang.srt.model_executor.model_runner import (
+            _prefill_cuda_graph_allows_context_parallel,
+        )
+        from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+            DecodeCudaGraphRunner,
+        )
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+
+        self.EmbeddingPoolerOutput = EmbeddingPoolerOutput
+        self.PPProxyTensors = PPProxyTensors
+        self.prefill_allows_cp = _prefill_cuda_graph_allows_context_parallel
+        self.EagerRunner = EagerRunner
+        self.DecodeCudaGraphRunner = DecodeCudaGraphRunner
+
+
+_NATIVE_TYPES: Optional[_NativeTypes] = None
+
+
+def _native() -> _NativeTypes:
+    global _NATIVE_TYPES
+    if _NATIVE_TYPES is None:
+        _NATIVE_TYPES = _NativeTypes()
+    return _NATIVE_TYPES
 
 
 def _bucket(runner, rows: int, captured) -> int:
@@ -240,9 +300,46 @@ def _bucket(runner, rows: int, captured) -> int:
     return runner._pad_to_bucket(rows, captured)
 
 
-def native_execute(*, model_runner: ModelRunner, plan: NativePlan) -> StepOutput:
+def native_execute(
+    *,
+    model_runner: ModelRunner,
+    plan: NativePlan,
+    lowering: Optional[NativeStepLowering] = None,
+) -> StepOutput:
+    """Runs the native forward; ``lowering`` keeps the native output the
+    returned StepOutput views."""
+    out = native_forward(model_runner=model_runner, plan=plan)
+    if isinstance(out.logits_output, _native().PPProxyTensors):
+        # A stage before the last: what goes to the next stage.
+        step_output = StepOutput(pp_out=out.logits_output.tensors)
+    else:
+        step_output = step_output_of(out.logits_output)
+    if lowering is not None:
+        lowering.produced(step_output, out)
+    return step_output
+
+
+def native_forward(*, model_runner: ModelRunner, plan: NativePlan):
+    """The native forward of ``plan``'s batch, checked against the plan: its
+    ModelRunnerOutput, with no captures the Step path drops."""
+    out = model_runner.forward(
+        plan.forward_batch, pp_proxy_tensors=plan.pp_proxy_tensors
+    )
+    if plan.graph is not None:
+        _check_graph(plan=plan, out=out)
+    if (
+        out.expert_distribution_metrics is not None
+        or out.routed_experts_output is not None
+        or out.indexer_topk_output is not None
+        or out.kv_weight_version_record is not None
+    ):
+        raise RuntimeError("a native forward on the Step path produced captures")
+    return out
+
+
+def _check_graph(*, plan: NativePlan, out) -> None:
+    """The native forward took the graph Step.graph reported."""
     forward_batch = plan.forward_batch
-    out = model_runner.forward(forward_batch, pp_proxy_tensors=plan.pp_proxy_tensors)
     if out.can_run_graph == plan.graph.is_eager:
         raise RuntimeError(
             f"Step.graph said {_describe(plan.graph)} but the native forward "
@@ -266,19 +363,6 @@ def native_execute(*, model_runner: ModelRunner, plan: NativePlan) -> StepOutput
                 f"Step.graph said {_describe(plan.graph)} on every DP rank but "
                 f"the native forward padded the ranks to {padded} ({padding})"
             )
-    if (
-        out.expert_distribution_metrics is not None
-        or out.routed_experts_output is not None
-        or out.indexer_topk_output is not None
-        or out.kv_weight_version_record is not None
-    ):
-        raise RuntimeError("a native forward on the Step path produced captures")
-    from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-
-    if isinstance(out.logits_output, PPProxyTensors):
-        # A stage before the last: what goes to the next stage.
-        return StepOutput(pp_out=out.logits_output.tensors)
-    return step_output_of(out.logits_output)
 
 
 def _describe(graph: GraphChoice) -> str:
@@ -291,9 +375,7 @@ def step_output_of(
     logits_output: Union[LogitsProcessorOutput, EmbeddingPoolerOutput],
 ) -> StepOutput:
     """The native output as a StepOutput; the Step subset sets no other field."""
-    from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-
-    if isinstance(logits_output, EmbeddingPoolerOutput):
+    if isinstance(logits_output, _native().EmbeddingPoolerOutput):
         return StepOutput(
             pooled=logits_output.embeddings,
             pooled_hidden=logits_output.pooled_hidden_states,

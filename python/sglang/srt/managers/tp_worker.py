@@ -653,30 +653,37 @@ class TpModelWorker(BaseTpWorker):
         """One forward at the worker boundary: through the selected model
         runner's steps when it takes the batch, else the direct path."""
         steps = self.step_forward
-        via_steps = steps is not None and steps.takes(forward_batch)
         trace = self.step_trace
-        tic = trace.start() if trace is not None else 0.0
+        if trace is None:
+            if steps is not None:
+                out = steps.try_forward(forward_batch, pp_proxy_tensors)
+                if out is not None:
+                    return out
+            return self.model_runner.forward(
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+        via_steps = steps is not None and steps.takes(forward_batch)
+        tic = trace.start()
         if via_steps:
             out = steps.forward(forward_batch, pp_proxy_tensors)
         else:
             out = self.model_runner.forward(
                 forward_batch, pp_proxy_tensors=pp_proxy_tensors
             )
-        if trace is not None:
-            trace.record(
-                tic=tic,
-                runner=steps.runner_name if via_steps else None,
-                execute_seconds=steps.last_execute_seconds if via_steps else None,
-                forward_batch=forward_batch,
-                logits_output=out.logits_output,
-                replayed_graph=out.can_run_graph,
-                graph=steps.last_graph if via_steps else None,
-                kv=steps.last_kv if via_steps else None,
-                model_runner=self.model_runner,
-                adapters=steps.last_adapters if via_steps else None,
-                sampling_owner=steps.last_sampling_owner.value if via_steps else None,
-                plan_runs=steps.last_plan_runs if via_steps else None,
-            )
+        trace.record(
+            tic=tic,
+            runner=steps.runner_name if via_steps else None,
+            execute_seconds=steps.last_execute_seconds if via_steps else None,
+            forward_batch=forward_batch,
+            logits_output=out.logits_output,
+            replayed_graph=out.can_run_graph,
+            graph=steps.last_graph if via_steps else None,
+            kv=steps.last_kv if via_steps else None,
+            model_runner=self.model_runner,
+            adapters=steps.last_adapters if via_steps else None,
+            sampling_owner=steps.last_sampling_owner.value if via_steps else None,
+            plan_runs=steps.last_plan_runs if via_steps else None,
+        )
         return out
 
     def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:
