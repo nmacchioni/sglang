@@ -155,6 +155,7 @@ class StepTrace:
         graph: Optional[GraphChoice] = None,
         kv: Optional[KVTables] = None,
         model_runner=None,
+        adapters: Optional[torch.Tensor] = None,
     ) -> None:
         host_seconds = time.perf_counter() - tic
         # A pipeline stage before the last hands the next stage proxy tensors.
@@ -209,6 +210,14 @@ class StepTrace:
             ),
             "padded_num_tokens": forward_batch.global_num_tokens_cpu,
             "expert_layout": self._expert_layout_crc(),
+            # LoRA: each request's adapter, and (step path) its Step.adapters slot.
+            "lora_ids": (
+                None
+                if not forward_batch.lora_ids
+                or all(uid is None for uid in forward_batch.lora_ids)
+                else list(forward_batch.lora_ids[: forward_batch.batch_size])
+            ),
+            "adapters": None if adapters is None else adapters.tolist(),
             # Step path only: the window and state tables the Step carried.
             **_sub_pool_summary(kv),
             # Step path, with saved tensors: per request with a cached prefix

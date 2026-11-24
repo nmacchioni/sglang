@@ -14,7 +14,7 @@ checks the forward took it.
 from __future__ import annotations
 
 import contextlib
-from typing import TYPE_CHECKING, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Callable, Iterator, Optional, Union
 
 import msgspec
 
@@ -40,6 +40,8 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.device import is_confidential_compute
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.pooler import EmbeddingPoolerOutput
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -160,8 +162,11 @@ def native_step_refusals(
     ):
         # Served by the Inkling2 MTP worker, not the DSpark worker.
         reasons.append("DSPARK on Inkling2")
-    if get_lora().enable_lora:
-        reasons.append("LoRA")
+    if get_lora().enable_lora and get_parallel().attn_dp_size > 1:
+        # Adapter slots are assigned inside the forward, after the Step.
+        reasons.append("LoRA under DP attention")
+    if get_lora().enable_lora and algorithm is not None:
+        reasons.append("LoRA with speculative decoding")
     features = get_exec().features
     if (
         features.aux_hidden_state_capture is not None
@@ -323,3 +328,27 @@ def step_output_of(
         logprobs=logprobs,
         hidden=logits_output.hidden_states,
     )
+
+
+def native_adapter_slots(
+    model_runner: ModelRunner,
+) -> Optional[Callable[[ForwardBatch], Optional[torch.Tensor]]]:
+    """Each request's LoRA slot, as the batch's lowering assigned it (its
+    ``prepare_lora_batch`` loads any missing adapter and evicts first); None
+    without LoRA."""
+    manager = model_runner.lora_manager
+    if manager is None:
+        return None
+    import torch
+
+    def adapter_slots(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+        lora_ids = forward_batch.lora_ids
+        if not lora_ids or all(uid is None for uid in lora_ids):
+            return None
+        to_slot = manager.memory_pool.uid_to_buffer_id
+        return torch.tensor(
+            [to_slot[uid] for uid in lora_ids[: forward_batch.batch_size]],
+            dtype=torch.int32,
+        )
+
+    return adapter_slots

@@ -109,6 +109,10 @@ class ControlOp(str, Enum):
     EXPERT_STATS = "expert_stats"
     # Elastic EP: change the expert-parallel group at runtime.
     RECONFIGURE_PARALLEL = "reconfigure_parallel"
+    # Register a LoRA adapter's weights (from disk or tensors), or drop them.
+    # SGLang assigns adapter slots per step (Step.adapters) and evicts them.
+    LORA_LOAD = "lora_load"
+    LORA_UNLOAD = "lora_unload"
 
 
 class RefusedCombination(msgspec.Struct, frozen=True, kw_only=True):
@@ -813,8 +817,8 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     """One forward step, as SGLang scheduled it.
 
     Tensors are views of what SGLang built for the step; a runner must not
-    modify them. Fields of later blocks (input embeddings, adapters,
-    multimodal items) are not part of this version.
+    modify them. Fields of later blocks (input embeddings, multimodal items)
+    are not part of this version.
 
     With overlap scheduling, ``plan`` runs while the device still executes
     the previous step: host fields (shapes, ``*_cpu`` copies) are final then,
@@ -847,12 +851,22 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     # committed positions and to the drafts before it (causal).
     mask: Optional[TreeMask] = None
     spec: Optional[SpecInputs] = None
+    # [B] int32 host: the LoRA slot of request b, as SGLang assigned it for
+    # this step (slot assignment and eviction are SGLang's; the runner holds
+    # the adapter weights in each slot). Requests without an adapter get the
+    # base model's slot. None when no request of the step uses an adapter.
+    adapters: Optional[torch.Tensor] = None
     # Declared model inputs beside the tokens, each one row per input row:
     # "token_type_ids" (cross-encoders, [T] int64).
     extra: dict[str, torch.Tensor] = {}
 
     def __post_init__(self) -> None:
         num_tokens = self.input_ids.shape[0]
+        if self.adapters is not None and self.adapters.shape[0] != self.rows.batch_size:
+            raise ValueError(
+                f"Step has {self.rows.batch_size} requests but "
+                f"{self.adapters.shape[0]} adapter slots"
+            )
         for name, tensor in self.extra.items():
             if tensor.shape[0] != num_tokens:
                 raise ValueError(

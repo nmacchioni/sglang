@@ -2,7 +2,8 @@
 
 Under ``--model-runner``, every scheduler request that acts on the runner's
 weights or memory between steps (weight updates and reads, checksums and
-export, memory release and resume, expert statistics, elastic EP) maps to a
+export, memory release and resume, expert statistics, elastic EP, LoRA
+adapter loads and unloads) maps to a
 ``ControlOp`` and goes through the runner. A runner that does not declare the
 operation is answered with the reply's own failed status on every rank, so no
 reply format changes. Requests that act only on SGLang's state (cache flush,
@@ -54,6 +55,9 @@ def _routes() -> dict[type, _Route]:
 
     def status(out_type):
         return lambda message: out_type(success=False, message=message)
+
+    def lora_refusal(message):
+        return io.LoRAUpdateOutput(success=False, error_message=message)
 
     return {
         io.UpdateWeightFromDiskReqInput: _Route(
@@ -154,6 +158,21 @@ def _routes() -> dict[type, _Route]:
             op=ControlOp.EXPERT_STATS,
             api="expert_distribution_record",
             refuse=lambda message: io.ExpertDistributionReqOutput(),
+        ),
+        io.LoadLoRAAdapterReqInput: _Route(
+            op=ControlOp.LORA_LOAD,
+            api="load_lora_adapter",
+            refuse=lora_refusal,
+        ),
+        io.LoadLoRAAdapterFromTensorsReqInput: _Route(
+            op=ControlOp.LORA_LOAD,
+            api="load_lora_adapter_from_tensors",
+            refuse=lora_refusal,
+        ),
+        io.UnloadLoRAAdapterReqInput: _Route(
+            op=ControlOp.LORA_UNLOAD,
+            api="unload_lora_adapter",
+            refuse=lora_refusal,
         ),
         io.ScaleElasticEPReqInput: _Route(
             op=ControlOp.RECONFIGURE_PARALLEL,
