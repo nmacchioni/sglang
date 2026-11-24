@@ -24,6 +24,7 @@ from sglang.srt.model_runner_plugins.api import (
     KVTables,
     LogitRows,
     LogitsLayout,
+    MMItem,
     OutputSpec,
     PromptLogprobs,
     Rows,
@@ -67,8 +68,6 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         or forward_batch.replace_embeds is not None
     ):
         return "input embeddings"
-    if forward_batch.mm_inputs is not None and any(forward_batch.mm_inputs):
-        return "multimodal inputs"
     if forward_batch.beam is not None:
         return "beam search"
     if forward_batch.input_candidate_selectors is not None:
@@ -232,7 +231,11 @@ def build_step(
     return Step(
         mode=mode,
         input_ids=forward_batch.input_ids,
-        positions=forward_batch.positions,
+        positions=(
+            forward_batch.positions
+            if forward_batch.mrope_positions is None
+            else forward_batch.mrope_positions
+        ),
         rows=Rows(
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
@@ -275,12 +278,34 @@ def build_step(
         mask=mask,
         spec=spec,
         adapters=adapters,
+        mm=mm_items(forward_batch),
         extra=(
             {}
             if forward_batch.token_type_ids is None
             else {"token_type_ids": forward_batch.token_type_ids}
         ),
     )
+
+
+def mm_items(forward_batch: ForwardBatch) -> Optional[tuple[MMItem, ...]]:
+    """The step's multimodal items, in request order; None without any."""
+    if forward_batch.mm_inputs is None:
+        return None
+    items = tuple(
+        MMItem(
+            request=request,
+            modality=item.modality.name.lower(),
+            offsets=tuple(tuple(o) for o in item.offsets or ()),
+            hash=item.hash,
+            feature=item.feature,
+            embeddings=item.precomputed_embeddings,
+            model_specific=item.model_specific_data,
+        )
+        for request, mm_input in enumerate(forward_batch.mm_inputs)
+        if mm_input is not None
+        for item in mm_input.mm_items
+    )
+    return items or None
 
 
 def score_rows(forward_batch: ForwardBatch) -> Optional[ScoreRows]:
@@ -341,7 +366,9 @@ def logits_output_from_step(
             raise ValueError("vocabulary-sharded logits need a TP group to gather")
         logits = gather_vocab(logits)
     logits_output = LogitsProcessorOutput(
-        next_token_logits=logits, hidden_states=out.hidden
+        next_token_logits=logits,
+        hidden_states=out.hidden,
+        mm_input_embeds=out.input_embeds,
     )
     if out.pp_out is not None:
         raise ValueError("a last-stage step returned pp_out")

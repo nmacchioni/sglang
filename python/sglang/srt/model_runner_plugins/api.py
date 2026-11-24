@@ -652,6 +652,28 @@ class StateTables(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("state copies name sources and destinations")
 
 
+class MMItem(msgspec.Struct, frozen=True, kw_only=True):
+    """One image, video or audio input of a request, as SGLang's processor
+    prepared it. The runner encodes it (or reads ``embeddings``) and places
+    its embeddings at the request's placeholder rows."""
+
+    # The request (row of Step.rows) it belongs to.
+    request: int
+    # "image", "video", "audio", ...
+    modality: str
+    # Placeholder token ranges [start, end] (inclusive) in the request's whole
+    # sequence; a step covers only those at or past the request's prefix.
+    offsets: tuple[tuple[int, int], ...]
+    # Content identity, for an encoder cache.
+    hash: Optional[int] = None
+    # The processor's features (e.g. pixel values), or precomputed encoder
+    # embeddings; one of the two is set.
+    feature: Optional[Any] = None
+    embeddings: Optional[Any] = None
+    # Processor outputs specific to the model (e.g. image grid sizes).
+    model_specific: dict[str, Any] = {}
+
+
 class TreeMaskLayout(str, Enum):
     """How ``TreeMask.tensor`` lays out which positions each draft token sees."""
 
@@ -817,8 +839,9 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     """One forward step, as SGLang scheduled it.
 
     Tensors are views of what SGLang built for the step; a runner must not
-    modify them. Fields of later blocks (input embeddings, multimodal items)
-    are not part of this version.
+    modify them. Input embeddings are not part of this version.
+    ``positions`` is [3, T] for models with multimodal rotary positions
+    (M-RoPE), [T] otherwise.
 
     With overlap scheduling, ``plan`` runs while the device still executes
     the previous step: host fields (shapes, ``*_cpu`` copies) are final then,
@@ -851,6 +874,8 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     # committed positions and to the drafts before it (causal).
     mask: Optional[TreeMask] = None
     spec: Optional[SpecInputs] = None
+    # Multimodal items of the step's requests; None without any.
+    mm: Optional[tuple[MMItem, ...]] = None
     # [B] int32 host: the LoRA slot of request b, as SGLang assigned it for
     # this step (slot assignment and eviction are SGLang's; the runner holds
     # the adapter weights in each slot). Requests without an adapter get the
@@ -1044,6 +1069,9 @@ class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
     pp_out: Optional[dict[str, torch.Tensor]] = None
     # OutputSpec.hidden; SGLang copies what it keeps past release.
     hidden: Optional[torch.Tensor] = None
+    # [T, hidden] device: the input embeddings with multimodal items merged
+    # in, from a step that carried Step.mm (a draft model reads them).
+    input_embeds: Optional[torch.Tensor] = None
     # DRAFT steps.
     draft: Optional[DraftTree] = None
     # OutputSpec.pooled: [B, D] (embeddings or head scores), or a list of
