@@ -53,7 +53,10 @@ def check_model_runner_at_launch() -> None:
         return
     runner = load_model_runner(name)
     cfg = resolved_config(process_model_config())
-    reasons = launch_refusals(describe_runner(runner, cfg), cfg)
+    capabilities = describe_runner(runner, cfg)
+    reasons = launch_refusals(capabilities, cfg)
+    if not runner.is_native:
+        reasons += external_launch_refusals(capabilities, cfg)
     if reasons:
         raise ValueError(refusal_message(name, reasons))
 
@@ -80,8 +83,34 @@ _EXTERNAL_FEATURES = frozenset(
         # PD transfer backends register and move the same bytes, located
         # through the KVLayout, with SGLang's page leases and checksums.
         Feature.PD_DISAGGREGATION,
+        # Target verify steps; only for drafts no model makes (n-gram), see
+        # external_launch_refusals.
+        Feature.SPECULATIVE_DECODING,
     }
 )
+
+# Speculative algorithms an external runner can serve: SGLang drafts without a
+# model, the runner verifies. Draft models are loaded and run by SGLang's own
+# runner, which reads its target's internals, so they need the built-in runner.
+EXTERNAL_SPECULATIVE_ALGORITHMS = frozenset({"NGRAM"})
+
+
+def external_launch_refusals(
+    capabilities: RunnerCapabilities, cfg: ResolvedConfig
+) -> list[str]:
+    """Refusals beyond the declared capabilities, for an external runner."""
+    algorithm = cfg.speculative_algorithm
+    if (
+        capabilities.speculative_decoding
+        and algorithm is not None
+        and algorithm.upper() not in EXTERNAL_SPECULATIVE_ALGORITHMS
+    ):
+        return [
+            f"speculative decoding with a draft model (speculative_algorithm="
+            f"{algorithm}; an installed runner verifies n-gram drafts only: pass "
+            "--speculative-algorithm NGRAM, or serve with --model-runner sglang)"
+        ]
+    return []
 
 
 def capabilities_in_this_release(

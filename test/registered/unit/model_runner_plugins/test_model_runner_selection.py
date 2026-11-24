@@ -264,6 +264,37 @@ class TestLaunchCheck(_DistsCase):
         ):
             check_model_runner_at_launch()
 
+    def test_external_runner_verifies_ngram_drafts_only(self):
+        """An external runner declaring speculative decoding serves n-gram
+        drafts, which no model makes; a draft model needs the built-in runner."""
+        self.dists.plugin(
+            "fake-alpha",
+            "alpha",
+            capabilities="RunnerCapabilities(speculative_decoding=True)",
+        )
+        eager_text = dict(
+            _model_config=_model_config(),
+            model_runner="alpha",
+            disable_overlap_schedule=True,
+            disable_decode_cuda_graph=True,
+            disable_prefill_cuda_graph=True,
+        )
+        with get_context().override_server_args(
+            **eager_text, speculative_algorithm="NGRAM"
+        ):
+            check_model_runner_at_launch()
+        with get_context().override_server_args(
+            **eager_text, speculative_algorithm="EAGLE3"
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                check_model_runner_at_launch()
+        self.assertIn(
+            "speculative decoding with a draft model (speculative_algorithm=EAGLE3; "
+            "an installed runner verifies n-gram drafts only: pass "
+            "--speculative-algorithm NGRAM, or serve with --model-runner sglang)",
+            str(ctx.exception),
+        )
+
     def test_native_runner_accepts_the_launch(self):
         self._launch(
             model_runner="sglang",

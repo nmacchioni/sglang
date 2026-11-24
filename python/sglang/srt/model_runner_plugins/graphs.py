@@ -21,7 +21,8 @@ def bucket_graph_choice(
     """The smallest captured bucket that holds the step, else eager.
 
     Decode buckets count requests and prefill buckets input tokens; idle steps
-    run eager, since they produce nothing on one GPU.
+    run eager, since they produce nothing on one GPU, and so do verify steps:
+    the buckets SGLang passes to ``capture`` hold one token per request.
     """
     if mode is StepMode.DECODE:
         phase, rows = GraphPhase.DECODE, batch_size

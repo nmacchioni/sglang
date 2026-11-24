@@ -112,6 +112,8 @@ class RunnerCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     two_batch_overlap: bool = False
     cuda_graphs: bool = False
     overlap_schedule: bool = False
+    # The runner executes VERIFY steps (Step.spec, Step.mask with
+    # TreeMaskLayout.FULL) and returns logits for every draft token.
     speculative_decoding: bool = False
     lora: bool = False
     multimodal: bool = False
@@ -497,20 +499,22 @@ class KVLayout(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class StepMode(str, Enum):
-    """What one step runs; EXTEND, DECODE, MIXED and IDLE execute in this version."""
+    """What one step runs; DRAFT and DRAFT_EXTEND do not execute in this version."""
 
     EXTEND = "extend"
     DECODE = "decode"
     # Extend rows and decode rows in one batch, laid out as an extend.
     MIXED = "mixed"
     IDLE = "idle"
+    # Speculative decoding: the target scores every draft token of every
+    # request (``Step.spec``) under the draft tree's mask (``Step.mask``).
     VERIFY = "verify"
     DRAFT = "draft"
     DRAFT_EXTEND = "draft_extend"
 
 
 EXECUTABLE_STEP_MODES = frozenset(
-    {StepMode.EXTEND, StepMode.DECODE, StepMode.MIXED, StepMode.IDLE}
+    {StepMode.EXTEND, StepMode.DECODE, StepMode.MIXED, StepMode.IDLE, StepMode.VERIFY}
 )
 
 
@@ -603,6 +607,49 @@ class StateTables(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("state copies name sources and destinations")
 
 
+class TreeMaskLayout(str, Enum):
+    """How ``TreeMask.tensor`` lays out which positions each draft token sees."""
+
+    # Per request b, a [D, seq_lens[b] + D] boolean matrix, row-major; the
+    # requests' matrices concatenated in request order. Entry (i, j): draft i
+    # (input row b * D + i) attends to position j of the request.
+    FULL = "full"
+    # Per request, [D, D] over the drafts only; every committed position is
+    # visible. The built-in runner's CPU kernels only.
+    DRAFTS_ONLY = "drafts_only"
+    # DRAFTS_ONLY with each row packed into bits. The built-in runner only.
+    DRAFTS_ONLY_BITPACKED = "drafts_only_bitpacked"
+
+
+class TreeMask(msgspec.Struct, frozen=True, kw_only=True):
+    """The draft tree of a verify step, as SGLang built it from the drafts."""
+
+    # Device, in ``layout``.
+    tensor: torch.Tensor
+    layout: TreeMaskLayout = TreeMaskLayout.FULL
+
+
+class SpecInputs(msgspec.Struct, frozen=True, kw_only=True):
+    """Speculative inputs of a verify step.
+
+    Request b's drafts are input rows ``[b * D, (b + 1) * D)``, D =
+    ``num_draft_tokens``, at the positions ``Step.positions`` gives (committed
+    length plus tree depth). Their KV goes to ``KVTables.write_slots``, which
+    ``page_table`` also maps at positions ``[seq_lens[b], seq_lens[b] + D)``.
+    SGLang accepts drafts from the step's logits, then moves the accepted
+    tokens' KV bytes to the front of that window itself, through the
+    ``KVLayout``; rejected slots are freed or overwritten later.
+    """
+
+    num_draft_tokens: int
+
+    def __post_init__(self) -> None:
+        if self.num_draft_tokens < 1:
+            raise ValueError(
+                f"SpecInputs needs num_draft_tokens >= 1, got {self.num_draft_tokens}"
+            )
+
+
 class KVTables(msgspec.Struct, frozen=True, kw_only=True):
     """Physical KV slots, as SGLang allocated and translated them."""
 
@@ -620,6 +667,8 @@ class KVTables(msgspec.Struct, frozen=True, kw_only=True):
 class LogitRows(str, Enum):
     # One row per request, for its last input row; request b is row b.
     LAST = "last"
+    # One row per input row (verify steps: every draft token).
+    ALL = "all"
     # No logits (idle steps, and every pipeline stage but the last).
     NONE = "none"
 
@@ -680,9 +729,8 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     """One forward step, as SGLang scheduled it.
 
     Tensors are views of what SGLang built for the step; a runner must not
-    modify them. Fields of later blocks (input embeddings, masks, adapters,
-    multimodal items, speculative and parallel inputs) are not part of this
-    version.
+    modify them. Fields of later blocks (input embeddings, adapters,
+    multimodal items) are not part of this version.
 
     With overlap scheduling, ``plan`` runs while the device still executes
     the previous step: host fields (shapes, ``*_cpu`` copies) are final then,
@@ -709,6 +757,10 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     # Every pipeline stage but the first: what the previous stage's pp_out
     # held, received by SGLang. None on the first stage.
     pp_in: Optional[dict[str, torch.Tensor]] = None
+    # VERIFY steps: the draft tree's attention mask, and the draft layout.
+    # ``rows.seq_lens`` are then the committed lengths, before the drafts.
+    mask: Optional[TreeMask] = None
+    spec: Optional[SpecInputs] = None
 
     def __post_init__(self) -> None:
         num_tokens = self.input_ids.shape[0]
@@ -738,6 +790,17 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
                 f"a {self.mode.value} step has one input row per request, got "
                 f"{num_tokens} rows for {self.rows.batch_size} requests"
             )
+        if (self.mode is StepMode.VERIFY) != (self.spec is not None) or (
+            self.mask is not None and self.spec is None
+        ):
+            raise ValueError("speculative inputs and a tree mask go with verify steps")
+        if self.spec is not None:
+            drafts = self.spec.num_draft_tokens
+            if has_queries or num_tokens != self.rows.batch_size * drafts:
+                raise ValueError(
+                    f"a verify step has {drafts} input rows per request, got "
+                    f"{num_tokens} rows for {self.rows.batch_size} requests"
+                )
         if self.graph.bucket is not None:
             rows = (
                 self.rows.batch_size

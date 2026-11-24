@@ -26,12 +26,53 @@ if TYPE_CHECKING:
     from sglang.srt.model_runner_plugins.api import GraphChoice, KVTables
 
 
+def _slot_row_pool(pool):
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    if isinstance(pool, MHATokenToKVPool) and not pool.use_hnd:
+        return pool
+    return None
+
+
+class AcceptTrace:
+    """Speculative acceptance per verify, beside the step trace: one JSON line
+    per accept (``accepts-<pid>.jsonl``), on the direct and the step path."""
+
+    def __init__(self, *, directory: str):
+        self._path = os.path.join(directory, f"accepts-{os.getpid()}.jsonl")
+        self._count = 0
+
+    def record_accept(self, batch, accept) -> None:
+        """``accept``: the tokens, accept lengths and accept indices (with the
+        bonus token) SGLang took from one verify of ``batch``. Syncs the host."""
+        record = {
+            "index": self._count,
+            "rids": [req.rid for req in batch.reqs],
+            "seq_lens": batch.seq_lens.tolist(),
+            "accept_lens": accept.accept_lens.tolist(),
+            "accept_index": accept.accept_index.tolist(),
+            "predict": accept.tokens.tolist(),
+        }
+        self._count += 1
+        with open(self._path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+
+# The process's accept trace: None unless the step trace is on. Speculative
+# workers check it after each accept.
+ACCEPT_TRACE: Optional[AcceptTrace] = None
+
+
 class StepTrace:
     @classmethod
     def maybe_create(cls) -> Optional[StepTrace]:
+        global ACCEPT_TRACE
         directory = envs.SGLANG_MODEL_RUNNER_STEP_TRACE_DIR.get()
         if directory is None:
             return None
+        if ACCEPT_TRACE is None:
+            os.makedirs(directory, exist_ok=True)
+            ACCEPT_TRACE = AcceptTrace(directory=directory)
         return cls(
             directory=directory,
             save_logits=envs.SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS.get(),
@@ -80,6 +121,7 @@ class StepTrace:
         replayed_graph: bool,
         graph: Optional[GraphChoice] = None,
         kv: Optional[KVTables] = None,
+        model_runner=None,
     ) -> None:
         host_seconds = time.perf_counter() - tic
         # A pipeline stage before the last hands the next stage proxy tensors.
@@ -134,7 +176,7 @@ class StepTrace:
             **_sub_pool_summary(kv),
             # Step path, with saved tensors: per request with a cached prefix
             # on an extend step, a CRC of that prefix's K and V bytes.
-            "prefix_kv_crc": self._prefix_kv_crcs(forward_batch, kv),
+            "prefix_kv_crc": self._prefix_kv_crcs(forward_batch, kv, model_runner),
         }
         with open(f"{self._prefix}.jsonl", "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -157,23 +199,26 @@ class StepTrace:
         self._count += 1
 
     def _prefix_kv_crcs(
-        self, forward_batch: ForwardBatch, kv: Optional[KVTables]
+        self, forward_batch: ForwardBatch, kv: Optional[KVTables], model_runner
     ) -> Optional[list[int]]:
         prefix_lens = forward_batch.extend_prefix_lens_cpu
-        if (
-            not self._save_logits
-            or kv is None
-            or self._kv_pool is None
-            or not prefix_lens
-            or not any(prefix_lens)
-        ):
+        if not self._save_logits or not prefix_lens or not any(prefix_lens):
             return None
-        pool = self._kv_pool
+        # The direct path reads the worker's own pool and page table.
+        if kv is not None:
+            pool, page_table = self._kv_pool, kv.page_table
+        elif model_runner is not None:
+            pool = _slot_row_pool(model_runner.token_to_kv_pool)
+            page_table = model_runner.req_to_token_pool.req_to_token
+        else:
+            pool = None
+        if pool is None:
+            return None
         crcs = []
         for row, prefix in zip(forward_batch.req_pool_indices.tolist(), prefix_lens):
             if not prefix:
                 continue
-            slots = kv.page_table[row, :prefix].long()
+            slots = page_table[row, :prefix].long()
             crc = 0
             for buffer in (*pool.k_buffer, *pool.v_buffer):
                 rows = buffer[slots].contiguous().view(torch.uint8)

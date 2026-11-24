@@ -22,6 +22,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_runner_plugins import step_trace
 from sglang.srt.runtime_context import mamba_track_grid
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.runtime import watermark_view_fields
@@ -301,11 +302,14 @@ def accept_draft_tree(
                 sparse_bonus_argmax=sparse_bonus_argmax,
             )
         )
-        return VerifyAccept(
+        accept = VerifyAccept(
             tokens=post_verify_output.token_ids,
             accept_lens=post_verify_output.accepted_lengths,
             accept_index=post_verify_output.accepted_indices,
         )
+        if step_trace.ACCEPT_TRACE is not None:
+            step_trace.ACCEPT_TRACE.record_accept(batch, accept)
+        return accept
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
         batch,
@@ -317,9 +321,13 @@ def accept_draft_tree(
         sparse_bonus_argmax=sparse_bonus_argmax,
         has_custom_logit_processor=has_custom_logit_processor,
     )
-    return VerifyAccept(
+    accept = VerifyAccept(
         tokens=predict, accept_lens=accept_lens, accept_index=accept_index
     )
+    if step_trace.ACCEPT_TRACE is not None:
+        # Test hook (SGLANG_MODEL_RUNNER_STEP_TRACE_DIR): what this verify accepted.
+        step_trace.ACCEPT_TRACE.record_accept(batch, accept)
+    return accept
 
 
 if TYPE_CHECKING:
@@ -976,6 +984,14 @@ def run_eagle_verify(
     )
     if post is not None:
         predict, accept_lens, accept_index, new_seq_lens, bonus_tokens = post[:5]
+        if step_trace.ACCEPT_TRACE is not None:
+            # Accepted inside the post-verify graph.
+            step_trace.ACCEPT_TRACE.record_accept(
+                batch,
+                VerifyAccept(
+                    tokens=predict, accept_lens=accept_lens, accept_index=accept_index
+                ),
+            )
         if (c := target_worker.model_runner.canary_manager) is not None:
             c.on_verify_accept(
                 logits_output=logits_output,

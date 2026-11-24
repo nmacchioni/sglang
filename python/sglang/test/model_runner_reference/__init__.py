@@ -66,3 +66,15 @@ def read_step_trace(directory: str) -> list[dict]:
                 record["tensors"] = torch.load(saved)
             records.append(record)
     return records
+
+
+def read_accept_trace(directory: str) -> list[dict]:
+    """The speculative accepts the step trace collected beside its steps
+    (``accepts-<pid>.jsonl``), each tagged with its ``source`` file."""
+    records = []
+    for path in sorted(glob.glob(os.path.join(directory, "accepts-*.jsonl"))):
+        for line in Path(path).read_text().splitlines():
+            record = json.loads(line)
+            record["source"] = os.path.basename(path)
+            records.append(record)
+    return records

@@ -26,10 +26,13 @@ from sglang.srt.model_runner_plugins.api import (
     OutputSpec,
     PromptLogprobs,
     Rows,
+    SpecInputs,
     StateTables,
     Step,
     StepMode,
     StepOutput,
+    TreeMask,
+    TreeMaskLayout,
     WindowTables,
 )
 
@@ -43,6 +46,7 @@ _STEP_MODES = {
     ForwardMode.DECODE: StepMode.DECODE,
     ForwardMode.MIXED: StepMode.MIXED,
     ForwardMode.IDLE: StepMode.IDLE,
+    ForwardMode.TARGET_VERIFY: StepMode.VERIFY,
 }
 
 
@@ -50,6 +54,10 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
     """Why ``forward_batch`` cannot run as a ``Step`` yet; None when it can."""
     if forward_batch.forward_mode not in _STEP_MODES:
         return f"forward mode {forward_batch.forward_mode.name}"
+    if forward_batch.forward_mode.is_target_verify():
+        refusal = _verify_refusal(forward_batch)
+        if refusal is not None:
+            return refusal
     if forward_batch.capture_hidden_mode != CaptureHiddenMode.NULL:
         return "hidden-state capture"
     if (
@@ -82,6 +90,30 @@ def step_refusal(forward_batch: ForwardBatch) -> Optional[str]:
         # then decides its own prefill graph after padding to its own count.
         # The inputs are the rendezvous's, so every rank falls back alike.
         return "a prefill graph step under DP attention without a shared bucket"
+    return None
+
+
+def _verify_refusal(forward_batch: ForwardBatch) -> Optional[str]:
+    """Why a target-verify batch is not a VERIFY step; None when it is."""
+    spec_info = forward_batch.spec_info
+    if forward_batch.ragged_verify_layout is not None:
+        return "a ragged verify (draft counts per request)"
+    if spec_info is None or getattr(spec_info, "num_tokens_per_req", -1) < 1:
+        return "a verify without a uniform draft count"
+    if tree_mask_layout(spec_info) is None:
+        return "a verify tree mask in no TreeMaskLayout"
+    return None
+
+
+def tree_mask_layout(spec_info) -> Optional[TreeMaskLayout]:
+    """The layout of ``spec_info.custom_mask``; None when no layout describes it."""
+    from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+    if spec_info.custom_mask is None:
+        return None
+    if isinstance(spec_info, NgramVerifyInput):
+        # The n-gram worker always builds a full mask on GPU (USE_FULL_MASK).
+        return TreeMaskLayout.FULL
     return None
 
 
@@ -139,6 +171,7 @@ def step_mode(forward_batch: ForwardBatch) -> StepMode:
 def reads_prompt_logprobs(forward_batch: ForwardBatch) -> bool:
     return (
         forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
         and forward_batch.return_logprob
         and extend_reads_input_logprobs(forward_batch)
     )
@@ -161,6 +194,13 @@ def build_step(
     published at the MLP-sync rendezvous, before any collective runs."""
     mode = _STEP_MODES[forward_batch.forward_mode]
     extend = mode in (StepMode.EXTEND, StepMode.MIXED)
+    mask = spec = None
+    if mode is StepMode.VERIFY:
+        spec_info = forward_batch.spec_info
+        mask = TreeMask(
+            tensor=spec_info.custom_mask, layout=tree_mask_layout(spec_info)
+        )
+        spec = SpecInputs(num_draft_tokens=spec_info.num_tokens_per_req)
     return Step(
         mode=mode,
         input_ids=forward_batch.input_ids,
@@ -183,9 +223,11 @@ def build_step(
         ),
         outputs=OutputSpec(
             logit_rows=(
-                LogitRows.LAST
-                if last_stage and mode is not StepMode.IDLE
-                else LogitRows.NONE
+                LogitRows.NONE
+                if not last_stage or mode is StepMode.IDLE
+                else LogitRows.ALL
+                if mode is StepMode.VERIFY
+                else LogitRows.LAST
             ),
             prompt_logprobs=last_stage and reads_prompt_logprobs(forward_batch),
             pp_out=not last_stage,
@@ -194,6 +236,8 @@ def build_step(
         inputs_ready=inputs_ready,
         dp=dp_info(forward_batch),
         pp_in=pp_in,
+        mask=mask,
+        spec=spec,
     )
 
 

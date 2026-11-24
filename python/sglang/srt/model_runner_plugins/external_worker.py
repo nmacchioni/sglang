@@ -33,6 +33,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -96,6 +97,11 @@ class _NoModel:
     @staticmethod
     def forward():
         raise RuntimeError("The model runner plugin owns the model")
+
+    @staticmethod
+    def modules():
+        # Speculative workers look for logits processors to configure.
+        return ()
 
 
 class PluginOwnedModelRunner(ModelRunner):
@@ -194,11 +200,16 @@ class PluginOwnedModelRunner(ModelRunner):
         )
 
     def _kv_pool(self, layout):
-        """A byte view of the runner's KV, for host copies and transfers; a
-        stand-in that holds no bytes when the layout is not viewable."""
+        """A byte view of the runner's KV, for host copies, transfers and the
+        moves of accepted drafts; a stand-in that holds no bytes when the
+        layout is not viewable."""
         refusal = kv_view_refusal(layout)
         if refusal is None:
-            return PluginKVView(layout=layout, device=self.device)
+            return PluginKVView(
+                layout=layout,
+                device=self.device,
+                move_slots=get_spec().speculative_algorithm is not None,
+            )
         for in_use, feature, flag in (
             (
                 get_memory().enable_hierarchical_cache,
@@ -209,6 +220,12 @@ class PluginOwnedModelRunner(ModelRunner):
                 get_disagg().disaggregation_mode != "null",
                 "PD disaggregation",
                 "serve without --disaggregation-mode",
+            ),
+            (
+                # SGLang moves accepted drafts' KV bytes after each verify.
+                get_spec().speculative_algorithm is not None,
+                "speculative decoding",
+                "serve without --speculative-algorithm",
             ),
         ):
             if in_use:

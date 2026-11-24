@@ -45,6 +45,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+# Speculative algorithms whose forwards run through the API. The target's verify
+# steps are VERIFY Steps; n-gram drafts on the host, with no draft model.
+STEP_SPECULATIVE_ALGORITHMS = frozenset({"NGRAM"})
+
+
 class NativeStepLowering:
     """Hands ``plan`` the ``ForwardBatch`` of the step being planned."""
 
@@ -109,6 +114,9 @@ def native_step_refusals(
     the two-batch-overlap split) and ``pp_in`` carry. EPLB rebalances inside
     the native forward, on the same forward count on every rank as today.
 
+    Speculative decoding runs through the API for the algorithms in
+    ``STEP_SPECULATIVE_ALGORITHMS``; the others keep the direct path.
+
     Elastic EP keeps the direct path: on a rank fault the forward rebalances
     and runs again, and scale-up rewrites the DP layout and recaptures graphs,
     decisions taken inside the forward rather than at SGLang's rendezvous.
@@ -127,8 +135,9 @@ def native_step_refusals(
         # Host copies then run on a worker thread, unordered with the streams
         # a release event could be recorded on.
         reasons.append("overlap scheduling with asynchronous host copies")
-    if get_spec().speculative_algorithm is not None:
-        reasons.append("speculative decoding")
+    algorithm = get_spec().speculative_algorithm
+    if algorithm is not None and algorithm.upper() not in STEP_SPECULATIVE_ALGORITHMS:
+        reasons.append(f"speculative decoding with {algorithm}")
     if get_lora().enable_lora:
         reasons.append("LoRA")
     features = get_exec().features

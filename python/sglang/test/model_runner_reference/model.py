@@ -22,7 +22,13 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.model_runner_plugins.api import SINGLE_RANK, RankGroup, Step, StepMode
+from sglang.srt.model_runner_plugins.api import (
+    SINGLE_RANK,
+    RankGroup,
+    Step,
+    StepMode,
+    TreeMaskLayout,
+)
 
 
 class DecoderConfig(msgspec.Struct, frozen=True, kw_only=True):
@@ -189,11 +195,12 @@ class DenseDecoder:
         x = self.embed(step.input_ids)
         cos, sin = self.rope(step.positions)
         spans = request_spans(step)
+        masks = tree_masks(step, spans)
         for layer in range(self.config.num_layers):
             q = self.pre_attention(
                 x, layer=layer, cos=cos, sin=sin, write_slots=step.kv.write_slots
             )
-            attn = self.attention(q, layer=layer, step=step, spans=spans)
+            attn = self.attention(q, layer=layer, step=step, spans=spans, masks=masks)
             x = self.post_attention(x, attn, layer=layer)
         return self.final_norm(x)
 
@@ -286,8 +293,9 @@ class DenseDecoder:
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[:, None, :], emb.sin()[:, None, :]
 
-    def attention(self, q: torch.Tensor, *, layer: int, step: Step, spans):
-        """Causal attention of each request's query rows over its KV in the pool."""
+    def attention(self, q: torch.Tensor, *, layer: int, step: Step, spans, masks=None):
+        """Causal attention of each request's query rows over its KV in the
+        pool; on a verify step, under each request's draft-tree mask."""
         c = self.config
         out = torch.empty_like(q)
         groups = c.num_heads // c.num_kv_heads
@@ -296,10 +304,13 @@ class DenseDecoder:
             keys = self.kv.k[layer, slots].repeat_interleave(groups, dim=1)
             values = self.kv.v[layer, slots].repeat_interleave(groups, dim=1)
             query = q[start : start + length]
-            # Query i sits at position prefix + i and sees keys 0..prefix + i.
-            mask = torch.arange(seq_len, device=q.device)[None, :] <= (
-                prefix + torch.arange(length, device=q.device)[:, None]
-            )
+            if masks is not None:
+                mask = masks[row]
+            else:
+                # Query i sits at position prefix + i and sees keys 0..prefix + i.
+                mask = torch.arange(seq_len, device=q.device)[None, :] <= (
+                    prefix + torch.arange(length, device=q.device)[:, None]
+                )
             out[start : start + length] = F.scaled_dot_product_attention(
                 query.transpose(0, 1),
                 keys.transpose(0, 1),
@@ -317,6 +328,10 @@ def request_spans(step: Step) -> list[tuple[int, int, int, int]]:
     ).tolist()
     if step.mode in (StepMode.DECODE, StepMode.IDLE):
         return [(b, 1, n - 1, n) for b, n in enumerate(seq_lens)]
+    if step.mode is StepMode.VERIFY:
+        # seq_lens are the committed lengths; the drafts follow them.
+        d = step.spec.num_draft_tokens
+        return [(b * d, d, n, n + d) for b, n in enumerate(seq_lens)]
     spans, start = [], 0
     for length, prefix, seq_len in zip(
         rows.query_lens_cpu, rows.prefix_lens_cpu, seq_lens
@@ -324,6 +339,24 @@ def request_spans(step: Step) -> list[tuple[int, int, int, int]]:
         spans.append((start, length, prefix, seq_len))
         start += length
     return spans
+
+
+def tree_masks(step: Step, spans) -> Optional[list[torch.Tensor]]:
+    """Per request, the [D, seq_len + D] tree mask of a verify step (FULL layout)."""
+    if step.mask is None:
+        return None
+    if step.mask.layout is not TreeMaskLayout.FULL:
+        raise ValueError(
+            f"the reference runner reads full tree masks only, got {step.mask.layout.value}"
+        )
+    flat = step.mask.tensor.view(-1)
+    masks, offset = [], 0
+    for _, length, _, seq_len in spans:
+        masks.append(
+            flat[offset : offset + length * seq_len].view(length, seq_len).bool()
+        )
+        offset += length * seq_len
+    return masks
 
 
 def last_rows(step: Step) -> torch.Tensor:

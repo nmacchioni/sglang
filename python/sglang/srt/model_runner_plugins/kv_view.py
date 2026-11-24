@@ -61,7 +61,9 @@ class PluginKVView(MHATokenToKVPool):
     of ``slot_bytes`` uint8 per slot, K and V per layer, at the layout's
     addresses."""
 
-    def __init__(self, *, layout: KVLayout, device: str):
+    def __init__(self, *, layout: KVLayout, device: str, move_slots: bool = False):
+        """``move_slots``: SGLang moves slot rows within the view (accepted
+        speculative drafts), with the pool's own tiled byte copy."""
         refusal = kv_view_refusal(layout)
         if refusal is not None:
             raise ValueError(f"SGLang cannot view the runner's KV: {refusal}")
@@ -79,6 +81,7 @@ class PluginKVView(MHATokenToKVPool):
             enable_memory_saver=False,
             enable_alt_stream=False,
             kv_cache_layout="nhd",
+            enable_kv_cache_copy=move_slots,
         )
         self.model_layer_ids = tuple(layer.layer_id for layer in self._layers)
 
