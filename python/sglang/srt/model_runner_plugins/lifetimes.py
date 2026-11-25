@@ -54,20 +54,23 @@ class OutputLifetimes:
         self.deferred = deferred
         self._pending: Deque[OutputLease] = deque()
         self._count = 0
+        # Not deferred: the one output not yet released (the last step's).
+        self._last: Optional[StepOutput] = None
 
     @property
     def pending(self) -> int:
-        return len(self._pending)
+        return len(self._pending) + (self._last is not None)
 
     def step_started(self) -> None:
         """Without overlap, the previous step's consumers have all run."""
-        if not self.deferred:
-            for lease in self._pending:
-                lease.consumed = True
-            self._release_consumed()
+        last = self._last
+        if last is not None:
+            self._last = None
+            self._release(last, None)
 
     def before_execute(self) -> None:
         """No earlier output may still hold a buffer the next step overwrites."""
+        # Not deferred, step_started released every earlier output.
         for lease in self._pending:
             held = lease.out.buffers() & self._shared
             if held:
@@ -77,7 +80,13 @@ class OutputLifetimes:
                     "before the next execute() reuses its buffer"
                 )
 
-    def produced(self, out: StepOutput) -> OutputLease:
+    def produced(self, out: StepOutput) -> Optional[OutputLease]:
+        """The lease the scheduler marks consumed under overlap; None when not
+        deferred (the next step_started releases ``out``)."""
+        if not self.deferred:
+            self._count += 1
+            self._last = out
+            return None
         lease = OutputLease(out=out, index=self._count)
         self._count += 1
         self._pending.append(lease)
@@ -93,6 +102,7 @@ class OutputLifetimes:
 
     def close(self) -> None:
         """Release everything left; the caller has synchronized the device."""
+        self.step_started()
         for lease in self._pending:
             lease.consumed = True
             lease.after = None

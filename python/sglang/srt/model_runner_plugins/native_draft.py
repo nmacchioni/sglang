@@ -18,9 +18,8 @@ draft graphs, the fused top-1 chain and the draft sampling stay native.
 
 from __future__ import annotations
 
-import contextlib
 import time
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import msgspec
 
@@ -29,7 +28,6 @@ from sglang.srt.model_runner_plugins.api import (
     DraftTree,
     GraphChoice,
     GraphPhase,
-    HiddenRows,
     KVTables,
     LogitRows,
     Logits,
@@ -40,6 +38,11 @@ from sglang.srt.model_runner_plugins.api import (
     StepMode,
     StepOutput,
 )
+from sglang.srt.model_runner_plugins.native_steps import (
+    graph_choice,
+    native_graph_choice,
+)
+from sglang.srt.model_runner_plugins.steps import HIDDEN_ROWS, output_spec
 
 if TYPE_CHECKING:
     import torch
@@ -49,10 +52,11 @@ if TYPE_CHECKING:
     from sglang.srt.model_runner_plugins.step_trace import StepTrace
 
 
-class NativeDraftPlan(msgspec.Struct, frozen=True, kw_only=True):
+class NativeDraftPlan(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     # The worker's own draft code for the bound batch.
     run: Any
-    graph: GraphChoice = EAGER
+    # None: no Step was materialized (see NativeDraftSteps._unmaterialized).
+    graph: Optional[GraphChoice] = EAGER
 
 
 class SGLangDraftPlugin:
@@ -61,14 +65,22 @@ class SGLangDraftPlugin:
 
     def __init__(self):
         self._bound: Optional[tuple[Step, Callable[[], Any]]] = None
+        # The last StepOutput of a draft forward and the native output it views.
+        self._output: Optional[tuple[StepOutput, Any]] = None
 
-    @contextlib.contextmanager
-    def bind(self, *, step: Step, run: Callable[[], Any]) -> Iterator[None]:
+    def bind(self, *, step: Step, run: Callable[[], Any]) -> None:
+        """Until ``unbind``: plan() of ``step`` runs ``run``."""
         self._bound = (step, run)
-        try:
-            yield
-        finally:
-            self._bound = None
+
+    def unbind(self) -> None:
+        self._bound = None
+
+    def native_output_of(self, out: StepOutput) -> Any:
+        """The native draft output ``out`` was made from, once; else None."""
+        kept, self._output = self._output, None
+        if kept is None or kept[0] is not out:
+            return None
+        return kept[1]
 
     def plan(self, step: Step) -> NativeDraftPlan:
         if self._bound is None or self._bound[0] is not step:
@@ -89,9 +101,11 @@ class SGLangDraftPlugin:
             or out.last_hidden_states is not None
         ):
             raise RuntimeError("a native draft step produced outputs StepOutput lacks")
-        return StepOutput(
+        step_output = StepOutput(
             logits=Logits(tensor=out.next_token_logits), hidden=out.hidden_states
         )
+        self._output = (step_output, out)
+        return step_output
 
     def release(self, out: StepOutput, after: Optional[Any]) -> None:
         # Draft outputs are consumed on the runner stream within the same
@@ -131,6 +145,9 @@ class NativeDraftSteps:
         """The expansion: ``run`` is the worker's native draft of the batch
         (one graph replay, or the eager loop); returns its
         ``(parents, scores, tokens, probs)``."""
+        if self._trace is None:
+            tree = self._unmaterialized(run).draft
+            return tree.parents, tree.scores, tree.tokens, tree.probs
         spec_info = forward_batch.spec_info
         step = Step(
             mode=StepMode.DRAFT,
@@ -145,7 +162,7 @@ class NativeDraftSteps:
             kv=KVTables(
                 write_slots=forward_batch.out_cache_loc, page_table=self._page_table
             ),
-            outputs=OutputSpec(logit_rows=LogitRows.NONE),
+            outputs=_DRAFT_OUTPUTS,
             graph=draft_graph_choice(graph_runner, forward_batch),
             spec=SpecInputs(
                 num_draft_tokens=self._num_draft_tokens,
@@ -172,12 +189,36 @@ class NativeDraftSteps:
         replays ``graph_runner`` (a draft-extend graph, returning only each
         request's last accepted row: ``selected_rows``) or runs
         ``model_runner.forward``, whose own graph choice the Step reports."""
+        if self._trace is None:
+            out = self._unmaterialized(run)
+        else:
+            step = self._draft_extend_step(
+                forward_batch,
+                selected_rows=selected_rows,
+                graph_runner=graph_runner,
+                model_runner=model_runner,
+            )
+            out = self._run(step, forward_batch, run)
+        # The native output itself when it is this StepOutput's source.
+        native = self._executor.native_output_of(out)
+        if native is not None:
+            return native
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-        from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
-        from sglang.srt.model_runner_plugins.native_steps import native_graph_choice
 
+        return LogitsProcessorOutput(
+            next_token_logits=out.logits.tensor, hidden_states=out.hidden
+        )
+
+    def _draft_extend_step(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        selected_rows: bool,
+        graph_runner: Optional[Any],
+        model_runner: Optional[Any],
+    ) -> Step:
         extend = forward_batch.extend_start_loc is not None
-        step = Step(
+        return Step(
             mode=StepMode.DRAFT_EXTEND,
             input_ids=forward_batch.input_ids,
             positions=forward_batch.positions,
@@ -196,17 +237,16 @@ class NativeDraftSteps:
             kv=KVTables(
                 write_slots=forward_batch.out_cache_loc, page_table=self._page_table
             ),
-            outputs=OutputSpec(
+            outputs=output_spec(
                 logit_rows=(
                     LogitRows.LAST if extend or selected_rows else LogitRows.ALL
                 ),
-                hidden=(
-                    HiddenRows.NONE
-                    if forward_batch.capture_hidden_mode == CaptureHiddenMode.NULL
-                    else HiddenRows.LAST
-                    if forward_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-                    else HiddenRows.ALL
-                ),
+                prompt_logprobs=False,
+                hidden=HIDDEN_ROWS[forward_batch.capture_hidden_mode],
+                pp_out=False,
+                pooled=False,
+                pooled_hidden=False,
+                score_rows=None,
             ),
             graph=(
                 native_graph_choice(
@@ -220,30 +260,37 @@ class NativeDraftSteps:
                 hidden=forward_batch.spec_info.hidden_states,
             ),
         )
-        out = self._run(step, forward_batch, run)
-        return LogitsProcessorOutput(
-            next_token_logits=out.logits.tensor, hidden_states=out.hidden
-        )
+
+    def _unmaterialized(self, run: Callable[[], Any]) -> StepOutput:
+        """A draft call with no step trace: its Step would be read by nothing
+        (plan() runs ``run`` on the bound batch), so it is not materialized."""
+        plan = NativeDraftPlan(run=run, graph=None)
+        out = self._executor.execute(plan)
+        self.steps_executed += 1
+        self._executor.release(out, None)
+        return out
 
     def _run(self, step: Step, forward_batch: ForwardBatch, run) -> StepOutput:
-        trace = self._trace
+        """A draft call as a materialized Step, recorded in the step trace."""
         tic = time.perf_counter()
-        with self._executor.bind(step=step, run=run):
+        self._executor.bind(step=step, run=run)
+        try:
             plan = self._executor.plan(step)
+        finally:
+            self._executor.unbind()
         execute_tic = time.perf_counter()
         out = self._executor.execute(plan)
         execute_seconds = time.perf_counter() - execute_tic
         self.steps_executed += 1
         self._executor.release(out, None)
-        if trace is not None:
-            trace.record_draft(
-                tic=tic,
-                runner=self.runner_name,
-                execute_seconds=execute_seconds,
-                step=step,
-                forward_batch=forward_batch,
-                out=out,
-            )
+        self._trace.record_draft(
+            tic=tic,
+            runner=self.runner_name,
+            execute_seconds=execute_seconds,
+            step=step,
+            forward_batch=forward_batch,
+            out=out,
+        )
         return out
 
 
@@ -256,4 +303,7 @@ def draft_graph_choice(runner, forward_batch: ForwardBatch) -> GraphChoice:
     captured = getattr(runner, "capture_bs", None)
     if captured and rows <= captured[-1] and hasattr(runner, "_pad_to_bucket"):
         rows = runner._pad_to_bucket(rows, captured)
-    return GraphChoice(phase=GraphPhase.DECODE, bucket=rows)
+    return graph_choice(GraphPhase.DECODE, rows)
+
+
+_DRAFT_OUTPUTS = OutputSpec(logit_rows=LogitRows.NONE)

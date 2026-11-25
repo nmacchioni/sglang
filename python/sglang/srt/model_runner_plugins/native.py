@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.model_executor.model_runner import ModelRunnerOutput
 
 _NATIVE_CAPABILITIES = RunnerCapabilities.all_supported(
     refused_combinations=(
@@ -96,6 +97,8 @@ class SGLangRunnerPlugin:
         # Releasing the KV ends its epoch; the resume that follows starts the next.
         self._kv_released = False
         self._epoch = 0
+        # The host's model runner, once a step has run (run_plan).
+        self._model_runner = None
 
     def describe(self, cfg: ResolvedConfig) -> RunnerCapabilities:
         return _NATIVE_CAPABILITIES
@@ -130,9 +133,35 @@ class SGLangRunnerPlugin:
             step=step, forward_batch=self.lowering.forward_batch_of(step)
         )
 
+    def plan_batch(
+        self, *, forward_batch: object, pp_proxy_tensors: Optional[object]
+    ) -> NativePlan:
+        """The plan of a batch whose Step SGLang does not materialize, since
+        nothing would read it (``plan`` reads only the batch back): the native
+        forward decides its graph, as on the direct path."""
+        return NativePlan(
+            forward_batch=forward_batch, graph=None, pp_proxy_tensors=pp_proxy_tensors
+        )
+
     def execute(self, plan: NativePlan) -> StepOutput:
         return native_execute(
-            model_runner=self._require_host().tp_worker.model_runner, plan=plan
+            model_runner=self._require_host().tp_worker.model_runner,
+            plan=plan,
+            lowering=self.lowering,
+        )
+
+    def run_plan(self, plan: NativePlan) -> ModelRunnerOutput:
+        """execute() for a step nothing reads the StepOutput of (see
+        plan_batch): the native forward's own output whole, so nothing (no
+        capture) is dropped and no StepOutput is built. Its release would be a
+        no-op, so none follows."""
+        model_runner = self._model_runner
+        if model_runner is None:
+            model_runner = self._model_runner = (
+                self._require_host().tp_worker.model_runner
+            )
+        return model_runner.forward(
+            plan.forward_batch, pp_proxy_tensors=plan.pp_proxy_tensors
         )
 
     def project(self, req: ProjectRequest) -> torch.Tensor:
@@ -178,7 +207,7 @@ class SGLangRunnerPlugin:
 
     def close(self) -> None:
         # Native workers own no teardown beyond process exit; drop the handle.
-        self._host = None
+        self._host = self._model_runner = None
 
     def _require_host(self) -> NativeStartupHost:
         if self._host is None:

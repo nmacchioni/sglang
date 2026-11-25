@@ -308,6 +308,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     num_prefilled_input_skips = 0
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
+    # (batch, can_run_graph) decided ahead of that batch's forward (decide_graph).
+    _decided_graph: Optional[tuple] = None
 
     def __init__(
         self,
@@ -977,7 +979,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.uocr_graph_io.record_tail if self.uocr_graph_io is not None else None
         )
 
+    def decide_graph(self, forward_batch: ForwardBatch) -> bool:
+        """``can_run_graph``, decided before the forward (a model runner plugin's
+        Step reports it); the forward's own check of the same batch reuses it."""
+        self._decided_graph = None
+        # A subclass's own check, when it overrides can_run_graph.
+        can_run = self.can_run_graph(forward_batch)
+        self._decided_graph = (forward_batch, can_run)
+        return can_run
+
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # A decision is kept for the next check only, and only for its own
+        # batch object: any check consumes it, so it never outlives that batch.
+        decided = self._decided_graph
+        if decided is not None:
+            self._decided_graph = None
+            if decided[0] is forward_batch:
+                return decided[1]
+        return self._check_graph(forward_batch)
+
+    def _check_graph(self, forward_batch: ForwardBatch) -> bool:
         if not megakernel_can_run_graph(self.model_runner.model, forward_batch):
             return False
         # Disable for token embedding overrides (dynamic per-request)

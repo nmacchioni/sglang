@@ -115,6 +115,33 @@ def _serve(other_args, *, save_logits, workload):
     return result, read_step_trace(trace_dir)
 
 
+def _serve_untraced(other_args, *, workload, log=False):
+    """Launch without the step trace, run ``workload``, shut down; with
+    ``log``, also return the server's output."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("SGLANG_MODEL_RUNNER_STEP_TRACE")
+    }
+    with tempfile.TemporaryFile("w+") as out:
+        process = popen_launch_server(
+            _MODEL,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=env,
+            return_stdout_stderr=(out, out) if log else None,
+        )
+        try:
+            result = workload()
+        finally:
+            terminate_and_kill_process_tree(process)
+        if not log:
+            return result
+        out.seek(0)
+        return result, out.read()
+
+
 def _unique_by_inputs(trace) -> dict:
     """Steps keyed by their inputs, without keys that repeat in the run: a
     freed partial page can put another request's token at the same position
@@ -314,6 +341,19 @@ class TestModelRunnerStepBitwise(CustomTestCase):
                 self.assertEqual(want[key].get(field), got[key].get(field), field)
         else:
             self.assertEqual(want[key], got[key])
+
+    def test_untraced_steps_serve_as_the_direct_path(self):
+        """Without the step trace the built-in runner does not materialize its
+        Steps (nothing reads them); its responses must still be the direct
+        path's, under overlap and graphs, with every step through the runner."""
+        args = _CONFIGS["overlap_graphs"]
+        direct = _serve_untraced(args, workload=self._workload)
+        steps, log = _serve_untraced(
+            [*args, "--model-runner", "sglang"], workload=self._workload, log=True
+        )
+        self.assertIn("Model runner 'sglang' runs steps through its API", log)
+        self._assert_same_responses(direct[:4], steps[:4])
+        self.assertEqual(direct[4]["text"], steps[4]["text"])
 
     def test_step_overhead_at_the_worker_boundary(self):
         """Host time per forward at TpModelWorker.forward_model, and the wall

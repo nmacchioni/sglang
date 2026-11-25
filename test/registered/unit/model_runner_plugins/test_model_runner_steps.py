@@ -238,17 +238,18 @@ class TestStepView(CustomTestCase):
         lowering = NativeStepLowering()
         batch = _extend_batch(prefix_lens=[0, 3], extend_lens=[4, 2])
         step = build_step(forward_batch=batch, page_table=_PAGE_TABLE)
-        with lowering.bind(step=step, forward_batch=batch):
-            self.assertIs(lowering.forward_batch_of(step), batch)
-            other = build_step(forward_batch=batch, page_table=_PAGE_TABLE)
-            with self.assertRaisesRegex(RuntimeError, "plans only the step"):
-                lowering.forward_batch_of(other)
+        lowering.bind(step=step, forward_batch=batch)
+        self.assertIs(lowering.forward_batch_of(step), batch)
+        other = build_step(forward_batch=batch, page_table=_PAGE_TABLE)
+        with self.assertRaisesRegex(RuntimeError, "plans only the step"):
+            lowering.forward_batch_of(other)
+        lowering.unbind()
         with self.assertRaisesRegex(RuntimeError, "plans only the step"):
             lowering.forward_batch_of(step)
         copied = _extend_batch(prefix_lens=[0, 3], extend_lens=[4, 2])
-        with lowering.bind(step=step, forward_batch=copied):
-            with self.assertRaisesRegex(RuntimeError, "does not view"):
-                lowering.forward_batch_of(step)
+        lowering.bind(step=step, forward_batch=copied)
+        with self.assertRaisesRegex(RuntimeError, "does not view"):
+            lowering.forward_batch_of(step)
 
 
 def _dp_decode_batch(*, published, votes=(True, False)):
@@ -727,10 +728,27 @@ class TestStepForward(CustomTestCase):
         )
 
     def test_a_batch_outside_the_subset_fails_for_external_runners_only(self):
+        """An installed runner's execute is not the native forward, so every
+        batch is checked against the Step subset, traced or not; only the
+        built-in runner's untraced lane skips the check (it runs the native
+        forward either way)."""
         batch = _decode_batch()
         batch.beam = object()
         with self.assertRaisesRegex(ValueError, "fake cannot run a step with beam"):
             _external_forward(_FakeExecutor()).takes(batch)
+        # Stream ordering does not make a runner the built-in one.
+        for traced, stream_ordered in ((False, False), (True, False), (False, True)):
+            external = StepForward(
+                runner_name="fake",
+                executor=_FakeExecutor(),
+                page_table=_PAGE_TABLE,
+                vocab_size=_VOCAB,
+                native_prompt_logprobs=False,
+                traced=traced,
+                stream_ordered=stream_ordered,
+            )
+            with self.assertRaisesRegex(ValueError, "fake cannot run a step with beam"):
+                external.try_forward(batch, None)
         native = StepForward(
             runner_name="sglang",
             executor=_FakeExecutor(),
@@ -755,6 +773,89 @@ class TestStepForward(CustomTestCase):
         executor.execute = lambda plan: {"logits": None}
         with self.assertRaisesRegex(TypeError, "expected StepOutput"):
             _external_forward(executor).forward(_decode_batch())
+
+
+class TestBuiltInRunnerUntraced(CustomTestCase):
+    def test_no_step_is_materialized_and_the_native_output_is_returned(self):
+        """Untraced and without DP attention, the built-in runner's plan() would
+        read only the batch back: no Step or StepOutput is built (so nothing is
+        released: its release is a no-op), and its forward's own output comes
+        back as is."""
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.model_runner import ModelRunnerOutput
+        from sglang.srt.model_runner_plugins.native import SGLangRunnerPlugin
+
+        outputs = []
+
+        def forward(forward_batch, pp_proxy_tensors=None):
+            outputs.append(
+                ModelRunnerOutput(
+                    logits_output=LogitsProcessorOutput(
+                        next_token_logits=torch.zeros(2, _VOCAB)
+                    ),
+                    can_run_graph=True,
+                )
+            )
+            return outputs[-1]
+
+        model_runner = SimpleNamespace(forward=forward)
+        plugin = SGLangRunnerPlugin(
+            host=SimpleNamespace(tp_worker=SimpleNamespace(model_runner=model_runner))
+        )
+        plugin.plan = lambda step: self.fail("a Step was materialized")
+        released = []
+        plugin.release = lambda out, after: released.append(out)
+        plugin.execute = lambda plan: self.fail("a StepOutput was materialized")
+        steps = StepForward(
+            runner_name="sglang",
+            executor=plugin,
+            page_table=_PAGE_TABLE,
+            vocab_size=_VOCAB,
+            native_prompt_logprobs=True,
+            overlap=True,
+            lowering=plugin.lowering,
+            direct_fallback=True,
+            stream_ordered=True,
+            builtin=True,
+        )
+        # The worker's one call (try_forward), and forward() itself.
+        self.assertIs(steps.try_forward(_decode_batch(), None), outputs[0])
+        self.assertIs(steps.forward(_decode_batch()), outputs[1])
+        # A batch outside the Step subset runs the same native forward.
+        outside = _decode_batch()
+        outside.beam = object()
+        self.assertIs(steps.try_forward(outside, None), outputs[2])
+        self.assertEqual(len(outputs), 3)
+        self.assertEqual(released, [])
+        self.assertIsNone(steps.take_lease())
+
+    def test_a_step_under_dp_attention_is_still_checked_at_the_rendezvous(self):
+        """A rank whose step disagrees with what it published must fail before
+        any collective, traced or not: under DP attention the Step is built."""
+        from sglang.srt.model_runner_plugins.native import SGLangRunnerPlugin
+
+        plugin = SGLangRunnerPlugin(
+            host=SimpleNamespace(tp_worker=SimpleNamespace(model_runner=None))
+        )
+        steps = StepForward(
+            runner_name="sglang",
+            executor=plugin,
+            page_table=_PAGE_TABLE,
+            vocab_size=_VOCAB,
+            native_prompt_logprobs=True,
+            lowering=plugin.lowering,
+            direct_fallback=True,
+            stream_ordered=True,
+            builtin=True,
+        )
+        from unittest.mock import patch
+
+        with (
+            patch("sglang.srt.layers.dp_attention.dp_gather_width", lambda: 2),
+            patch("sglang.srt.layers.dp_attention.dp_gather_slot", lambda: 1),
+            self.assertRaisesRegex(RendezvousMismatch, "published 3"),
+        ):
+            steps.forward(_dp_decode_batch(published=[2, 3]))
 
 
 def _greedy_info(**overrides):

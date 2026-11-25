@@ -77,12 +77,25 @@ class StepForward:
             Callable[[ForwardBatch], Optional[torch.Tensor]]
         ] = None,
         fused_sampling: bool = False,
+        stream_ordered: bool = False,
+        traced: bool = False,
+        builtin: bool = False,
     ):
         self.runner_name = runner_name
         self._executor = executor
         self._page_table = page_table
         self._native_prompt_logprobs = native_prompt_logprobs
-        self._overlap = overlap
+        # Under overlap scheduling, record Step.inputs_ready: not for a runner
+        # that executes on the stream SGLang wrote the inputs on (native).
+        self._record_ready = overlap and not stream_ordered
+        # Host time inside execute() and the step's fields, for the step trace.
+        self._traced = traced
+        # Native: execute() runs on the runner stream and returns the native
+        # forward's own outputs, which the lowering keeps.
+        self._stream_ordered = stream_ordered
+        # The built-in runner, untraced: steps without a rendezvous run
+        # unmaterialized, through its plan_batch/run_plan (the native forward).
+        self._unmaterialized = builtin and not traced
         self._choose_graph = choose_graph
         # Native only: the batch's own lowering, which its plan() reuses.
         self._lowering = lowering
@@ -94,7 +107,12 @@ class StepForward:
         # False on pipeline stages before the last, which return pp_out.
         self._last_stage = last_stage
         # Native only: the window and state tables beside the full-attention ones.
-        self._native_kv = native_kv
+        self._native_kv = (
+            native_kv
+            if native_kv is not None
+            and (native_kv.window_pool is not None or native_kv.state_pool is not None)
+            else None
+        )
         # External runners with HiCache: the runner stream waits for host loads
         # into the runner's KV before the step (and its inputs_ready) is built.
         self._wait_for_kv_loads = wait_for_kv_loads
@@ -123,7 +141,10 @@ class StepForward:
             # starts, with or without overlap scheduling.
             # A pooling model's outputs are copied to the host on the runner
             # stream inside the forward call, and no lease reaches the scheduler.
-            deferred=overlap and not speculative and not pooling,
+            # A stream-ordered runner (native) orders every overwrite of its
+            # outputs behind their consumers on the runner stream itself, and
+            # its release() reads no event: outputs go back at the next step.
+            deferred=overlap and not speculative and not pooling and not stream_ordered,
         )
         self._lease: Optional[OutputLease] = None
         # Host seconds of the last step inside execute(), and its graph, for
@@ -146,26 +167,66 @@ class StepForward:
             f"--model-runner {self.runner_name} cannot run a step with {refusal}"
         )
 
+    def try_forward(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> Optional[ModelRunnerOutput]:
+        """``forward`` when the batch runs through the API, in one call; None
+        when it takes the direct path (see ``takes``)."""
+        if self._unmaterialized and forward_batch.global_num_tokens_cpu is None:
+            # forward()'s unmaterialized lane, inlined. It needs no refusal
+            # check: with no Step built, a batch outside the Step subset runs
+            # the same native forward here as on the direct path.
+            executor = self._executor
+            return executor.run_plan(
+                executor.plan_batch(
+                    forward_batch=forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                )
+            )
+        refusal = step_refusal(forward_batch)
+        if refusal is not None:
+            if self._direct_fallback:
+                return None
+            raise ValueError(
+                f"--model-runner {self.runner_name} cannot run a step with {refusal}"
+            )
+        return self.forward(forward_batch, pp_proxy_tensors)
+
     def forward(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> ModelRunnerOutput:
-        from sglang.srt.model_executor.model_runner import ModelRunnerOutput
-
+        if self._unmaterialized and forward_batch.global_num_tokens_cpu is None:
+            # The built-in runner, with nothing to read its Step (no step
+            # trace) and no rendezvous to check it against (no DP attention):
+            # its plan() would read only the batch back, so neither the Step
+            # nor the StepOutput is materialized, the native forward decides
+            # the graph as on the direct path, and its own output comes back.
+            # Releasing that output would be a no-op (stream-ordered).
+            executor = self._executor
+            return executor.run_plan(
+                executor.plan_batch(
+                    forward_batch=forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                )
+            )
         self._lifetimes.step_started()
         if self._wait_for_kv_loads is not None:
             self._wait_for_kv_loads()
         step, plan = self._planned(forward_batch, pp_proxy_tensors)
         graph, owner = step.graph, step.sampling_owner
         self._lifetimes.before_execute()
-        tic = time.perf_counter()
-        out = self._executor.execute(plan)
-        self.last_execute_seconds = time.perf_counter() - tic
-        self.last_graph = graph
-        self.last_kv = step.kv
-        self.last_adapters = step.adapters
-        self.last_sampling_owner = owner
+        if self._traced:
+            tic = time.perf_counter()
+            out = self._executor.execute(plan)
+            self.last_execute_seconds = time.perf_counter() - tic
+            self.last_graph = graph
+            self.last_kv = step.kv
+            self.last_adapters = step.adapters
+            self.last_sampling_owner = owner
+        else:
+            out = self._executor.execute(plan)
         if not isinstance(out, StepOutput):
             raise TypeError(
                 f"Model runner {self.runner_name!r} execute() returned "
@@ -176,10 +237,17 @@ class StepForward:
             device = torch.get_device_module(forward_batch.input_ids.device)
             device.current_stream().wait_event(out.ready)
         lease = self._lifetimes.produced(out)
-        if self._lifetimes.deferred:
+        if lease is not None:
             self._lease = lease
+        return self._outputs(step=step, plan=plan, out=out, forward_batch=forward_batch)
+
+    def _outputs(
+        self, *, step: Step, plan: Any, out: StepOutput, forward_batch: ForwardBatch
+    ) -> ModelRunnerOutput:
+        """The scheduler's view of ``out``, after checking it against ``step``."""
+        graph, owner = step.graph, step.sampling_owner
         if not self._last_stage:
-            return ModelRunnerOutput(
+            return _model_runner_output_type()(
                 logits_output=self._pp_out(out), can_run_graph=not graph.is_eager
             )
         if owner is SamplingOwner.PLUGIN:
@@ -199,6 +267,12 @@ class StepForward:
                 f"Model runner {self.runner_name!r} returned no hidden states for "
                 f"a step that asked for them ({step.outputs.hidden.value})"
             )
+        if self._lowering is not None:
+            # The built-in runner's own forward output, when it is this
+            # StepOutput's source: zero copies, nothing rebuilt.
+            native = self._lowering.native_output_of(out)
+            if native is not None:
+                return native
         logits_output = logits_output_from_step(out, gather_vocab=self._gather_vocab)
         if step.mode is StepMode.DENOISE:
             # The diffusion algorithm reads every row's logits.
@@ -208,7 +282,7 @@ class StepForward:
             self._project_prompt_logprobs(
                 plan=plan, forward_batch=forward_batch, logits_output=logits_output
             )
-        return ModelRunnerOutput(
+        return _model_runner_output_type()(
             logits_output=logits_output, can_run_graph=not graph.is_eager
         )
 
@@ -253,8 +327,11 @@ class StepForward:
         if self._lowering is None:
             plan = self._executor.plan(step)
         else:
-            with self._lowering.bind(step=step, forward_batch=forward_batch):
+            self._lowering.bind(step=step, forward_batch=forward_batch)
+            try:
                 plan = self._executor.plan(step)
+            finally:
+                self._lowering.unbind()
         self._denoise_plan = (
             (forward_batch, step, plan) if step.mode is StepMode.DENOISE else None
         )
@@ -322,7 +399,7 @@ class StepForward:
         return full[..., : self._vocab_size].contiguous()
 
     def _record_inputs_ready(self, forward_batch: ForwardBatch) -> Optional[Any]:
-        if not self._overlap:
+        if not self._record_ready:
             return None
         # The scheduler wrote this step's inputs on the current (runner) stream.
         event = torch.get_device_module(forward_batch.input_ids.device).Event()
@@ -377,3 +454,16 @@ class DenoiseRunner:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._model_runner, name)
+
+
+def _model_runner_output_type():
+    global _MODEL_RUNNER_OUTPUT
+    if _MODEL_RUNNER_OUTPUT is None:
+        from sglang.srt.model_executor.model_runner import ModelRunnerOutput
+
+        _MODEL_RUNNER_OUTPUT = ModelRunnerOutput
+    return _MODEL_RUNNER_OUTPUT
+
+
+# Imported on first use: the model runner module imports this package.
+_MODEL_RUNNER_OUTPUT = None

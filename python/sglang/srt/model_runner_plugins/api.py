@@ -582,7 +582,9 @@ class SamplingOwner(str, Enum):
     PLUGIN = "plugin"
 
 
-class GraphChoice(msgspec.Struct, frozen=True, kw_only=True):
+# Structs built every step are gc=False: none can be part of a reference cycle,
+# and untracked objects keep per-step allocation off the cyclic collector.
+class GraphChoice(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """The graph SGLang chose for a step: replay ``phase``'s graph of ``bucket``
     rows (requests for decode, tokens for prefill), or run eager when both are
     None. Rows past the step's own are padding, whose KV writes go to the
@@ -603,7 +605,7 @@ class GraphChoice(msgspec.Struct, frozen=True, kw_only=True):
 EAGER = GraphChoice()
 
 
-class Rows(msgspec.Struct, frozen=True, kw_only=True):
+class Rows(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """Which requests a step serves and where their input rows are.
 
     Request ``b`` owns input rows ``[query_start[b], query_start[b] +
@@ -629,7 +631,7 @@ class Rows(msgspec.Struct, frozen=True, kw_only=True):
         return self.req_pool_indices.shape[0]
 
 
-class WindowTables(msgspec.Struct, frozen=True, kw_only=True):
+class WindowTables(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """The sliding-window sub-pool's slots, translated by SGLang."""
 
     # [T] device: the window slot input row t writes its K and V to.
@@ -641,7 +643,7 @@ class WindowTables(msgspec.Struct, frozen=True, kw_only=True):
     slot_map: torch.Tensor
 
 
-class StateTables(msgspec.Struct, frozen=True, kw_only=True):
+class StateTables(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """Recurrent-state slots, and the state operations SGLang scheduled for this
     step. The operations run on the runner stream before any layer reads the
     state, in this order: ``clear``, then the copies."""
@@ -666,7 +668,7 @@ class StateTables(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("state copies name sources and destinations")
 
 
-class MMItem(msgspec.Struct, frozen=True, kw_only=True):
+class MMItem(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """One image, video or audio input of a request, as SGLang's processor
     prepared it. The runner encodes it (or reads ``embeddings``) and places
     its embeddings at the request's placeholder rows."""
@@ -702,7 +704,7 @@ class TreeMaskLayout(str, Enum):
     DRAFTS_ONLY_BITPACKED = "drafts_only_bitpacked"
 
 
-class TreeMask(msgspec.Struct, frozen=True, kw_only=True):
+class TreeMask(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """The draft tree of a verify step, as SGLang built it from the drafts."""
 
     # Device, in ``layout``.
@@ -710,7 +712,7 @@ class TreeMask(msgspec.Struct, frozen=True, kw_only=True):
     layout: TreeMaskLayout = TreeMaskLayout.FULL
 
 
-class SpecInputs(msgspec.Struct, frozen=True, kw_only=True):
+class SpecInputs(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """Speculative inputs of a verify step.
 
     Request b's drafts are input rows ``[b * D, (b + 1) * D)``, D =
@@ -737,7 +739,7 @@ class SpecInputs(msgspec.Struct, frozen=True, kw_only=True):
             )
 
 
-class KVTables(msgspec.Struct, frozen=True, kw_only=True):
+class KVTables(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """Physical KV slots, as SGLang allocated and translated them."""
 
     # [T] device: the slot input row t writes its K and V to.
@@ -778,7 +780,7 @@ class ScoreRowKind(str, Enum):
     BEFORE_DELIMITER = "before_delimiter"
 
 
-class ScoreRows(msgspec.Struct, frozen=True, kw_only=True):
+class ScoreRows(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """Position scoring: the input rows of each request whose outputs are read."""
 
     kind: ScoreRowKind
@@ -786,7 +788,7 @@ class ScoreRows(msgspec.Struct, frozen=True, kw_only=True):
     rows: tuple[torch.Tensor, ...]
 
 
-class OutputSpec(msgspec.Struct, frozen=True, kw_only=True):
+class OutputSpec(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     logit_rows: LogitRows = LogitRows.LAST
     hidden: HiddenRows = HiddenRows.NONE
     # Some request reads prompt logprobs this step: from StepOutput.logprobs
@@ -807,7 +809,7 @@ class OutputSpec(msgspec.Struct, frozen=True, kw_only=True):
     score_rows: Optional[ScoreRows] = None
 
 
-class DPInfo(msgspec.Struct, frozen=True, kw_only=True):
+class DPInfo(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """What SGLang's per-step MLP-sync rendezvous decided for every DP rank.
 
     Under data-parallel attention each DP rank runs its own batch, or an idle
@@ -849,7 +851,7 @@ class DPInfo(msgspec.Struct, frozen=True, kw_only=True):
             )
 
 
-class Step(msgspec.Struct, frozen=True, kw_only=True):
+class Step(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """One forward step, as SGLang scheduled it.
 
     Tensors are views of what SGLang built for the step; a runner must not
@@ -1042,7 +1044,7 @@ class LogitsLayout(str, Enum):
     VOCAB_SHARDED = "vocab_sharded"
 
 
-class Logits(msgspec.Struct, frozen=True, kw_only=True):
+class Logits(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """Next-token logits; SGLang may modify ``tensor`` in place."""
 
     # [rows, vocab_size], or [rows, shard] when vocabulary-sharded.
@@ -1052,7 +1054,7 @@ class Logits(msgspec.Struct, frozen=True, kw_only=True):
     row_requests: Optional[torch.Tensor] = None
 
 
-class PromptLogprobs(msgspec.Struct, frozen=True, kw_only=True):
+class PromptLogprobs(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """Prompt logprobs computed by the runner, in SGLang's input-logprob layout
     (``LogitsProcessorOutput.input_*``)."""
 
@@ -1066,7 +1068,7 @@ class PromptLogprobs(msgspec.Struct, frozen=True, kw_only=True):
     copy_done: Optional[Any] = None
 
 
-class DraftTree(msgspec.Struct, frozen=True, kw_only=True):
+class DraftTree(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """A draft step's expansion, in SGLang's draft-result layout (the inputs of
     its verify-tree build): per request, the selected tokens, their parents in
     the expansion, and which scored candidates were kept."""
@@ -1078,7 +1080,7 @@ class DraftTree(msgspec.Struct, frozen=True, kw_only=True):
     probs: Optional[torch.Tensor] = None
 
 
-class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
+class StepOutput(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """What one step produced.
 
     Lifetimes: SGLang reads an output only after ``ready``; it may modify
@@ -1122,7 +1124,7 @@ class StepOutput(msgspec.Struct, frozen=True, kw_only=True):
         return frozenset(held)
 
 
-class ProjectRequest(msgspec.Struct, frozen=True, kw_only=True):
+class ProjectRequest(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     """Apply the LM head to input rows of an executed step.
 
     SGLang selects and chunks the rows as native prompt logprobs do and calls
