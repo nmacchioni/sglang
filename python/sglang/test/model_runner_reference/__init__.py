@@ -49,11 +49,13 @@ def install_reference_runner(root: str) -> dict[str, str]:
     return {"PYTHONPATH": root if not path else f"{root}{os.pathsep}{path}"}
 
 
-def with_model_runner(args) -> list[str]:
-    """``args``, with ``--model-runner direct`` unless they name a runner: the
-    built-in runner is the default, so a direct-path run must say so."""
-    args = list(args)
-    return args if "--model-runner" in args else [*args, "--model-runner", "direct"]
+def native_lane(args) -> dict[str, str]:
+    """Environment for a launch with ``args``: unless they name a runner, the
+    built-in runner's native lane, every step on its native forward with no
+    Step materialized. Step tests compare the API against that lane."""
+    if "--model-runner" in args:
+        return {}
+    return {"SGLANG_TEST_MODEL_RUNNER_NATIVE_LANE": "1"}
 
 
 def read_step_trace(directory: str) -> list[dict]:

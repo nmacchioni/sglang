@@ -2,7 +2,7 @@
 
 A rank that dies or stalls mid-step tears its peers down within a bound,
 instead of leaving them in a collective forever: the bound is the scheduler
-watchdog's, which the step path runs under like the direct path. A rank whose
+watchdog's, which the step path runs under like the native lane. A rank whose
 step does not match what it published at the per-step rendezvous refuses the
 step before entering a collective, so the server fails fast, well inside that
 bound, with the mismatch named.
@@ -19,7 +19,7 @@ import psutil
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import with_model_runner
+from sglang.test.model_runner_reference import native_lane
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -119,8 +119,8 @@ class TestRankFailure(CustomTestCase):
             _MODEL,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=with_model_runner(_ARGS),
-            env={**os.environ, **_NO_CRASH_DIAGNOSTICS},
+            other_args=_ARGS,
+            env={**os.environ, **_NO_CRASH_DIAGNOSTICS, **native_lane(_ARGS)},
         )
         try:
             pids = [p.pid for p in psutil.Process(process.pid).children(True)]
@@ -165,7 +165,7 @@ class TestRendezvousMismatch(CustomTestCase):
                     *_ARGS,
                     "--attn-dp-size",
                     "2",
-                    # Prefill graph steps under DP attention keep the direct
+                    # Prefill graph steps under DP attention keep the native
                     # path, which has no check; this fault must reach a Step.
                     "--disable-prefill-cuda-graph",
                     # The warmup request decodes; the fault must first hit a

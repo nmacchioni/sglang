@@ -486,8 +486,9 @@ class _MambaPool:
 
 class TestNativeKVDescription(CustomTestCase):
     """The built-in runner describes the pools its steps index, and keeps the
-    direct path for a pool it cannot describe rather than run a Step whose
-    KVTables leave out KV the forward reads."""
+    model's steps on its native forward, with no Step, for a pool it cannot
+    describe rather than run a Step whose KVTables leave out KV the forward
+    reads."""
 
     def _layout(self, model_runner):
         model_runner.token_to_kv_pool.page_size = 1
@@ -552,7 +553,7 @@ class TestNativeKVDescription(CustomTestCase):
         )
         self.assertEqual(state_pool.buffers[0].item_bytes, 12)
         # Quantized checkpoints, and state slots behind a remapping table, have
-        # no description: those models keep the direct path.
+        # no description: those models run on the native forward.
         state.ckpt_pool = object()
         self.assertIn("quantized checkpoints", NativeKV(runner).refusal)
         state.ckpt_pool = None
@@ -561,7 +562,7 @@ class TestNativeKVDescription(CustomTestCase):
         )
         self.assertEqual(NativeKV(runner).refusal, "remapped recurrent-state slots")
 
-    def test_an_undescribed_pool_keeps_the_direct_path(self):
+    def test_an_undescribed_pool_has_no_description(self):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
         from sglang.srt.model_runner_plugins.native_kv import NativeKV
 
@@ -605,17 +606,20 @@ class TestSchedulerWiring(CustomTestCase):
         "sglang.srt.model_runner_plugins.registry.entry_points",
         side_effect=AssertionError("runner plugins enumerated without the flag"),
     )
-    def test_omitted_flag_creates_no_lifecycle(self, _entry_points):
-        self.assertIsNone(
-            ModelRunnerStartup.maybe_create(
-                native_host=_FakeHost(), model_config=_model_config()
-            )
+    def test_omitted_flag_binds_the_builtin_runner(self, _entry_points):
+        host = _FakeHost()
+        startup = ModelRunnerStartup.create(
+            native_host=host, model_config=_model_config()
         )
+        self.assertEqual(startup.runner_name, "sglang")
+        self.assertFalse(startup.is_external)
+        startup.run(_INPUTS)
+        self.assertEqual(host.calls, list(_HOST_PHASES))
 
     def test_native_flag_binds_the_scheduler_phases(self):
         with get_context().override_server_args(model_runner="sglang"):
             host = _FakeHost()
-            startup = ModelRunnerStartup.maybe_create(
+            startup = ModelRunnerStartup.create(
                 native_host=host, model_config=_model_config()
             )
         self.assertEqual(startup.runner_name, "sglang")
@@ -653,11 +657,11 @@ class TestSchedulerWiring(CustomTestCase):
             ):
                 if external is None:
                     with self.assertRaisesRegex(TypeError, "lacks the lifecycle"):
-                        ModelRunnerStartup.maybe_create(
+                        ModelRunnerStartup.create(
                             native_host=_FakeHost(), model_config=_model_config()
                         )
                     continue
-                startup = ModelRunnerStartup.maybe_create(
+                startup = ModelRunnerStartup.create(
                     native_host=_FakeHost(), model_config=_model_config()
                 )
             self.assertTrue(startup.is_external)
@@ -676,9 +680,30 @@ class TestSchedulerWiring(CustomTestCase):
         self.assertEqual(inputs.capacity.max_total_tokens, 12345)
         self.assertEqual(inputs.capacity.max_running_requests, 17)
 
-    def test_worker_info_matches_on_both_paths(self):
-        direct = _stub_scheduler(startup=None)
-        direct.init_worker_info()
+    def test_worker_info_matches_the_native_worker_info(self):
+        (
+            max_total_num_tokens,
+            max_prefill_tokens,
+            max_running_requests,
+            max_queued_requests,
+            max_req_len,
+            max_req_input_len,
+            random_seed,
+            device,
+            forward_stream,
+            *_,
+        ) = _stub_scheduler(startup=None).tp_worker.get_worker_info()
+        native = SimpleNamespace(
+            max_total_num_tokens=max_total_num_tokens,
+            max_prefill_tokens=max_prefill_tokens,
+            max_running_requests=max_running_requests,
+            max_queued_requests=max_queued_requests,
+            max_req_len=max_req_len,
+            max_req_input_len=max_req_input_len,
+            random_seed=random_seed,
+            device=device,
+            forward_stream=forward_stream,
+        )
 
         startup, _ = _native_startup(_FakeHost())
         startup.run(_INPUTS)
@@ -689,9 +714,9 @@ class TestSchedulerWiring(CustomTestCase):
 
         for field in _WORKER_INFO_FIELDS:
             with self.subTest(field=field):
-                self.assertEqual(getattr(via_plugin, field), getattr(direct, field))
+                self.assertEqual(getattr(via_plugin, field), getattr(native, field))
 
-    def test_close_model_runner_is_a_no_op_without_the_flag(self):
+    def test_close_model_runner_is_a_no_op_before_startup(self):
         _stub_scheduler(startup=None).close_model_runner()
         plugin = _FakePlugin()
         startup = ModelRunnerStartup(runner_name="fake", plugin=plugin)

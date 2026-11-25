@@ -1,6 +1,6 @@
 """Speculative decoding through the model runner API (TP1).
 
-Each configuration runs the same pre-tokenized workload direct, direct again
+Each configuration runs the same pre-tokenized workload native, native again
 (to show the configuration repeats) and through --model-runner sglang, and
 requires: identical outputs; identical accepts per verify (accept lengths,
 accept indices and the sampled tokens they select); raw logits bitwise equal
@@ -36,9 +36,9 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.model_runner_reference import (
     REFERENCE_RUNNER,
     install_reference_runner,
+    native_lane,
     read_accept_trace,
     read_step_trace,
-    with_model_runner,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -62,7 +62,7 @@ _OVERLAP_GRAPHS = ["--cuda-graph-max-bs-decode", "4"]
 _NGRAM = ["--speculative-algorithm", "NGRAM", "--speculative-num-draft-tokens", "8"]
 # A chain of 3 drafts (4 verified tokens), and a tree of 6 nodes from top-2
 # expansion; the tree runs on the Triton backend, as the image's FlashInfer
-# cannot plan this tree verify on the direct path.
+# cannot plan this tree verify on the native lane.
 _EAGLE3_HEAD = "GavinLucky/SGLang-EAGLE3-Qwen3-0.6B-SpecForge"
 _EAGLE3 = [
     "--speculative-algorithm",
@@ -112,7 +112,7 @@ _MTP_MODEL = "Qwen/Qwen3.5-0.8B"
 _MTP = ["--speculative-algorithm", "NEXTN", *_CHAIN_SHAPE, "--disable-multimodal"]
 # DSpark, native-only: blocks of 7 drafts (8 verified tokens) from a DSpark
 # head, with the accept fused into SGLang's verify; on Triton, as the image's
-# FlashInfer cannot plan this verify on the direct path.
+# FlashInfer cannot plan this verify on the native lane.
 _DSPARK_TARGET = "Qwen/Qwen3-4B-FP8"
 _DSPARK = [
     "--trust-remote-code",
@@ -204,12 +204,13 @@ def _serve(model, other_args, workload, env=None):
         model,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner(other_args),
+        other_args=other_args,
         env={
             **os.environ,
             **(env or {}),
             "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+            **native_lane(other_args),
         },
     )
     try:
@@ -369,15 +370,15 @@ class _SpeculativeCase(CustomTestCase):
     def _check_config(self, name, *, num_draft_tokens=8):
         model, args, sampling = _CONFIGS[name]
         workload = self._workload(model, sampling)
-        direct = _serve(model, args, workload)
+        native = _serve(model, args, workload)
         again = _serve(model, args, workload)
         steps = _serve(model, [*args, "--model-runner", "sglang"], workload)
 
-        self.assertEqual({r["path"] for r in direct[1] + again[1]}, {"direct"})
+        self.assertEqual({r["path"] for r in native[1] + again[1]}, {"native"})
         self.assertEqual({r["path"] for r in steps[1]}, {"step"})
         exact = not sampling
-        self._check_repeats(f"{name} direct/direct", direct, again, exact=exact)
-        modes = self._check_repeats(f"{name} direct/steps", direct, steps, exact=exact)
+        self._check_repeats(f"{name} native/native", native, again, exact=exact)
+        modes = self._check_repeats(f"{name} native/steps", native, steps, exact=exact)
         accepts = (
             _accepts_from_steps(steps[1], num_draft_tokens)
             if name in _ACCEPT_FROM_STEPS
@@ -394,7 +395,7 @@ class _SpeculativeCase(CustomTestCase):
             f"[{name}] steps matched bitwise per mode {dict(modes)}; "
             f"{len(accepts)} verifies, accept lengths {dict(sorted(lens.items()))}"
         )
-        return direct, steps
+        return native, steps
 
 
 class TestNgramSteps(_SpeculativeCase):

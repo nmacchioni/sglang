@@ -6,13 +6,13 @@ model runner API, for the built-in runner (2 GPUs).
   shows long extend steps CP-sharded on the step path.
 - Expert parallelism: Qwen3-30B-A3B at TP=2 with EP=2, with graphs; and with
   EPLB rebalancing every few forwards, where the trace shows the expert
-  placement change mid-run on the step path, at the same forward as direct.
+  placement change mid-run on the step path, at the same forward as native.
 - Two-batch overlap: Qwen3-30B-A3B-FP8 at TP=2 with EP=2 (DeepEP), where the
   trace shows steps split into two micro-batches.
 
-Each configuration runs direct, direct again, and through the API; steps are
+Each configuration runs native, native again, and through the API; steps are
 matched by their inputs (batch composition can depend on request arrival),
-and a configuration's matched steps are compared bitwise only once the direct
+and a configuration's matched steps are compared bitwise only once the native
 path repeats bitwise against itself. Responses must be identical throughout.
 """
 
@@ -27,7 +27,7 @@ import torch
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace, with_model_runner
+from sglang.test.model_runner_reference import native_lane, read_step_trace
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -58,7 +58,7 @@ _CP = [
 _EP = [*_COMMON, "--ep-size", "2", "--mem-fraction-static", "0.7"]
 # Two micro-batches per step, experts dispatched by DeepEP (normal mode, which
 # captures no graphs). Attention stays TP: under DP attention an idle rank
-# beside a peer whose batch splits fails on the direct path in DeepEP's
+# beside a peer whose batch splits fails on the native lane in DeepEP's
 # dispatch (the idle rank's empty micro-batches), whatever the runner.
 _TBO = [
     *_COMMON,
@@ -126,11 +126,12 @@ def _serve(model, other_args, *, workload):
         model,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner(other_args),
+        other_args=other_args,
         env={
             **os.environ,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+            **native_lane(other_args),
         },
     )
     try:
@@ -193,16 +194,16 @@ class _Compare:
         return matched, equal
 
     def _check(self, name, args, workload):
-        """Direct, direct again, then the API; returns the API run's trace."""
+        """Native, native again, then the API; returns the API run's trace."""
         runs = [
             _serve(self.model, run_args, workload=workload)
             for run_args in (args, args, [*args, "--model-runner", "sglang"])
         ]
-        (direct_out, direct), (again_out, again), (steps_out, steps) = runs
+        (native_out, native), (again_out, again), (steps_out, steps) = runs
         self.assertEqual(set(steps), {0, 1})
         for rank in (0, 1):
-            self.assertEqual({r["path"] for r in direct[rank]}, {"direct"})
-            self.assertEqual({r["path"] for r in again[rank]}, {"direct"})
+            self.assertEqual({r["path"] for r in native[rank]}, {"native"})
+            self.assertEqual({r["path"] for r in again[rank]}, {"native"})
             self.assertEqual(
                 {(r["path"], r["runner"]) for r in steps[rank]}, {("step", "sglang")}
             )
@@ -210,20 +211,20 @@ class _Compare:
                 self.assertEqual(r["step_graph"] is not None, r["replayed_graph"], r)
         counts = {
             rank: (
-                self._matched(direct[rank], again[rank]),
-                self._matched(direct[rank], steps[rank]),
+                self._matched(native[rank], again[rank]),
+                self._matched(native[rank], steps[rank]),
             )
             for rank in (0, 1)
         }
         print(f"[{name}] (matched, bitwise) per rank (repeat, steps): {counts}")
         for rank, (repeat, through_api) in counts.items():
             self.assertGreater(through_api[0], 0, rank)
-            # Bitwise wherever the direct path repeats bitwise.
+            # Bitwise wherever the native lane repeats bitwise.
             if repeat[0] == repeat[1]:
                 self.assertEqual(through_api[1], through_api[0], (rank, counts))
-        self.assertEqual(_ids(again_out), _ids(direct_out))
-        self.assertEqual(_ids(steps_out), _ids(direct_out))
-        return direct, steps
+        self.assertEqual(_ids(again_out), _ids(native_out))
+        self.assertEqual(_ids(steps_out), _ids(native_out))
+        return native, steps
 
 
 class TestContextParallel(_Compare, CustomTestCase):
@@ -295,7 +296,7 @@ class TestExpertParallel(_Compare, CustomTestCase):
 
     def test_eplb_rebalances_on_the_step_path(self):
         """EPLB counts forwards and rebalances inside the native forward: on the
-        step path the placement changes at the same forward as on the direct
+        step path the placement changes at the same forward as on the native
         path, and the logits after it still match."""
         args = [
             *_EP,
@@ -309,7 +310,7 @@ class TestExpertParallel(_Compare, CustomTestCase):
             "--moe-runner-backend",
             "triton",
         ]
-        direct, steps = self._check("ep2 eplb", args, self.workload)
+        native, steps = self._check("ep2 eplb", args, self.workload)
         for rank in (0, 1):
             changes = [
                 (r["index"], r["expert_layout"])
@@ -317,12 +318,12 @@ class TestExpertParallel(_Compare, CustomTestCase):
                 if r["expert_layout"] != prev["expert_layout"]
             ]
             self.assertTrue(changes, f"no rebalance on rank {rank}")
-            direct_changes = [
+            native_changes = [
                 (r["index"], r["expert_layout"])
-                for prev, r in zip(direct[rank], direct[rank][1:])
+                for prev, r in zip(native[rank], native[rank][1:])
                 if r["expert_layout"] != prev["expert_layout"]
             ]
-            self.assertEqual(changes, direct_changes)
+            self.assertEqual(changes, native_changes)
 
 
 class TestTwoBatchOverlap(_Compare, CustomTestCase):

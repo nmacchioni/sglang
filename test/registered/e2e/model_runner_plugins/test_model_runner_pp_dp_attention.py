@@ -7,9 +7,9 @@ collectives; the graph decision is the one SGLang's MLP-sync gather voted, so
 one rank's oversized batch sends every rank eager on that step, and an extend
 step with prefill graphs pads every rank to one shared bucket.
 
-Both are compared with the direct path step by step, matched by their inputs
+Both are compared with the native lane step by step, matched by their inputs
 (batch composition under DP depends on request arrival), each configuration
-first direct against direct: matched steps' logits and stage outputs must be
+first native against native: matched steps' logits and stage outputs must be
 bitwise equal, and responses of the deterministic phases identical.
 """
 
@@ -25,7 +25,7 @@ import torch
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace, with_model_runner
+from sglang.test.model_runner_reference import native_lane, read_step_trace
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -72,11 +72,12 @@ def _serve(other_args, *, workload):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner(other_args),
+        other_args=other_args,
         env={
             **os.environ,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+            **native_lane(other_args),
         },
     )
     try:
@@ -138,9 +139,9 @@ class _Compare:
             matched += 1
         return matched
 
-    def _check_paths(self, direct, steps, key):
-        for rank, records in _by(direct, key).items():
-            self.assertEqual({r["path"] for r in records}, {"direct"}, rank)
+    def _check_paths(self, native, steps, key):
+        for rank, records in _by(native, key).items():
+            self.assertEqual({r["path"] for r in records}, {"native"}, rank)
         by_rank = _by(steps, key)
         self.assertEqual(set(by_rank), {0, 1})
         for rank, records in by_rank.items():
@@ -158,18 +159,18 @@ class _Compare:
         ]
 
     def _compare(self, name, key, runs):
-        (direct_out, direct), (again_out, again), (steps_out, steps) = runs
+        (native_out, native), (again_out, again), (steps_out, steps) = runs
         counts = {}
         for rank in (0, 1):
-            d = [r for r in direct if r[key] == rank]
+            d = [r for r in native if r[key] == rank]
             counts[rank] = (
                 self._matched_bitwise(d, [r for r in again if r[key] == rank]),
                 self._matched_bitwise(d, [r for r in steps if r[key] == rank]),
             )
             self.assertGreater(counts[rank][1], 0, rank)
         print(f"[{name}] matched bitwise steps per rank (repeat, steps): {counts}")
-        self.assertEqual(_ids(again_out), _ids(direct_out))
-        self.assertEqual(_ids(steps_out), _ids(direct_out))
+        self.assertEqual(_ids(again_out), _ids(native_out))
+        self.assertEqual(_ids(steps_out), _ids(native_out))
 
 
 def _ids(outputs):
@@ -259,7 +260,7 @@ class TestDPAttention(_Compare, CustomTestCase):
         by_rank = self._check_paths(runs[0][1], runs[2][1], "attn_dp_rank")
         ranks = (by_rank[0], by_rank[1])
         # Lockstep: every step runs on both DP ranks, with one graph decision
-        # and, where a step falls back to the direct path, on every rank.
+        # and, where a step falls back to the native lane, on every rank.
         self.assertEqual(len(ranks[0]), len(ranks[1]))
         for a, b in zip(*ranks):
             self.assertEqual(a["global_num_tokens"], b["global_num_tokens"])

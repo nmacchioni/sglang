@@ -66,7 +66,7 @@ class StepForward:
         shared_outputs: tuple[OutputBuffer, ...] = (),
         choose_graph: Optional[Callable[[ForwardBatch], GraphChoice]] = None,
         lowering: Optional[NativeStepLowering] = None,
-        direct_fallback: bool = False,
+        native_only: bool = False,
         tp_group: Optional[Any] = None,
         last_stage: bool = True,
         native_kv: Optional[NativeKV] = None,
@@ -96,11 +96,16 @@ class StepForward:
         # The built-in runner, untraced: steps without a rendezvous run
         # unmaterialized, through its plan_batch/run_plan (the native forward).
         self._unmaterialized = builtin and not traced
+        # The built-in runner runs batches the Step does not describe on its
+        # native forward; an external runner is refused them.
+        self._builtin = builtin
+        # The built-in runner, in a configuration the Step does not describe
+        # (native_step_refusals, the tests' native lane among them): every
+        # step on its native forward, none materialized.
+        self._native_always = builtin and native_only
         self._choose_graph = choose_graph
         # Native only: the batch's own lowering, which its plan() reuses.
         self._lowering = lowering
-        # Native only: batches outside the Step subset take the direct path.
-        self._direct_fallback = direct_fallback
         self._vocab_size = vocab_size
         # SGLang's TP GroupCoordinator, when the runner spans several ranks.
         self._tp_group = tp_group
@@ -155,56 +160,37 @@ class StepForward:
         self.last_kv: Optional[KVTables] = None
         self.last_adapters: Optional[torch.Tensor] = None
 
-    def takes(self, forward_batch: ForwardBatch) -> bool:
-        """Whether ``forward_batch`` runs through the API; False leaves it to
-        the direct path, which only the built-in runner has."""
+    def materializes(self, forward_batch: ForwardBatch) -> bool:
+        """Whether ``forward`` builds a ``Step`` for ``forward_batch``. The
+        built-in runner runs the other batches on its native forward; an
+        external runner is refused them (a launch or admission refusal missed)."""
+        if self._native_always:
+            return False
+        if self._unmaterialized and forward_batch.global_num_tokens_cpu is None:
+            return False
         refusal = step_refusal(forward_batch)
         if refusal is None:
             return True
-        if self._direct_fallback:
+        if self._builtin:
             return False
         raise ValueError(
             f"--model-runner {self.runner_name} cannot run a step with {refusal}"
         )
-
-    def try_forward(
-        self,
-        forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-    ) -> Optional[ModelRunnerOutput]:
-        """``forward`` when the batch runs through the API, in one call; None
-        when it takes the direct path (see ``takes``)."""
-        if self._unmaterialized and forward_batch.global_num_tokens_cpu is None:
-            # forward()'s unmaterialized lane, inlined. It needs no refusal
-            # check: with no Step built, a batch outside the Step subset runs
-            # the same native forward here as on the direct path.
-            executor = self._executor
-            return executor.run_plan(
-                executor.plan_batch(
-                    forward_batch=forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
-            )
-        refusal = step_refusal(forward_batch)
-        if refusal is not None:
-            if self._direct_fallback:
-                return None
-            raise ValueError(
-                f"--model-runner {self.runner_name} cannot run a step with {refusal}"
-            )
-        return self.forward(forward_batch, pp_proxy_tensors)
 
     def forward(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> ModelRunnerOutput:
-        if self._unmaterialized and forward_batch.global_num_tokens_cpu is None:
-            # The built-in runner, with nothing to read its Step (no step
-            # trace) and no rendezvous to check it against (no DP attention):
-            # its plan() would read only the batch back, so neither the Step
-            # nor the StepOutput is materialized, the native forward decides
-            # the graph as on the direct path, and its own output comes back.
-            # Releasing that output would be a no-op (stream-ordered).
+        if (
+            self._unmaterialized and forward_batch.global_num_tokens_cpu is None
+        ) or not self.materializes(forward_batch):
+            # The built-in runner's native forward, with no Step materialized:
+            # untraced without a rendezvous to check (no DP attention), its
+            # plan() would read only the batch back; otherwise a batch the Step
+            # does not describe. The native forward decides the graph itself
+            # and its own output comes back. Releasing that output would be a
+            # no-op (stream-ordered).
             executor = self._executor
             return executor.run_plan(
                 executor.plan_batch(
@@ -357,7 +343,7 @@ class StepForward:
 
     def take_lease(self) -> Optional[OutputLease]:
         """The last step's output for the scheduler to mark consumed (overlap
-        scheduling only); None when the last forward went direct."""
+        scheduling only); None when the last forward built no Step."""
         lease, self._lease = self._lease, None
         return lease
 

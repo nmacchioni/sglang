@@ -46,7 +46,12 @@ from sglang.srt.model_runner_plugins.startup import (
     StartupInputs,
     StartupPhase,
 )
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -740,6 +745,7 @@ class _SchedulerWorker:
         linear_attn_registry_result=None,
     )
     preloaded_weights_bytes = 0
+    step_trace = None
 
     def __init__(self, trace, *, post_capture_active=False):
         self._trace = trace
@@ -748,7 +754,7 @@ class _SchedulerWorker:
             forward_stream=object(),
             weight_load_mem_usage=1.0,
             # Read when the steps start running through the API.
-            model_config=SimpleNamespace(vocab_size=32000),
+            model_config=SimpleNamespace(vocab_size=32000, is_generation=True),
             req_to_token_pool=SimpleNamespace(req_to_token=None),
             decode_cuda_graph_runner=None,
             prefill_cuda_graph_runner=None,
@@ -849,7 +855,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             pp_size=pp_size,
             model_runner=model_runner,
         )
-        scheduler.model_runner_startup = ModelRunnerStartup.maybe_create(
+        scheduler.model_runner_startup = ModelRunnerStartup.create(
             native_host=scheduler, model_config=worker.model_config
         )
         schedule_stream = object()
@@ -897,19 +903,15 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
                 side_effect=lambda: trace.append("borrow_prewarm"),
             ),
             patch.object(StartupInputs, "from_published", return_value=_STARTUP_INPUTS),
+            # The runner's steps ask whether this is the last pipeline stage.
+            get_parallel().override(pp_group=SimpleNamespace(is_last_rank=True)),
             self.assertRaisesRegex(RuntimeError, "stop after startup"),
         ):
             scheduler.init_model_worker()
 
         self.assertIs(scheduler.schedule_stream, None if mlx else schedule_stream)
-        # The flag ran the phases through the runner lifecycle, to completion.
-        self.assertEqual(
-            scheduler.model_runner_startup is not None, model_runner is not None
-        )
-        if model_runner is not None:
-            self.assertEqual(
-                scheduler.model_runner_startup.phase, StartupPhase.FINALIZED
-            )
+        # The phases ran through the runner lifecycle, to completion.
+        self.assertEqual(scheduler.model_runner_startup.phase, StartupPhase.FINALIZED)
         worker.model_runner.post_capture_resize_kv_pool.assert_called_once_with(
             draft_runners=(worker.model_runner,) if use_draft_worker else ()
         )
@@ -959,7 +961,7 @@ class TestStartupWeightLoadSchedulerRouting(CustomTestCase):
             ],
         )
 
-    def test_model_runner_sglang_runs_the_same_startup(self):
+    def test_explicit_model_runner_sglang_runs_the_default_startup(self):
         for mode, use_draft_worker in (
             ("serial", False),
             ("overlap", False),

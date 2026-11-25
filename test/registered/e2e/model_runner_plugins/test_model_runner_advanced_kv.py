@@ -2,8 +2,8 @@
 sliding-window model (Gemma 3, window 512) and a hybrid recurrent-state model
 (Granite 4.0 H, Mamba2 layers with prefix-cache checkpoints).
 
-Each configuration runs direct, direct again, then through the API, and the
-raw logits of every step are compared bitwise, after the direct-vs-direct run
+Each configuration runs native, native again, then through the API, and the
+raw logits of every step are compared bitwise, after the native-vs-native run
 shows the configuration repeats. The trace proves the step path ran with the
 sub-pool tables (KVTables.window, KVTables.state) and that the features were
 exercised: prompts longer than the window, prefix hits, eviction of the cached
@@ -20,7 +20,7 @@ import torch
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace, with_model_runner
+from sglang.test.model_runner_reference import native_lane, read_step_trace
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -91,8 +91,8 @@ def _serve(model, other_args, *, save_logits, workload):
         model,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner(other_args),
-        env=env,
+        other_args=other_args,
+        env={**env, **native_lane(other_args)},
     )
     try:
         result = workload()
@@ -134,8 +134,8 @@ class TestModelRunnerAdvancedKV(CustomTestCase):
             _serve(model, run_args, save_logits=True, workload=workload)
             for run_args in (args, args, [*args, "--model-runner", "sglang"])
         ]
-        (direct_out, direct), (again_out, again), (steps_out, steps) = runs
-        self.assertEqual({r["path"] for r in direct + again}, {"direct"})
+        (native_out, native), (again_out, again), (steps_out, steps) = runs
+        self.assertEqual({r["path"] for r in native + again}, {"native"})
         self.assertEqual(
             {(r["path"], r["runner"]) for r in steps}, {("step", "sglang")}
         )
@@ -147,13 +147,13 @@ class TestModelRunnerAdvancedKV(CustomTestCase):
         self.assertLess(evicted, min(cached), "the fillers evicted nothing")
         self._check_sub_pool_tables(name, steps)
 
-        repeat = self._assert_same_steps(direct, again)
-        self._assert_same_outputs(direct_out, again_out)
-        through_steps = self._assert_same_steps(direct, steps)
-        self._assert_same_outputs(direct_out, steps_out)
+        repeat = self._assert_same_steps(native, again)
+        self._assert_same_outputs(native_out, again_out)
+        through_steps = self._assert_same_steps(native, steps)
+        self._assert_same_outputs(native_out, steps_out)
         print(
-            f"[{name}] bitwise logits: {repeat} steps direct vs direct, "
-            f"{through_steps} steps direct vs steps"
+            f"[{name}] bitwise logits: {repeat} steps native vs native, "
+            f"{through_steps} steps native vs steps"
         )
         self.assertGreater(through_steps, 0)
         if "graphs" in name:
@@ -241,12 +241,12 @@ class TestModelRunnerAdvancedKV(CustomTestCase):
 
     def test_step_overhead(self):
         """Median host time outside execute per forward on the step path, and
-        the direct path's host time per forward, for each model with graphs."""
+        the native lane's host time per forward, for each model with graphs."""
         report = []
         for name in ("swa_overlap_graphs", "state_overlap_graphs"):
             model, args = _CONFIGS[name]
             workload = self._workload(model)
-            _, direct = _serve(model, args, save_logits=False, workload=workload)
+            _, native = _serve(model, args, save_logits=False, workload=workload)
             _, steps = _serve(
                 model,
                 [*args, "--model-runner", "sglang"],
@@ -254,12 +254,12 @@ class TestModelRunnerAdvancedKV(CustomTestCase):
                 workload=workload,
             )
             for mode in ("extend", "decode"):
-                d = [r["host_us"] for r in direct[2:] if r["mode"] == mode]
+                d = [r["host_us"] for r in native[2:] if r["mode"] == mode]
                 s = [r for r in steps[2:] if r["mode"] == mode]
                 if not d or not s:
                     continue
                 report.append(
-                    f"[{name}] {mode}: direct {statistics.median(d):.0f} us, steps "
+                    f"[{name}] {mode}: native {statistics.median(d):.0f} us, steps "
                     f"{statistics.median(r['host_us'] for r in s):.0f} us, outside "
                     "execute "
                     f"{statistics.median(r['host_us'] - r['execute_us'] for r in s):.0f}"

@@ -9,7 +9,6 @@ import msgspec
 
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_runner_plugins.api import (
-    DIRECT_MODEL_RUNNER,
     NATIVE_MODEL_RUNNER,
     UNGATED_FEATURES,
     ControlOp,
@@ -31,7 +30,6 @@ from sglang.srt.model_runner_plugins.registry import (
     load_model_runner,
 )
 from sglang.srt.runtime_context import (
-    get_device,
     get_disagg,
     get_exec,
     get_lora,
@@ -42,7 +40,6 @@ from sglang.srt.runtime_context import (
     get_spec,
     process_model_config,
 )
-from sglang.srt.utils.device import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -51,47 +48,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def default_runner_refusal() -> Optional[str]:
-    """Why a launch without ``--model-runner`` keeps the direct path; None when
-    it runs the built-in runner (the default where its step path is validated)."""
-    device = get_device().device
-    if device != "cuda" or is_hip():
-        return f"device {'rocm' if is_hip() else device}"
-    return None
-
-
-def selected_model_runner() -> Optional[LoadedModelRunner]:
-    """The runner of this launch: ``--model-runner``'s, else the built-in one
-    by default; None for the direct path (``--model-runner direct``, or a
-    default refused above)."""
+def selected_model_runner() -> LoadedModelRunner:
+    """The runner of this launch: ``--model-runner``'s, else the built-in one."""
     name = get_exec().kernel.model_runner
-    if name == DIRECT_MODEL_RUNNER:
-        return None
-    if name is not None:
-        return load_model_runner(name)
-    if default_runner_refusal() is not None:
-        return None
-    return load_model_runner(NATIVE_MODEL_RUNNER, explicit=False)
-
-
-def _log_selection(runner: Optional[LoadedModelRunner]) -> None:
-    flag = get_exec().kernel.model_runner
-    if runner is not None:
-        logger.info(
-            "Model runner: %r%s",
-            runner.name,
-            (
-                f" (default; --model-runner {DIRECT_MODEL_RUNNER} runs the direct path)"
-                if flag is None
-                else ""
-            ),
-        )
-    elif flag is None:
-        logger.info(
-            "Model runner: the direct path (default on %s)", default_runner_refusal()
-        )
-    else:
-        logger.info("Model runner: the direct path (--model-runner %s)", flag)
+    if name is None:
+        return load_model_runner(NATIVE_MODEL_RUNNER, explicit=False)
+    return load_model_runner(name)
 
 
 def check_model_runner_at_launch() -> None:
@@ -101,9 +63,11 @@ def check_model_runner_at_launch() -> None:
     runner is the default, and it is checked like a named one.
     """
     runner = selected_model_runner()
-    _log_selection(runner)
-    if runner is None:
-        return
+    logger.info(
+        "Model runner: %r%s",
+        runner.name,
+        " (default)" if get_exec().kernel.model_runner is None else "",
+    )
     name = runner.name
     cfg = resolved_config(process_model_config())
     capabilities = describe_runner(runner, cfg)
@@ -257,13 +221,8 @@ class ModelRunnerAdmission:
         self._launch = launch
 
     @classmethod
-    def maybe_create(
-        cls, *, model_config: ModelConfig
-    ) -> Optional[ModelRunnerAdmission]:
-        """None on the direct path, which checks nothing."""
+    def create(cls, *, model_config: ModelConfig) -> ModelRunnerAdmission:
         runner = selected_model_runner()
-        if runner is None:
-            return None
         cfg = resolved_config(model_config)
         return cls(
             runner_name=runner.name,

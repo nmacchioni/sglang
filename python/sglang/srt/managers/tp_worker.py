@@ -285,7 +285,7 @@ class BaseTpWorker(ABC):
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
 
-    # Set after startup under --model-runner; None runs every forward directly.
+    # The model runner's forwards, set after startup (set_step_forward).
     step_forward: Optional[StepForward] = None
     step_trace: Optional[StepTrace] = None
 
@@ -614,15 +614,7 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu,
             dllm_algo_state,
             can_run_cuda_graph,
-        ) = self.dllm_algorithm.run(
-            (
-                self.model_runner
-                if self.step_forward is None and self.step_trace is None
-                else self._denoise_runner()
-            ),
-            forward_batch,
-            algo_states,
-        )
+        ) = self.dllm_algorithm.run(self._denoise_runner(), forward_batch, algo_states)
 
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -633,16 +625,16 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def _denoise_runner(self):
-        """The runner a diffusion algorithm drives under --model-runner (or
-        with the step trace on): its denoising passes go through forward_model."""
+        """The runner a diffusion algorithm drives: its denoising passes go
+        through forward_model."""
         from sglang.srt.model_runner_plugins.step_forward import DenoiseRunner
 
         return DenoiseRunner(
             model_runner=self.model_runner, forward_model=self.forward_model
         )
 
-    def set_step_forward(self, step_forward: Optional[StepForward]) -> None:
-        """Run this worker's forwards through the --model-runner Step API."""
+    def set_step_forward(self, step_forward: StepForward) -> None:
+        """Run this worker's forwards through the model runner."""
         self.step_forward = step_forward
 
     def forward_model(
@@ -650,39 +642,28 @@ class TpModelWorker(BaseTpWorker):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> ModelRunnerOutput:
-        """One forward at the worker boundary: through the selected model
-        runner's steps when it takes the batch, else the direct path."""
+        """One forward at the worker boundary, through the model runner."""
         steps = self.step_forward
         trace = self.step_trace
         if trace is None:
-            if steps is not None:
-                out = steps.try_forward(forward_batch, pp_proxy_tensors)
-                if out is not None:
-                    return out
-            return self.model_runner.forward(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
-            )
-        via_steps = steps is not None and steps.takes(forward_batch)
+            return steps.forward(forward_batch, pp_proxy_tensors)
+        materialized = steps.materializes(forward_batch)
         tic = trace.start()
-        if via_steps:
-            out = steps.forward(forward_batch, pp_proxy_tensors)
-        else:
-            out = self.model_runner.forward(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors
-            )
+        out = steps.forward(forward_batch, pp_proxy_tensors)
         trace.record(
             tic=tic,
-            runner=steps.runner_name if via_steps else None,
-            execute_seconds=steps.last_execute_seconds if via_steps else None,
+            runner=steps.runner_name,
+            materialized=materialized,
+            execute_seconds=steps.last_execute_seconds if materialized else None,
             forward_batch=forward_batch,
             logits_output=out.logits_output,
             replayed_graph=out.can_run_graph,
-            graph=steps.last_graph if via_steps else None,
-            kv=steps.last_kv if via_steps else None,
+            graph=steps.last_graph if materialized else None,
+            kv=steps.last_kv if materialized else None,
             model_runner=self.model_runner,
-            adapters=steps.last_adapters if via_steps else None,
-            sampling_owner=steps.last_sampling_owner.value if via_steps else None,
-            plan_runs=steps.last_plan_runs if via_steps else None,
+            adapters=steps.last_adapters if materialized else None,
+            sampling_owner=(steps.last_sampling_owner.value if materialized else None),
+            plan_runs=steps.last_plan_runs if materialized else None,
         )
         return out
 
@@ -790,11 +771,7 @@ class TpModelWorker(BaseTpWorker):
                     else self.model_runner.runner_ids.own_plan(batch)
                 ),
                 kv_weight_version_record=out.kv_weight_version_record,
-                step_output_lease=(
-                    None
-                    if self.step_forward is None
-                    else self.step_forward.take_lease()
-                ),
+                step_output_lease=self.step_forward.take_lease(),
             )
             if (
                 batch is not None

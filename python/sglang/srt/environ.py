@@ -2650,6 +2650,9 @@ class Envs:
     SGLANG_MODEL_RUNNER_STEP_TRACE_DIR = EnvStr(None)
     # With the trace on, also save each step's inputs and raw pre-sampling logits.
     SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS = EnvBool(False)
+    # Test hook: the built-in runner runs every step on its native forward,
+    # with no Step materialized. Step tests compare the API against it.
+    SGLANG_TEST_MODEL_RUNNER_NATIVE_LANE = EnvBool(False)
     # Read by the NVIDIA megakernel plugin, not by SGLang: a comma-separated
     # slot list that replaces the plugin's default. Empty runs the stock paths.
     SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())

@@ -3,7 +3,8 @@
 It declares everything SGLang's own runner supports. Its lifecycle delegates to
 the scheduler's native startup phases, in the native order. Its steps run
 today's ``ModelRunner.forward`` on the batch SGLang lowered for the ``Step``;
-configurations outside the Step subset keep the direct path.
+configurations and batches outside the Step subset run that forward with no
+Step materialized.
 """
 
 from __future__ import annotations
@@ -138,7 +139,7 @@ class SGLangRunnerPlugin:
     ) -> NativePlan:
         """The plan of a batch whose Step SGLang does not materialize, since
         nothing would read it (``plan`` reads only the batch back): the native
-        forward decides its graph, as on the direct path."""
+        forward decides its graph itself."""
         return NativePlan(
             forward_batch=forward_batch, graph=None, pp_proxy_tensors=pp_proxy_tensors
         )

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 import msgspec
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_runner_plugins.api import (
     EAGER,
@@ -29,6 +30,7 @@ from sglang.srt.model_runner_plugins.api import (
 )
 from sglang.srt.model_runner_plugins.steps import dp_prefill_graph_bucket
 from sglang.srt.runtime_context import (
+    get_device,
     get_exec,
     get_lora,
     get_parallel,
@@ -36,7 +38,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     reports_expert_balancedness,
 )
-from sglang.srt.utils.device import is_confidential_compute
+from sglang.srt.utils.device import is_confidential_compute, is_hip
 
 if TYPE_CHECKING:
     import torch
@@ -52,7 +54,8 @@ if TYPE_CHECKING:
 # EAGLE family's draft model runs DRAFT and DRAFT_EXTEND Steps (native_draft).
 # DSpark is native-only: its target's steps are Steps, with its fused accept
 # kept inside the native verify, and its draft stays inside its worker.
-# DFLASH, UNO and frozen-KV MTP keep the direct path (see the 7d commit).
+# DFLASH, UNO and frozen-KV MTP run on the native forward, with no Step (see
+# the 7d commit).
 STEP_SPECULATIVE_ALGORITHMS = frozenset(
     # NEXTN names EAGLE over a model's own MTP layers; STANDALONE drafts with a
     # separate small model through the same draft worker.
@@ -105,8 +108,8 @@ class NativeStepLowering:
 
 class NativePlan(msgspec.Struct, frozen=True, kw_only=True, gc=False):
     forward_batch: object
-    # None: no Step was materialized, and the forward decides as on the direct
-    # path; otherwise Step.graph, which the forward must take.
+    # None: no Step was materialized, and the forward decides its graph itself;
+    # otherwise Step.graph, which the forward must take.
     graph: Optional[GraphChoice] = EAGER
     # The PPProxyTensors over Step.pp_in, on every stage but the first.
     pp_proxy_tensors: Optional[object] = None
@@ -127,8 +130,8 @@ def native_plan(*, step: Step, forward_batch: ForwardBatch) -> NativePlan:
 def native_step_refusals(
     model_runner: ModelRunner, *, kv_refusal: Optional[str] = None
 ) -> list[str]:
-    """Why the built-in runner keeps today's path for every step; empty when
-    its steps run through the API. Fixed for the runner's lifetime.
+    """Why the built-in runner runs every step on its native forward, with no
+    Step materialized; empty when its steps run through the API. Fixed for the runner's lifetime.
 
     Tensor parallelism runs through the API: every TP rank lowers the same
     batch from the same replicated schedule, so each member reaches the same
@@ -142,16 +145,28 @@ def native_step_refusals(
     the native forward, on the same forward count on every rank as today.
 
     Speculative decoding runs through the API for the algorithms in
-    ``STEP_SPECULATIVE_ALGORITHMS``; the others keep the direct path.
+    ``STEP_SPECULATIVE_ALGORITHMS``; the others run on the native forward.
 
-    Elastic EP keeps the direct path: on a rank fault the forward rebalances
+    Elastic EP runs on the native forward: on a rank fault the forward rebalances
     and runs again, and scale-up rewrites the DP layout and recaptures graphs,
     decisions taken inside the forward rather than at SGLang's rendezvous.
-    Decode context parallelism keeps it too, until a DCP configuration (MLA or
+    Decode context parallelism does too, until a DCP configuration (MLA or
     DSA models) proves the step path bitwise against it. So do KV pools that
     ``KVLayout`` and ``KVTables`` do not describe yet (``kv_refusal``): MLA,
-    index caches, packed and quantized layouts, per-request windows."""
+    index caches, packed and quantized layouts, per-request windows.
+
+    Devices other than CUDA run on the native forward too: the Step's graph
+    decision mirrors the CUDA graph runners, and no other device's runners have
+    been checked against it.
+
+    The tests' native lane (``SGLANG_TEST_MODEL_RUNNER_NATIVE_LANE``) is a
+    refusal of its own: the bitwise baseline the step path is compared against."""
     reasons = []
+    if envs.SGLANG_TEST_MODEL_RUNNER_NATIVE_LANE.get():
+        reasons.append("the native test lane")
+    device = get_device().device
+    if device != "cuda" or is_hip():
+        reasons.append(f"device {'rocm' if is_hip() else device}")
     if kv_refusal is not None:
         reasons.append(f"{kv_refusal} (no KVLayout description)")
     if get_parallel().dcp_size > 1:
@@ -194,8 +209,11 @@ def native_step_refusals(
         or reports_expert_balancedness()
     ):
         reasons.append("per-forward captures")
-    if model_runner.is_draft_worker or use_mlx():
+    if model_runner.is_draft_worker:
         reasons.append("a draft model")
+    if use_mlx():
+        # The MLX worker executes its batches itself (MlxTpModelWorker).
+        reasons.append("the MLX worker")
     return reasons
 
 

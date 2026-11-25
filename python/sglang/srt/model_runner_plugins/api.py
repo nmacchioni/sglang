@@ -22,9 +22,6 @@ MODEL_RUNNER_API_VERSION = 1
 MODEL_RUNNERS_GROUP = "sglang.srt.model_runners"
 # Built in, so no entry point may claim it.
 NATIVE_MODEL_RUNNER = "sglang"
-# Not a runner: --model-runner direct runs SGLang's direct path, the rollback
-# from the built-in runner while it is the default.
-DIRECT_MODEL_RUNNER = "direct"
 
 
 class Feature(str, Enum):

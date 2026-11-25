@@ -1,9 +1,9 @@
 """The controlled bitwise fixture for --model-runner sglang steps (TP1): raw
-logits before sampling are bitwise equal to the direct path's at identical
+logits before sampling are bitwise equal to the native lane's at identical
 batches, row order, positions and KV slots; prompt logprobs, which the built-in
 runner returns natively, are equal too. Eager with overlap off, CUDA graphs,
 overlap scheduling, and both are compared separately, each with the same
-configuration on both paths, and each first direct against direct, to show the
+configuration on both paths, and each first native against native, to show the
 configuration repeats. Also reports the host time each path spends at the
 worker boundary."""
 
@@ -20,7 +20,7 @@ import torch
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace, with_model_runner
+from sglang.test.model_runner_reference import native_lane, read_step_trace
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -105,8 +105,8 @@ def _serve(other_args, *, save_logits, workload):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner(other_args),
-        env=env,
+        other_args=other_args,
+        env={**env, **native_lane(other_args)},
     )
     try:
         result = workload()
@@ -128,8 +128,8 @@ def _serve_untraced(other_args, *, workload, log=False):
             _MODEL,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=with_model_runner(other_args),
-            env=env,
+            other_args=other_args,
+            env={**env, **native_lane(other_args)},
             return_stdout_stderr=(out, out) if log else None,
         )
         try:
@@ -209,14 +209,14 @@ class TestModelRunnerStepBitwise(CustomTestCase):
         runs = {
             run: _serve(run_args, save_logits=True, workload=self._workload)
             for run, run_args in (
-                ("direct", args),
-                ("direct_again", args),
+                ("native", args),
+                ("native_again", args),
                 ("steps", [*args, "--model-runner", "sglang"]),
             )
         }
-        (direct_out, direct), (again_out, again), (steps_out, steps) = runs.values()
+        (native_out, native), (again_out, again), (steps_out, steps) = runs.values()
 
-        self.assertEqual({r["path"] for r in direct + again}, {"direct"})
+        self.assertEqual({r["path"] for r in native + again}, {"native"})
         self.assertEqual(
             {(r["path"], r["runner"]) for r in steps}, {("step", "sglang")}
         )
@@ -230,7 +230,7 @@ class TestModelRunnerStepBitwise(CustomTestCase):
         for r in steps:
             self.assertEqual(r["step_graph"] is not None, r["replayed_graph"], r)
         self.assertEqual(
-            [(r["mode"], r["replayed_graph"]) for r in direct],
+            [(r["mode"], r["replayed_graph"]) for r in native],
             [(r["mode"], r["replayed_graph"]) for r in steps],
         )
         if "graphs" in name:
@@ -242,14 +242,14 @@ class TestModelRunnerStepBitwise(CustomTestCase):
         else:
             self.assertFalse(any(r["replayed_graph"] for r in steps))
 
-        # Direct against direct first: the fixture repeats bitwise.
-        repeat = self._assert_same_steps(direct, again)
-        self._assert_same_responses(direct_out, again_out)
-        through_steps = self._assert_same_steps(direct, steps)
-        self._assert_same_responses(direct_out, steps_out)
+        # Native against native first: the fixture repeats bitwise.
+        repeat = self._assert_same_steps(native, again)
+        self._assert_same_responses(native_out, again_out)
+        through_steps = self._assert_same_steps(native, steps)
+        self._assert_same_responses(native_out, steps_out)
         print(
-            f"[{name}] bitwise logits: {repeat} steps direct vs direct, "
-            f"{through_steps} steps direct vs steps"
+            f"[{name}] bitwise logits: {repeat} steps native vs native, "
+            f"{through_steps} steps native vs steps"
         )
         self.assertGreater(through_steps, 0)
 
@@ -268,16 +268,16 @@ class TestModelRunnerStepBitwise(CustomTestCase):
             _assert_bitwise(self, want, got)
         return compared
 
-    def test_eager_steps_are_bitwise_equal_to_the_direct_path(self):
+    def test_eager_steps_are_bitwise_equal_to_the_native_lane(self):
         self._check_config("eager")
 
-    def test_graph_steps_are_bitwise_equal_to_the_direct_path(self):
+    def test_graph_steps_are_bitwise_equal_to_the_native_lane(self):
         self._check_config("graphs")
 
-    def test_overlap_steps_are_bitwise_equal_to_the_direct_path(self):
+    def test_overlap_steps_are_bitwise_equal_to_the_native_lane(self):
         self._check_config("overlap")
 
-    def test_overlap_graph_steps_are_bitwise_equal_to_the_direct_path(self):
+    def test_overlap_graph_steps_are_bitwise_equal_to_the_native_lane(self):
         self._check_config("overlap_graphs")
 
     def test_mixed_prefill_and_decode_under_overlap_and_graphs(self):
@@ -285,7 +285,7 @@ class TestModelRunnerStepBitwise(CustomTestCase):
         composition depends on timing: steps are matched by their inputs, and
         every matched step's logits must be bitwise equal."""
         args = _CONFIGS["overlap_graphs"]
-        _, direct = _serve(args, save_logits=True, workload=self._mixed_workload)
+        _, native = _serve(args, save_logits=True, workload=self._mixed_workload)
         _, steps = _serve(
             [*args, "--model-runner", "sglang"],
             save_logits=True,
@@ -293,7 +293,7 @@ class TestModelRunnerStepBitwise(CustomTestCase):
         )
         self.assertTrue(any(r["mode"] == "mixed" for r in steps))
         self.assertTrue(all(r["path"] == "step" for r in steps if r["mode"] == "mixed"))
-        by_inputs = _unique_by_inputs(direct)
+        by_inputs = _unique_by_inputs(native)
         matched = {"mixed": 0, "other": 0}
         for key, got in _unique_by_inputs(steps).items():
             want = by_inputs.get(key)
@@ -342,22 +342,22 @@ class TestModelRunnerStepBitwise(CustomTestCase):
         else:
             self.assertEqual(want[key], got[key])
 
-    def test_untraced_steps_serve_as_the_direct_path(self):
+    def test_untraced_steps_serve_as_the_native_lane(self):
         """Without the step trace the built-in runner does not materialize its
-        Steps (nothing reads them); its responses must still be the direct
+        Steps (nothing reads them); its responses must still be the native
         path's, under overlap and graphs, with every step through the runner."""
         args = _CONFIGS["overlap_graphs"]
-        direct = _serve_untraced(args, workload=self._workload)
+        native = _serve_untraced(args, workload=self._workload)
         steps, log = _serve_untraced(
             [*args, "--model-runner", "sglang"], workload=self._workload, log=True
         )
         self.assertIn("Model runner 'sglang' runs steps through its API", log)
-        self._assert_same_responses(direct[:4], steps[:4])
-        self.assertEqual(direct[4]["text"], steps[4]["text"])
+        self._assert_same_responses(native[:4], steps[:4])
+        self.assertEqual(native[4]["text"], steps[4]["text"])
 
     def test_step_overhead_at_the_worker_boundary(self):
         """Host time per forward at TpModelWorker.forward_model, and the wall
-        time of a decode-heavy workload, direct vs steps, per configuration.
+        time of a decode-heavy workload, native vs steps, per configuration.
 
         Reported, not gated: the step path adds building the Step views, the
         graph decision, plan, the output conversion and, under overlap, the
@@ -383,7 +383,7 @@ class TestModelRunnerStepBitwise(CustomTestCase):
         report = []
         for config in ("eager", "graphs", "overlap_graphs"):
             args = _CONFIGS[config]
-            (direct_out, direct_s), direct = _serve(
+            (native_out, native_s), native = _serve(
                 args, save_logits=False, workload=decode_heavy
             )
             (steps_out, steps_s), steps = _serve(
@@ -391,18 +391,18 @@ class TestModelRunnerStepBitwise(CustomTestCase):
                 save_logits=False,
                 workload=decode_heavy,
             )
-            self._assert_same_responses(direct_out, steps_out)
+            self._assert_same_responses(native_out, steps_out)
             report.append(
-                f"[{config}] workload wall time: direct {direct_s:.3f} s, "
+                f"[{config}] workload wall time: native {native_s:.3f} s, "
                 f"steps {steps_s:.3f} s"
             )
-            report += _host_time_report(direct, steps, batch_sizes=(1, 2, 4))
+            report += _host_time_report(native, steps, batch_sizes=(1, 2, 4))
         print("STEP OVERHEAD (median host time at forward_model)")
         print("\n".join(report))
         self.assertTrue(report)
 
 
-def _host_time_report(direct, steps, *, batch_sizes):
+def _host_time_report(native, steps, *, batch_sizes):
     report = []
     for mode in ("extend", "decode"):
         for batch_size in batch_sizes:
@@ -412,20 +412,20 @@ def _host_time_report(direct, steps, *, batch_sizes):
                     for r in trace[2:]  # skip warmup
                     if r["mode"] == mode and r["batch_size"] == batch_size
                 ]
-                for name, trace in (("direct", direct), ("steps", steps))
+                for name, trace in (("native", native), ("steps", steps))
             }
             if not all(rows.values()):
                 continue
-            direct_us = statistics.median(r["host_us"] for r in rows["direct"])
+            native_us = statistics.median(r["host_us"] for r in rows["native"])
             steps_us = statistics.median(r["host_us"] for r in rows["steps"])
             outside = statistics.median(
                 r["host_us"] - r["execute_us"] for r in rows["steps"]
             )
             replayed = sum(r["replayed_graph"] for r in rows["steps"])
             report.append(
-                f"  {mode} bs={batch_size}: direct {direct_us:.0f} us, "
+                f"  {mode} bs={batch_size}: native {native_us:.0f} us, "
                 f"steps {steps_us:.0f} us (outside execute {outside:.0f} us), "
-                f"n={len(rows['direct'])}/{len(rows['steps'])}, "
+                f"n={len(rows['native'])}/{len(rows['steps'])}, "
                 f"replayed {replayed}"
             )
     return report

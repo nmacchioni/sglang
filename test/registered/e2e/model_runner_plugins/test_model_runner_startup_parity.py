@@ -1,5 +1,5 @@
-"""--model-runner sglang reaches the same final capacities (within the direct
-path's own launch-to-launch spread) and admission limits as the direct path:
+"""--model-runner sglang reaches the same final capacities (within the native
+path's own launch-to-launch spread) and admission limits as the native lane:
 default sizing, an explicit --max-total-tokens, and post-capture KV resizing."""
 
 import os
@@ -9,7 +9,7 @@ import unittest
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import with_model_runner
+from sglang.test.model_runner_reference import native_lane
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -23,9 +23,11 @@ register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
 # Small and ungated: dense full attention, so the plain MHA KV pool.
 _MODEL = "Qwen/Qwen3-0.6B"
 _STARTED = "Model runner 'sglang' started"
+_NATIVE = "runs every step on its native forward, without a Step: the native test lane"
+_THROUGH_API = "Model runner 'sglang' runs steps through its API"
 _RESIZED = "Post-capture KV sizing:"
 # The KV pool is sized from the free memory measured at startup, which varies
-# between launches of the same path: two direct launches with post-capture
+# between launches of the same path: two native launches with post-capture
 # sizing measured 1152 tokens (123 MB, 0.05%) apart. Capacities are compared
 # within that launch-to-launch spread with margin (0.2%); limits that do not
 # follow the free memory must match exactly.
@@ -40,8 +42,8 @@ def _launch(other_args, env=None):
             _MODEL,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=with_model_runner(other_args),
-            env={**os.environ, **(env or {})},
+            other_args=other_args,
+            env={**os.environ, **(env or {}), **native_lane(other_args)},
             return_stdout_stderr=(out, err),
         )
         try:
@@ -72,35 +74,39 @@ def _launch(other_args, env=None):
 
 class TestModelRunnerStartupParity(CustomTestCase):
     def _assert_parity(self, other_args, env=None):
-        direct, direct_log = _launch(other_args, env)
+        native, native_log = _launch(other_args, env)
         plugin, plugin_log = _launch([*other_args, "--model-runner", "sglang"], env)
 
-        self.assertNotIn(_STARTED, direct_log)
+        # Both lanes start the built-in runner; only the plugin lane runs Steps.
+        self.assertIn(_STARTED, native_log)
         self.assertIn(_STARTED, plugin_log)
-        exact = {k: v for k, v in direct.items() if k not in _POOL_FACTS}
+        self.assertIn(_NATIVE, native_log)
+        self.assertNotIn(_THROUGH_API, native_log)
+        self.assertIn(_THROUGH_API, plugin_log)
+        exact = {k: v for k, v in native.items() if k not in _POOL_FACTS}
         self.assertEqual({k: plugin[k] for k in exact}, exact)
         for fact in _POOL_FACTS:
             self.assertLessEqual(
-                abs(plugin[fact] - direct[fact]),
-                _POOL_TOLERANCE * direct[fact],
-                f"{fact}: {plugin[fact]} vs direct {direct[fact]}",
+                abs(plugin[fact] - native[fact]),
+                _POOL_TOLERANCE * native[fact],
+                f"{fact}: {plugin[fact]} vs native {native[fact]}",
             )
-        return direct, direct_log, plugin_log
+        return native, native_log, plugin_log
 
     def test_default_sizing(self):
         self._assert_parity(["--disable-overlap-schedule"])
 
     def test_explicit_max_total_tokens(self):
-        direct, _, _ = self._assert_parity(
+        native, _, _ = self._assert_parity(
             ["--max-total-tokens", "20000", "--max-running-requests", "24"]
         )
-        self.assertLessEqual(direct["max_total_num_tokens"], 20000)
-        self.assertLessEqual(direct["max_running_requests"], 24)
+        self.assertLessEqual(native["max_total_num_tokens"], 20000)
+        self.assertLessEqual(native["max_running_requests"], 24)
 
     def test_post_capture_resize(self):
         # Post-capture sizing needs every prefill batch to fit a captured
         # prefill graph bucket, so the chunk size is the largest bucket.
-        _, direct_log, plugin_log = self._assert_parity(
+        _, native_log, plugin_log = self._assert_parity(
             [
                 "--chunked-prefill-size",
                 "4096",
@@ -109,7 +115,7 @@ class TestModelRunnerStartupParity(CustomTestCase):
             ],
             env={"SGLANG_ENABLE_POST_CAPTURE_KV_SIZING": "1"},
         )
-        self.assertIn(_RESIZED, direct_log)
+        self.assertIn(_RESIZED, native_log)
         self.assertIn(_RESIZED, plugin_log)
 
 
