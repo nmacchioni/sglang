@@ -30,6 +30,7 @@ from sglang.test.model_runner_reference import (
     REFERENCE_RUNNER,
     install_reference_runner,
     read_step_trace,
+    with_model_runner,
 )
 from sglang.test.test_utils import (
     ADMIN_HEADERS_FOR_TEST,
@@ -131,7 +132,7 @@ class _Session:
             _MODEL,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=args,
+            other_args=with_model_runner(args),
             env={
                 **os.environ,
                 **(env or {}),

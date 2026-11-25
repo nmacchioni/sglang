@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace
+from sglang.test.model_runner_reference import read_step_trace, with_model_runner
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -115,7 +115,7 @@ def _serve(args, env=None):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=[*_COMMON, *args],
+        other_args=with_model_runner([*_COMMON, *args]),
         env={
             **os.environ,
             **(env or {}),

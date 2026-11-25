@@ -646,7 +646,7 @@ class TestSchedulerWiring(CustomTestCase):
             runner = SimpleNamespace(name="alpha", is_native=False, plugin=plugin)
             with (
                 patch(
-                    "sglang.srt.model_runner_plugins.startup.load_model_runner",
+                    "sglang.srt.model_runner_plugins.selection.load_model_runner",
                     return_value=runner,
                 ),
                 get_context().override_server_args(model_runner="alpha"),

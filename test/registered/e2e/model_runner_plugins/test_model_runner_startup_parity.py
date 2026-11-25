@@ -1,6 +1,6 @@
-"""--model-runner sglang reaches the same final capacities and admission limits as
-the direct path: default sizing, an explicit --max-total-tokens, and post-capture
-KV resizing."""
+"""--model-runner sglang reaches the same final capacities (within the direct
+path's own launch-to-launch spread) and admission limits as the direct path:
+default sizing, an explicit --max-total-tokens, and post-capture KV resizing."""
 
 import os
 import tempfile
@@ -9,6 +9,7 @@ import unittest
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.model_runner_reference import with_model_runner
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -23,6 +24,13 @@ register_cuda_ci(est_time=420, stage="base-b", runner_config="1-gpu-small")
 _MODEL = "Qwen/Qwen3-0.6B"
 _STARTED = "Model runner 'sglang' started"
 _RESIZED = "Post-capture KV sizing:"
+# The KV pool is sized from the free memory measured at startup, which varies
+# between launches of the same path: two direct launches with post-capture
+# sizing measured 1152 tokens (123 MB, 0.05%) apart. Capacities are compared
+# within that launch-to-launch spread with margin (0.2%); limits that do not
+# follow the free memory must match exactly.
+_POOL_FACTS = ("max_total_num_tokens", "token_capacity", "kvcache_gb")
+_POOL_TOLERANCE = 0.002
 
 
 def _launch(other_args, env=None):
@@ -32,7 +40,7 @@ def _launch(other_args, env=None):
             _MODEL,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
+            other_args=with_model_runner(other_args),
             env={**os.environ, **(env or {})},
             return_stdout_stderr=(out, err),
         )
@@ -69,7 +77,14 @@ class TestModelRunnerStartupParity(CustomTestCase):
 
         self.assertNotIn(_STARTED, direct_log)
         self.assertIn(_STARTED, plugin_log)
-        self.assertEqual(plugin, direct)
+        exact = {k: v for k, v in direct.items() if k not in _POOL_FACTS}
+        self.assertEqual({k: plugin[k] for k in exact}, exact)
+        for fact in _POOL_FACTS:
+            self.assertLessEqual(
+                abs(plugin[fact] - direct[fact]),
+                _POOL_TOLERANCE * direct[fact],
+                f"{fact}: {plugin[fact]} vs direct {direct[fact]}",
+            )
         return direct, direct_log, plugin_log
 
     def test_default_sizing(self):

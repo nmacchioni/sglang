@@ -27,6 +27,7 @@ from sglang.test.model_runner_reference import (
     REFERENCE_RUNNER,
     install_reference_runner,
     read_step_trace,
+    with_model_runner,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -90,7 +91,7 @@ def _serve(other_args, *, workload, env=None):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
+        other_args=with_model_runner(other_args),
         env=env,
     )
     try:

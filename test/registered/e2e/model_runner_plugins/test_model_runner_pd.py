@@ -37,6 +37,7 @@ from sglang.test.model_runner_reference import (
     REFERENCE_RUNNER,
     install_reference_runner,
     read_step_trace,
+    with_model_runner,
 )
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -181,7 +182,7 @@ class _PDRuns(PDDisaggregationServerBase):
             _MODEL,
             self.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[*_COMMON[1:], *other_args],
+            other_args=with_model_runner([*_COMMON[1:], *other_args]),
             env={
                 **os.environ,
                 **(env or {}),

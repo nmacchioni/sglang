@@ -18,6 +18,7 @@ from sglang.srt.model_runner_plugins.registry import load_model_runner
 from sglang.srt.model_runner_plugins.selection import (
     ModelRunnerAdmission,
     check_model_runner_at_launch,
+    selected_model_runner,
 )
 from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.server_args import ServerArgs, prepare_server_args
@@ -201,12 +202,25 @@ class TestFlag(CustomTestCase):
         "sglang.srt.model_runner_plugins.registry.entry_points",
         side_effect=AssertionError("runner plugins enumerated without the flag"),
     )
-    def test_omitted_flag_enumerates_no_runner(self, _entry_points):
-        with get_context().override_server_args(_model_config=_model_config()):
-            check_model_runner_at_launch()
-            self.assertIsNone(
-                ModelRunnerAdmission.maybe_create(model_config=_model_config())
-            )
+    def test_default_and_rollback_enumerate_no_runner(self, _entry_points):
+        """Unset, a CUDA launch runs the built-in runner and any other device the
+        direct path; ``direct`` is the rollback. None reads installed runners."""
+        for device, flag, expected in (
+            ("cuda", None, "sglang"),
+            ("cpu", None, None),
+            ("cuda", "direct", None),
+        ):
+            with self.subTest(device=device, flag=flag):
+                with get_context().override_server_args(
+                    _model_config=_model_config(), device=device, model_runner=flag
+                ):
+                    check_model_runner_at_launch()
+                    runner = selected_model_runner()
+                    self.assertEqual(runner and runner.name, expected)
+                    admission = ModelRunnerAdmission.maybe_create(
+                        model_config=_model_config()
+                    )
+                    self.assertEqual(admission is None, expected is None)
 
 
 class TestLaunchCheck(_DistsCase):
