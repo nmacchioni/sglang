@@ -3,8 +3,8 @@ sub-pools at startup and ``KVTables`` per step.
 
 Described: slot-row MHA full attention, alone, beside a paged sliding-window
 sub-pool (``SWAKVPool``), or beside recurrent state (``HybridLinearKVPool``).
-Every other pool has no description yet, and the built-in runner keeps such a
-model's steps on the direct path (``native_kv_refusal``).
+Every other pool has no description yet, and the built-in runner runs such a
+model's steps on its native forward, with no Step (``native_kv_refusal``).
 
 Every table is a reference to what SGLang already keeps (the full-to-window
 slot map, the request-to-state map) or to the step's own ForwardBatch fields,

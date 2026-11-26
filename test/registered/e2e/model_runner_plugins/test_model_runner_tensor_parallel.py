@@ -1,15 +1,15 @@
 """Tensor parallelism through the model runner API (TP=2).
 
-The built-in runner: raw logits before sampling are bitwise equal to the direct
+The built-in runner: raw logits before sampling are bitwise equal to the native
 path's on every rank, eager and with overlap scheduling and CUDA graphs, each
-configuration first direct against direct to show it repeats at this topology;
+configuration first native against native to show it repeats at this topology;
 responses are identical, and every rank's trace shows the step path and the
-same graph decision as the direct path.
+same graph decision as the native lane.
 
 The reference runner: column- and row-parallel linears over the TP group SGLang
 hands to ``load``. Its full logits (gathered inside the runner) and its
 vocabulary-sharded logits (gathered by SGLang) are bitwise equal, and it agrees
-with the direct path within the calibrated bounds of the TP1 reference test.
+with the native lane within the calibrated bounds of the TP1 reference test.
 """
 
 import os
@@ -26,8 +26,8 @@ from sglang.test.model_runner_reference import (
     REFERENCE_RUNNER,
     SHARDED_REFERENCE_RUNNER,
     install_reference_runner,
+    native_lane,
     read_step_trace,
-    with_model_runner,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -76,10 +76,10 @@ _FOLLOW_UPS = [
     _PREAMBLE + "1, 2, 3, 4, 5, 6,",
 ]
 _SIGNATURE = ("input_ids", "positions", "out_cache_loc", "seq_lens", "req_pool_indices")
-# The TP1 reference test's bounds, max widened for TP2 by the direct path's own
-# TP1-to-TP2 shift. Measured on GB300 over the same sequences: direct TP1 vs
-# TP2 max 0.21; vs HF fp32, direct TP1 0.18, direct TP2 0.36, reference TP2
-# 0.43; reference vs direct, TP1 0.24, TP2 0.27 (mean 0.015). Each max is at
+# The TP1 reference test's bounds, max widened for TP2 by the native lane's own
+# TP1-to-TP2 shift. Measured on GB300 over the same sequences: native TP1 vs
+# TP2 max 0.21; vs HF fp32, native TP1 0.18, native TP2 0.36, reference TP2
+# 0.43; reference vs native, TP1 0.24, TP2 0.27 (mean 0.015). Each max is at
 # a sequence's first or second scored token (logprob near -12).
 _TIE_MARGIN = 0.5
 _MAX_LOGPROB_DIFF = 0.35
@@ -105,11 +105,12 @@ def _serve(other_args, *, workload, env=None, save_logits=True):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner(other_args),
+        other_args=other_args,
         env={
             **(env or os.environ),
             "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1" if save_logits else "0",
+            **native_lane(other_args),
         },
     )
     try:
@@ -164,36 +165,36 @@ class TestNativeTensorParallel(_Prompts, CustomTestCase):
         cls.tokenize()
 
     def _check(self, args):
-        (direct_out, direct), (again_out, again), (steps_out, steps) = (
+        (native_out, native), (again_out, again), (steps_out, steps) = (
             _serve(run_args, workload=self.workload)
             for run_args in (args, args, [*args, "--model-runner", "sglang"])
         )
-        self.assertEqual(set(direct), {0, 1})
+        self.assertEqual(set(native), {0, 1})
         self.assertEqual(set(steps), {0, 1})
         for rank in (0, 1):
-            self.assertEqual({r["path"] for r in direct[rank]}, {"direct"})
+            self.assertEqual({r["path"] for r in native[rank]}, {"native"})
             self.assertEqual(
                 {(r["path"], r["runner"]) for r in steps[rank]}, {("step", "sglang")}
             )
             for r in steps[rank]:
                 self.assertEqual(r["step_graph"] is not None, r["replayed_graph"], r)
             # The TP members took the same decisions as each other and as the
-            # direct path: same modes, same graph replays, step by step.
+            # native lane: same modes, same graph replays, step by step.
             decisions = [(r["mode"], r["replayed_graph"]) for r in steps[rank]]
             self.assertEqual(
-                decisions, [(r["mode"], r["replayed_graph"]) for r in direct[rank]]
+                decisions, [(r["mode"], r["replayed_graph"]) for r in native[rank]]
             )
             self.assertEqual(
                 [r["step_graph"] for r in steps[rank]],
                 [r["step_graph"] for r in steps[0]],
             )
-        repeat = self._same_steps(direct, again)
-        through_steps = self._same_steps(direct, steps)
-        self._assert_same_outputs(direct_out, again_out)
-        self._assert_same_outputs(direct_out, steps_out)
+        repeat = self._same_steps(native, again)
+        through_steps = self._same_steps(native, steps)
+        self._assert_same_outputs(native_out, again_out)
+        self._assert_same_outputs(native_out, steps_out)
         print(
-            f"[tp2 {args[-2:]}] bitwise logits per rank: direct vs direct "
-            f"{repeat}, direct vs steps {through_steps}"
+            f"[tp2 {args[-2:]}] bitwise logits per rank: native vs native "
+            f"{repeat}, native vs steps {through_steps}"
         )
         return steps
 
@@ -248,9 +249,9 @@ class TestReferenceTensorParallel(_Prompts, CustomTestCase):
         cls.tokenize()
         env = {**os.environ, **install_reference_runner(tempfile.mkdtemp())}
         cls.forced_outputs = None
-        cls.runs = {"direct": _serve(_REFERENCE_EAGER, workload=cls.scored)}
-        # Every runner scores the direct path's continuations.
-        cls.forced_outputs = [o["output_ids"] for o in cls.runs["direct"][0]["greedy"]]
+        cls.runs = {"native": _serve(_REFERENCE_EAGER, workload=cls.scored)}
+        # Every runner scores the native lane's continuations.
+        cls.forced_outputs = [o["output_ids"] for o in cls.runs["native"][0]["greedy"]]
         for name, args, runner in (
             ("full", _REFERENCE_EAGER, REFERENCE_RUNNER),
             ("sharded", _REFERENCE_EAGER, SHARDED_REFERENCE_RUNNER),
@@ -262,7 +263,7 @@ class TestReferenceTensorParallel(_Prompts, CustomTestCase):
 
     @classmethod
     def scored(cls):
-        """Greedy outputs, then every prompt with the direct path's continuation
+        """Greedy outputs, then every prompt with the native lane's continuation
         scored (prompt logprobs through project())."""
         greedy = [_generate(p, max_new_tokens=16) for p in cls.prompts]
         pair = _generate(cls.prompts[:2], max_new_tokens=16)
@@ -331,13 +332,13 @@ class TestReferenceTensorParallel(_Prompts, CustomTestCase):
             [o["output_ids"] for o in self.runs["sharded"][0]["greedy"]],
         )
 
-    def test_agrees_with_the_direct_path_within_calibrated_bounds(self):
-        direct = self.runs["direct"][0]
+    def test_agrees_with_the_native_lane_within_calibrated_bounds(self):
+        native = self.runs["native"][0]
         for name in ("full", "sharded"):
             got = self.runs[name][0]
             exact = 0
             for ids, want, out, (_, top) in zip(
-                self.prompts, direct["greedy"], got["greedy"], direct["forced"]
+                self.prompts, native["greedy"], got["greedy"], native["forced"]
             ):
                 if want["output_ids"] == out["output_ids"]:
                     exact += 1
@@ -353,7 +354,7 @@ class TestReferenceTensorParallel(_Prompts, CustomTestCase):
                 self.assertLess(candidates[0][0] - candidates[1][0], _TIE_MARGIN)
             self.assertGreaterEqual(exact, len(self.prompts) - 1, name)
             diffs = []
-            for (want, _), (logprobs, _) in zip(direct["forced"], got["forced"]):
+            for (want, _), (logprobs, _) in zip(native["forced"], got["forced"]):
                 self.assertEqual([t for _, t, _ in logprobs], [t for _, t, _ in want])
                 diffs += [abs(w[0] - g[0]) for w, g in zip(want[1:], logprobs[1:])]
             mean = sum(diffs) / len(diffs)

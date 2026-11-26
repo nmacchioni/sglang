@@ -3,7 +3,7 @@ and KV, serves Qwen3-0.6B through the Step API with prefix reuse, mixed steps
 and prompt logprobs through project(), and agrees with SGLang's own runner.
 
 The two runners share no kernel, so exact greedy agreement is not guaranteed:
-a greedy mismatch must sit at a near tie of the direct path, and on the same
+a greedy mismatch must sit at a near tie of the native lane, and on the same
 forced tokens the reference's logprobs must stay within a calibrated bound.
 
 Under overlap scheduling with its decode graphs, the reference is compared with
@@ -25,8 +25,8 @@ from transformers import AutoTokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.model_runner_reference import (
     install_reference_runner,
+    native_lane,
     read_step_trace,
-    with_model_runner,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -60,7 +60,7 @@ _PROMPTS = [
     _PREAMBLE + "Write a short poem about the ocean. Make it rhyme.",
     "def fibonacci(n):",
 ]
-# Greedy may part ways only where the direct path's top two logprobs are this close.
+# Greedy may part ways only where the native lane's top two logprobs are this close.
 _TIE_MARGIN = 0.5
 # Calibrated on GB300: bf16 activations through different kernels.
 _MAX_LOGPROB_DIFF = 0.25
@@ -132,11 +132,12 @@ def _serve(other_args, env, *, save_logits=False):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner(other_args),
+        other_args=other_args,
         env={
             **env,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1" if save_logits else "0",
+            **native_lane(other_args),
         },
     )
     return process, trace_dir
@@ -147,13 +148,13 @@ class TestReferenceRunner(CustomTestCase):
     def setUpClass(cls):
         tokenizer = AutoTokenizer.from_pretrained(_MODEL)
         cls.prompts = [tokenizer.encode(p) for p in _PROMPTS]
-        cls.direct = cls._run(_ARGS, dict(os.environ), forced_outputs=None)
+        cls.native = cls._run(_ARGS, dict(os.environ), forced_outputs=None)
         env = {**os.environ, **install_reference_runner(tempfile.mkdtemp())}
-        # Both runners score the direct path's tokens.
+        # Both runners score the native lane's tokens.
         cls.reference = cls._run(
             [*_ARGS, "--model-runner", "reference"],
             env,
-            forced_outputs=[g["output_ids"] for g in cls.direct["greedy"]],
+            forced_outputs=[g["output_ids"] for g in cls.native["greedy"]],
         )
 
     @classmethod
@@ -188,7 +189,7 @@ class TestReferenceRunner(CustomTestCase):
         self.assertTrue({"extend", "decode", "mixed"} <= modes, modes)
         # Prompt logprobs went through project().
         self.assertTrue(any(r["prompt_logprobs"] for r in trace))
-        self.assertEqual({r["path"] for r in self.direct["trace"]}, {"direct"})
+        self.assertEqual({r["path"] for r in self.native["trace"]}, {"native"})
 
     def test_prefix_reuse(self):
         """Follow-up prompts hit the radix cache, and the reference reads the
@@ -210,33 +211,33 @@ class TestReferenceRunner(CustomTestCase):
 
     def test_greedy_outputs_match_up_to_near_ties(self):
         exact = 0
-        for prompt, ids, want, got, (_, direct_top) in zip(
+        for prompt, ids, want, got, (_, native_top) in zip(
             _PROMPTS,
             self.prompts,
-            self.direct["greedy"],
+            self.native["greedy"],
             self.reference["greedy"],
-            self.direct["forced"],
+            self.native["forced"],
         ):
             want_ids, got_ids = want["output_ids"], got["output_ids"]
             if want_ids == got_ids:
                 exact += 1
                 continue
             first = next(i for i, (w, g) in enumerate(zip(want_ids, got_ids)) if w != g)
-            # The direct path's candidates for output token `first`.
-            top = direct_top[len(ids) + first]
+            # The native lane's candidates for output token `first`.
+            top = native_top[len(ids) + first]
             margin = top[0][0] - top[1][0]
-            print(f"{prompt!r}: diverges at token {first}, direct margin {margin:.3f}")
+            print(f"{prompt!r}: diverges at token {first}, native margin {margin:.3f}")
             self.assertLess(margin, _TIE_MARGIN, prompt)
         print(f"greedy: {exact}/{len(_PROMPTS)} prompts match exactly")
         self.assertGreaterEqual(exact, len(_PROMPTS) - 1)
         self.assertEqual(
-            self.reference["late"]["output_ids"], self.direct["late"]["output_ids"]
+            self.reference["late"]["output_ids"], self.native["late"]["output_ids"]
         )
 
     def test_forced_token_logprobs_agree(self):
         diffs = []
         for (want, _), (got, got_top) in zip(
-            self.direct["forced"], self.reference["forced"]
+            self.native["forced"], self.reference["forced"]
         ):
             self.assertEqual([t for _, t, _ in got], [t for _, t, _ in want])
             diffs += [abs(w[0] - g[0]) for w, g in zip(want[1:], got[1:])]

@@ -1,7 +1,7 @@
 """Hierarchical cache (HiCache) through the model runner API.
 
 The built-in runner: HiCache on, a device pool small enough that cached
-prefixes are evicted to host memory and loaded back; direct, direct again,
+prefixes are evicted to host memory and loaded back; native, native again,
 then through the API, raw logits of every step bitwise.
 
 The reference (external) runner: SGLang backs up and loads the runner's own KV
@@ -26,8 +26,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.model_runner_reference import (
     REFERENCE_RUNNER,
     install_reference_runner,
+    native_lane,
     read_step_trace,
-    with_model_runner,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -91,8 +91,8 @@ def _serve(other_args, *, workload, env=None):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner(other_args),
-        env=env,
+        other_args=other_args,
+        env={**env, **native_lane(other_args)},
     )
     try:
         result = workload()
@@ -153,21 +153,21 @@ class TestModelRunnerHiCache(CustomTestCase):
         out["resume"] = [_generate(p, max_new_tokens=48) for p in self.follow_ups]
         return out
 
-    def test_builtin_runner_with_hicache_is_bitwise_equal_to_the_direct_path(self):
+    def test_builtin_runner_with_hicache_is_bitwise_equal_to_the_native_lane(self):
         args = [*_COMMON, *_SMALL_POOL, *_HICACHE]
-        direct_out, direct = _serve(args, workload=self._workload)
+        native_out, native = _serve(args, workload=self._workload)
         again_out, again = _serve(args, workload=self._workload)
         steps_out, steps = _serve(
             [*args, "--model-runner", "sglang"], workload=self._workload
         )
-        self.assertEqual({r["path"] for r in direct + again}, {"direct"})
+        self.assertEqual({r["path"] for r in native + again}, {"native"})
         self.assertEqual({r["path"] for r in steps}, {"step"})
         host = [_host_tokens(o) for o in steps_out["resume"]]
         print(f"[builtin] host-loaded prefix tokens per follow-up: {host}")
         self._assert_resumed_from_host(steps_out, host)
         for want_out, want, got_out, got in (
-            (direct_out, direct, again_out, again),
-            (direct_out, direct, steps_out, steps),
+            (native_out, native, again_out, again),
+            (native_out, native, steps_out, steps),
         ):
             self.assertEqual(_outputs(got_out), _outputs(want_out))
             self.assertEqual(len(got), len(want))

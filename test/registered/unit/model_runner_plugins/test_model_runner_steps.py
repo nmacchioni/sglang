@@ -467,7 +467,7 @@ class TestVerifyStep(CustomTestCase):
     def test_a_dflash_block_without_a_mask_verifies_one_chain(self):
         """The DFlash family verifies a linear block, causal over its drafts,
         without a mask: a VERIFY Step with no mask. Any other verify without a
-        mask has no layout to state and keeps the direct path."""
+        mask has no layout to state and runs on the native forward."""
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         batch = _ngram_verify_batch()
@@ -485,7 +485,7 @@ class TestVerifyStep(CustomTestCase):
         tree.spec_info.custom_mask = None
         self.assertIn("without a tree mask", step_refusal(tree))
 
-    def test_ragged_verify_keeps_the_direct_path(self):
+    def test_ragged_verify_is_outside_the_step_subset(self):
         batch = _ngram_verify_batch()
         batch.ragged_verify_layout = object()
         self.assertIn("ragged", step_refusal(batch))
@@ -588,7 +588,7 @@ class TestLoRASteps(CustomTestCase):
                 adapters=torch.zeros(3, dtype=torch.int32),
             )
 
-    def test_lora_keeps_the_direct_path_where_slots_are_assigned_later(self):
+    def test_lora_runs_natively_where_slots_are_assigned_later(self):
         self.assertEqual(_native_refusals(lora=True), [])
         self.assertIn(
             "LoRA under DP attention", _native_refusals(lora=True, attn_dp_size=2)
@@ -601,8 +601,9 @@ class TestLoRASteps(CustomTestCase):
 
 class TestStepSubset(CustomTestCase):
     def test_every_batch_feature_outside_block_3_is_refused(self):
-        """A batch the API cannot express must take the direct path (native)
-        or fail (external), never run with the feature silently dropped."""
+        """A batch the API cannot express must run on the native forward
+        (built-in runner) or fail (external), never run with the feature
+        silently dropped."""
         self.assertIsNone(step_refusal(_decode_batch()))
         cases = {
             "forward mode": dict(forward_mode=ForwardMode.DRAFT_EXTEND_V2),
@@ -625,7 +626,7 @@ class TestStepSubset(CustomTestCase):
         """The forward pads every DP rank of such a step to one captured prefill
         bucket; the Step names that bucket on every rank, idle and decode ranks
         included. Without a shared bucket (the ranks' tokens exceed the largest)
-        each rank would pick its own graph after padding: direct path."""
+        each rank would pick its own graph after padding: the native forward."""
         from sglang.srt.model_runner_plugins import steps
 
         def batch(published, buckets=(4, 8, 16)):
@@ -735,7 +736,7 @@ class TestStepForward(CustomTestCase):
         batch = _decode_batch()
         batch.beam = object()
         with self.assertRaisesRegex(ValueError, "fake cannot run a step with beam"):
-            _external_forward(_FakeExecutor()).takes(batch)
+            _external_forward(_FakeExecutor()).materializes(batch)
         # Stream ordering does not make a runner the built-in one.
         for traced, stream_ordered in ((False, False), (True, False), (False, True)):
             external = StepForward(
@@ -748,17 +749,30 @@ class TestStepForward(CustomTestCase):
                 stream_ordered=stream_ordered,
             )
             with self.assertRaisesRegex(ValueError, "fake cannot run a step with beam"):
-                external.try_forward(batch, None)
+                external.forward(batch, None)
         native = StepForward(
             runner_name="sglang",
             executor=_FakeExecutor(),
             page_table=_PAGE_TABLE,
             vocab_size=_VOCAB,
             native_prompt_logprobs=True,
-            direct_fallback=True,
+            traced=True,
+            builtin=True,
         )
-        self.assertFalse(native.takes(batch))
-        self.assertTrue(native.takes(_decode_batch()))
+        self.assertFalse(native.materializes(batch))
+        self.assertTrue(native.materializes(_decode_batch()))
+        # A configuration the Step does not describe: no batch builds one.
+        native_only = StepForward(
+            runner_name="sglang",
+            executor=_FakeExecutor(),
+            page_table=_PAGE_TABLE,
+            vocab_size=_VOCAB,
+            native_prompt_logprobs=True,
+            traced=True,
+            builtin=True,
+            native_only=True,
+        )
+        self.assertFalse(native_only.materializes(_decode_batch()))
 
     def test_a_step_asking_for_hidden_states_needs_them_back(self):
         """A draft reads the target's hidden states from the step's output; a
@@ -814,17 +828,15 @@ class TestBuiltInRunnerUntraced(CustomTestCase):
             native_prompt_logprobs=True,
             overlap=True,
             lowering=plugin.lowering,
-            direct_fallback=True,
             stream_ordered=True,
             builtin=True,
         )
-        # The worker's one call (try_forward), and forward() itself.
-        self.assertIs(steps.try_forward(_decode_batch(), None), outputs[0])
+        self.assertIs(steps.forward(_decode_batch(), None), outputs[0])
         self.assertIs(steps.forward(_decode_batch()), outputs[1])
         # A batch outside the Step subset runs the same native forward.
         outside = _decode_batch()
         outside.beam = object()
-        self.assertIs(steps.try_forward(outside, None), outputs[2])
+        self.assertIs(steps.forward(outside, None), outputs[2])
         self.assertEqual(len(outputs), 3)
         self.assertEqual(released, [])
         self.assertIsNone(steps.take_lease())
@@ -844,7 +856,6 @@ class TestBuiltInRunnerUntraced(CustomTestCase):
             vocab_size=_VOCAB,
             native_prompt_logprobs=True,
             lowering=plugin.lowering,
-            direct_fallback=True,
             stream_ordered=True,
             builtin=True,
         )
@@ -1132,15 +1143,20 @@ class TestExternalRelease(CustomTestCase):
         self.assertTrue(external.hicache and external.pd_disaggregation)
         self.assertEqual(launch_refusals(external, ResolvedConfig(model_path="m")), [])
 
-    def test_builtin_runner_keeps_the_direct_path_for_dcp_and_elastic_ep(self):
+    def test_builtin_runner_runs_natively_for_dcp_and_elastic_ep(self):
         """Prefill CP, EP and EPLB take the API on the built-in runner; decode
-        CP and elastic EP keep the direct path, and so does the expert
+        CP and elastic EP run on its native forward, and so does the expert
         balancedness report, which returns metrics from each forward."""
         cases = {
             "": {},
             "decode context parallelism": dict(dcp_size=2),
             "elastic EP": dict(elastic_ep_backend="mooncake"),
             "per-forward captures": dict(balancedness=True),
+            # Steps are lowered against the CUDA graph runners only.
+            "device npu": dict(device="npu"),
+            "device rocm": dict(hip=True),
+            # The bitwise baseline: drafts and adapters stay native too.
+            "the native test lane": dict(native_lane=True),
         }
         for case, options in cases.items():
             with self.subTest(case=case):
@@ -1205,9 +1221,13 @@ def _native_refusals(
     lora=False,
     attn_dp_size=1,
     speculative_algorithm=None,
+    device="cuda",
+    hip=False,
+    native_lane=False,
 ):
     from unittest.mock import patch
 
+    from sglang.srt.environ import envs
     from sglang.srt.model_runner_plugins import native_steps
 
     features = SimpleNamespace(
@@ -1245,11 +1265,16 @@ def _native_refusals(
         ),
         get_lora=SimpleNamespace(enable_lora=lora),
         get_exec=exec_,
+        get_device=SimpleNamespace(device=device),
+        is_hip=hip,
         use_mlx=False,
     )
     with contextlib.ExitStack() as stack:
         for name, value in getters.items():
             stack.enter_context(patch.object(native_steps, name, lambda v=value: v))
+        stack.enter_context(
+            envs.SGLANG_TEST_MODEL_RUNNER_NATIVE_LANE.override(native_lane)
+        )
         return native_steps.native_step_refusals(model_runner)
 
 

@@ -4,7 +4,7 @@ Qwen3-0.6B serves three LoRA adapters (written by the test: random PEFT
 adapters on every attention and MLP projection) with two adapter slots, so
 SGLang evicts and reloads slots while other requests keep decoding. A batch of
 requests over the three adapters and the base model, then an adapter loaded at
-runtime, used and unloaded, and the others again, run direct, direct again, then with
+runtime, used and unloaded, and the others again, run native, native again, then with
 ``--model-runner sglang``, eager and with overlap scheduling and decode
 graphs: identical outputs, raw logits bitwise for every step whose inputs
 (adapters included) the other run also has, every step of the API run on the
@@ -23,7 +23,7 @@ import requests
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace, with_model_runner
+from sglang.test.model_runner_reference import native_lane, read_step_trace
 from sglang.test.test_utils import (
     ADMIN_HEADERS_FOR_TEST,
     ADMIN_LAUNCH_ARGS_FOR_TEST,
@@ -202,13 +202,12 @@ class TestModelRunnerLoRA(CustomTestCase):
             _MODEL,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=with_model_runner(
-                [*_COMMON, "--lora-paths", *lora_paths, *args]
-            ),
+            other_args=[*_COMMON, "--lora-paths", *lora_paths, *args],
             env={
                 **os.environ,
                 "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
                 "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+                **native_lane([*_COMMON, "--lora-paths", *lora_paths, *args]),
             },
         )
         try:
@@ -236,23 +235,23 @@ class TestModelRunnerLoRA(CustomTestCase):
                 f"step {b['index']} ({b['mode']}): {output} differ",
             )
         # The adapter-slot admission makes batch composition depend on timing,
-        # so even the direct path repeats only part of its steps.
+        # so even the native lane repeats only part of its steps.
         self.assertTrue(matched)
         return f"{len(matched)}/{len(got_seen)}"
 
     def _case(self, name, args):
-        direct, direct_steps, _ = self._serve(args)
+        native, native_steps, _ = self._serve(args)
         again, again_steps, _ = self._serve(args)
         api, api_steps, controls = self._serve([*args, "--model-runner", "sglang"])
-        self.assertEqual(again, direct)
-        self.assertEqual(api, direct)
+        self.assertEqual(again, native)
+        self.assertEqual(api, native)
         # Prompt 0 under adapter a, then d, answers differently; prompt 2 under
         # the base model answers alike in both batches.
-        mixed, loaded = direct["mixed"], direct["loaded"]
+        mixed, loaded = native["mixed"], native["loaded"]
         self.assertNotEqual(loaded[0], mixed[0])
         self.assertEqual(loaded[2], mixed[2])
-        repeat = self._assert_steps_bitwise(direct_steps, again_steps)
-        through_api = self._assert_steps_bitwise(direct_steps, api_steps)
+        repeat = self._assert_steps_bitwise(native_steps, again_steps)
+        through_api = self._assert_steps_bitwise(native_steps, api_steps)
         self.assertEqual({r["path"] for r in api_steps}, {"step"})
         lora_steps = [r for r in api_steps if r["lora_ids"] is not None]
         self.assertTrue(lora_steps)
@@ -277,10 +276,10 @@ class TestModelRunnerLoRA(CustomTestCase):
         outside = sorted(r["host_us"] - r["execute_us"] for r in api_steps[2:])
         boundary = {
             label: sorted(r["host_us"] for r in run[2:])
-            for label, run in (("direct", direct_steps), ("API", api_steps))
+            for label, run in (("native", native_steps), ("API", api_steps))
         }
         print(
-            f"[lora {name}] steps bitwise: direct again {repeat}, API {through_api}; "
+            f"[lora {name}] steps bitwise: native again {repeat}, API {through_api}; "
             f"LoRA steps {len(lora_steps)}; slot history {served}; slot changes "
             f"beside a running slot {reused_in_flight}; graph replays "
             f"{sum(r['replayed_graph'] for r in api_steps)}; median host time "

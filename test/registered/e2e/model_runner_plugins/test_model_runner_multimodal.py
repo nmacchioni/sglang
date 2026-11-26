@@ -1,13 +1,13 @@
 """Multimodal requests through the model runner API.
 
 Qwen3.5-0.8B (a vision-language model with M-RoPE) serves image requests --
-one image, two images, a repeated image, and text alone -- direct, direct
+one image, two images, a repeated image, and text alone -- native, native
 again, then with ``--model-runner sglang``, eager and with overlap scheduling
 and graphs: identical outputs, raw logits of every step bitwise in order, and
 every step of the API run on the step path, its extends carrying the images'
 items. Then both frontends resolve SGLang's processor for the built-in
 runner: the Rust frontend (``SGLANG_RUST_SERVER=1``) serves the same image
-requests through the API as it does on the direct path."""
+requests through the API as it does on the native lane."""
 
 import base64
 import importlib.util
@@ -22,7 +22,7 @@ import torch
 from PIL import Image
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace, with_model_runner
+from sglang.test.model_runner_reference import native_lane, read_step_trace
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -115,12 +115,13 @@ def _serve(args, env=None):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner([*_COMMON, *args]),
+        other_args=[*_COMMON, *args],
         env={
             **os.environ,
             **(env or {}),
             "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+            **native_lane([*_COMMON, *args]),
         },
     )
     try:
@@ -152,30 +153,30 @@ class TestModelRunnerMultimodal(CustomTestCase):
         return len(matched)
 
     def _case(self, name, args, env=None):
-        direct, direct_steps = _serve(args, env)
+        native, native_steps = _serve(args, env)
         again, again_steps = _serve(args, env)
         api, api_steps = _serve([*args, "--model-runner", "sglang"], env)
-        self.assertEqual(again, direct)
-        self.assertEqual(api, direct)
-        repeat = self._assert_steps_bitwise(direct_steps, again_steps)
-        through_api = self._assert_steps_bitwise(direct_steps, api_steps)
+        self.assertEqual(again, native)
+        self.assertEqual(api, native)
+        repeat = self._assert_steps_bitwise(native_steps, again_steps)
+        through_api = self._assert_steps_bitwise(native_steps, api_steps)
         self.assertEqual({r["path"] for r in api_steps}, {"step"})
         mm_extends = [r for r in api_steps if r["mode"] == "extend" and r["mm_items"]]
         self.assertTrue(mm_extends)
         outside = sorted(r["host_us"] - r["execute_us"] for r in api_steps[2:])
         boundary = {
             label: sorted(r["host_us"] for r in run[2:])
-            for label, run in (("direct", direct_steps), ("API", api_steps))
+            for label, run in (("native", native_steps), ("API", api_steps))
         }
         print(
-            f"[multimodal {name}] steps bitwise: direct again {repeat}, API "
+            f"[multimodal {name}] steps bitwise: native again {repeat}, API "
             f"{through_api}; extends with images {len(mm_extends)} "
             f"(items {[r['mm_items'] for r in mm_extends]}); graph replays "
             f"{sum(r['replayed_graph'] for r in api_steps)}; median host time "
             f"outside execute {outside[len(outside) // 2]:.0f} us; at the worker "
             f"boundary {', '.join(f'{k} {v[len(v) // 2]:.0f} us' for k, v in boundary.items())}"
         )
-        return direct
+        return native
 
     def test_images_eager(self):
         self._case("eager", _EAGER)

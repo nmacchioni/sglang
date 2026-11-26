@@ -535,9 +535,9 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
-    # None without --model-runner, and in stub schedulers built via __new__.
+    # The model runner's request admission and lifecycle; None only in stub
+    # schedulers built via __new__.
     model_runner_admission: Optional[ModelRunnerAdmission] = None
-    # The --model-runner lifecycle; None without the flag and in stub schedulers.
     model_runner_startup: Optional[ModelRunnerStartup] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
     # Class-level defaults so stub schedulers built via __new__ skip the log.
@@ -901,14 +901,14 @@ class Scheduler(
             )
 
     def init_model_runner_admission(self) -> None:
-        """Per-request refusal for the runner --model-runner selects; None without it."""
-        self.model_runner_admission = ModelRunnerAdmission.maybe_create(
+        """Per-request refusal for the model runner of this launch."""
+        self.model_runner_admission = ModelRunnerAdmission.create(
             model_config=self.model_config
         )
 
     def init_model_runner_startup(self) -> None:
-        """Lifecycle of the runner --model-runner selects; None without it."""
-        self.model_runner_startup = ModelRunnerStartup.maybe_create(
+        """Lifecycle of the model runner of this launch."""
+        self.model_runner_startup = ModelRunnerStartup.create(
             native_host=self, model_config=self.model_config
         )
 
@@ -1134,10 +1134,7 @@ class Scheduler(
             from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
             self.tp_worker = MlxTpModelWorker(**worker_kwargs)
-        elif (
-            self.model_runner_startup is not None
-            and self.model_runner_startup.is_external
-        ):
+        elif self.model_runner_startup.is_external:
             # An external --model-runner owns the model; SGLang's worker has none.
             self.tp_worker = self.model_runner_startup.create_tp_worker(**worker_kwargs)
         else:
@@ -1332,15 +1329,9 @@ class Scheduler(
         kv_cache_builder.agree_on_stage_request_capacity(tp_worker=self.tp_worker)
 
     def init_model_worker(self):
-        if self.model_runner_startup is None:
-            self.load_model_workers()
-            self.alloc_model_memory_pools()
-            self.capture_model_graphs()
-            self.finalize_model_capacity()
-        else:
-            # The same phases, through the lifecycle of the --model-runner plugin.
-            self.model_runner_startup.run(StartupInputs.from_published())
-            self.init_model_runner_steps()
+        # The phases above, through the model runner's lifecycle.
+        self.model_runner_startup.run(StartupInputs.from_published())
+        self.init_model_runner_steps()
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none() or self.draft_worker is None:
@@ -1406,23 +1397,7 @@ class Scheduler(
             )
 
     def init_worker_info(self):
-        """Token and memory limits; typed runner results under --model-runner."""
-        if self.model_runner_startup is None:
-            (
-                self.max_total_num_tokens,
-                self.max_prefill_tokens,
-                self.max_running_requests,
-                self.max_queued_requests,
-                self.max_req_len,
-                self.max_req_input_len,
-                self.random_seed,
-                self.device,
-                self.forward_stream,
-                _,
-                _,
-                _,
-            ) = self.tp_worker.get_worker_info()
-            return
+        """Token and memory limits, from the model runner's typed results."""
         limits = self.model_runner_startup.layout.limits
         self.max_total_num_tokens = limits.max_total_num_tokens
         self.max_prefill_tokens = get_schedule().max_prefill_tokens
@@ -1436,23 +1411,21 @@ class Scheduler(
         self.forward_stream = self.tp_worker.model_runner.forward_stream
 
     def init_model_runner_control(self) -> None:
-        """Route runner control requests through the --model-runner's control();
-        no-op without it."""
-        if self.model_runner_startup is not None:
-            self.model_runner_startup.wrap_control(
-                dispatcher=self._request_dispatcher,
-                weight_updater=self.weight_updater,
-                wait_for_launched_forward=self.wait_for_launched_forward,
-            )
+        """Route runner control requests through the model runner's control()."""
+        self.model_runner_startup.wrap_control(
+            dispatcher=self._request_dispatcher,
+            weight_updater=self.weight_updater,
+            wait_for_launched_forward=self.wait_for_launched_forward,
+        )
 
     def init_model_runner_steps(self) -> None:
-        """Route the target worker's forwards through the --model-runner steps."""
+        """Route the target worker's forwards through the model runner."""
         self.tp_worker.set_step_forward(
             self.model_runner_startup.step_forward(tp_worker=self.tp_worker)
         )
 
     def close_model_runner(self) -> None:
-        """Close the --model-runner plugin on graceful shutdown; no-op without it."""
+        """Close the model runner on graceful shutdown; no-op before it exists."""
         if self.model_runner_startup is not None:
             self.model_runner_startup.close()
 
@@ -4098,8 +4071,6 @@ class Scheduler(
 
     def _refused_by_model_runner(self, req: Req) -> bool:
         """Reject a normalized request the selected model runner cannot serve."""
-        if self.model_runner_admission is None:
-            return False
         error_msg = self.model_runner_admission.check(req)
         if error_msg is None:
             return False

@@ -4,7 +4,7 @@ The built-in runner, with the memory saver, overlap scheduling and decode
 graphs on: one session generates, releases all device memory, resumes it,
 reloads the weights (released weights come back uninitialized) and generates
 again, loads a modified checkpoint from disk, generates, loads the
-original back and generates once more. The session runs direct, direct again,
+original back and generates once more. The session runs native, native again,
 then with ``--model-runner sglang``: same outputs per phase, raw logits of
 every step bitwise in order, every control request through the runner's
 ``control`` (the control trace), the KV epoch advanced by the resume, and the
@@ -29,8 +29,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.model_runner_reference import (
     REFERENCE_RUNNER,
     install_reference_runner,
+    native_lane,
     read_step_trace,
-    with_model_runner,
 )
 from sglang.test.test_utils import (
     ADMIN_HEADERS_FOR_TEST,
@@ -132,12 +132,13 @@ class _Session:
             _MODEL,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=with_model_runner(args),
+            other_args=args,
             env={
                 **os.environ,
                 **(env or {}),
                 "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": self.trace_dir,
                 "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+                **native_lane(args),
             },
         )
         self.original, self.modified = original, modified
@@ -197,23 +198,27 @@ class TestBuiltinRunnerControl(CustomTestCase):
             )
         return len(got)
 
-    def test_release_resume_and_weight_updates_match_the_direct_path(self):
-        direct, direct_steps, direct_controls = self._session(_BUILTIN)
+    def test_release_resume_and_weight_updates_match_the_native_lane(self):
+        native, native_steps, native_controls = self._session(_BUILTIN)
         again, again_steps, _ = self._session(_BUILTIN)
         api, api_steps, controls = self._session(
             [*_BUILTIN, "--model-runner", "sglang"]
         )
         # Each phase: same outputs on every path; resumed and restored weights
         # serve what they served before, the modified checkpoint differs.
-        self.assertEqual(again, direct)
-        self.assertEqual(api, direct)
-        self.assertEqual(direct["resumed"], direct["before"])
-        self.assertEqual(direct["restored"], direct["before"])
-        self.assertNotEqual(direct["modified"], direct["before"])
-        repeat = self._assert_steps_bitwise(direct_steps, again_steps)
-        through_api = self._assert_steps_bitwise(direct_steps, api_steps)
+        self.assertEqual(again, native)
+        self.assertEqual(api, native)
+        self.assertEqual(native["resumed"], native["before"])
+        self.assertEqual(native["restored"], native["before"])
+        self.assertNotEqual(native["modified"], native["before"])
+        repeat = self._assert_steps_bitwise(native_steps, again_steps)
+        through_api = self._assert_steps_bitwise(native_steps, api_steps)
         self.assertEqual({r["path"] for r in api_steps}, {"step"})
-        self.assertEqual(direct_controls, [])
+        # The native lane runs its control through the same runner.
+        self.assertEqual(
+            [(c["api"], c["success"], c["epoch"]) for c in native_controls],
+            [(c["api"], c["success"], c["epoch"]) for c in controls],
+        )
         self.assertEqual(
             [(c["api"], c["success"], c["epoch"]) for c in controls],
             [
@@ -227,7 +232,7 @@ class TestBuiltinRunnerControl(CustomTestCase):
         decodes = [r for r in api_steps if r["mode"] == "decode"]
         replayed = sum(r["replayed_graph"] for r in decodes)
         print(
-            f"[builtin control] steps bitwise: direct again {repeat}, API "
+            f"[builtin control] steps bitwise: native again {repeat}, API "
             f"{through_api}; decode graph replays {replayed}/{len(decodes)}; "
             f"control host us {[round(c['host_us']) for c in controls]}"
         )

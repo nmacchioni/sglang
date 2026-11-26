@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 
-from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.model_runner_plugins.api import (
     Capacity,
@@ -114,16 +113,10 @@ class ModelRunnerStartup:
     """One rank's runner lifecycle: startup in order, then ``close`` once."""
 
     @classmethod
-    def maybe_create(
+    def create(
         cls, *, native_host: NativeStartupHost, model_config: ModelConfig
-    ) -> Optional[ModelRunnerStartup]:
-        """None on the direct path, which runs no lifecycle."""
-        if use_mlx():
-            # The MLX worker keeps its own startup path in v1.
-            return None
+    ) -> ModelRunnerStartup:
         runner = selected_model_runner()
-        if runner is None:
-            return None
         name = runner.name
         capabilities = describe_runner(runner, resolved_config(model_config))
         if runner.is_native:
@@ -183,9 +176,8 @@ class ModelRunnerStartup:
         """The target worker over an external runner (``is_external`` only)."""
         return self._plugin.create_tp_worker(**worker_kwargs)
 
-    def step_forward(self, *, tp_worker: TpModelWorker) -> Optional[StepForward]:
-        """The worker's forwards through the runner's steps, after startup; None
-        when the built-in runner keeps every step on the direct path."""
+    def step_forward(self, *, tp_worker: TpModelWorker) -> StepForward:
+        """The worker's forwards through the runner, after startup."""
         from sglang.srt.model_runner_plugins.kv_view import PluginKVView
         from sglang.srt.model_runner_plugins.native_kv import NativeKV
         from sglang.srt.model_runner_plugins.native_steps import (
@@ -205,6 +197,7 @@ class ModelRunnerStartup:
                     "computing); pass --disable-overlap-schedule"
                 )
             executor, lowering, native_kv = self._plugin.plugin, None, None
+            refusals = []
             kv_pool = model_runner.token_to_kv_pool
             wait_for_kv_loads = (
                 kv_pool.wait_for_loads if isinstance(kv_pool, PluginKVView) else None
@@ -216,11 +209,11 @@ class ModelRunnerStartup:
             refusals = native_step_refusals(model_runner, kv_refusal=native_kv.refusal)
             if refusals:
                 logger.info(
-                    "Model runner %r keeps the direct path for every step: %s",
+                    "Model runner %r runs every step on its native forward, "
+                    "without a Step: %s",
                     self.runner_name,
                     ", ".join(refusals),
                 )
-                return None
             executor, lowering = self._plugin, self._plugin.lowering
             choose_graph = lambda batch: native_graph_choice(
                 model_runner=model_runner, forward_batch=batch
@@ -235,15 +228,18 @@ class ModelRunnerStartup:
             shared_outputs=self._capabilities.shared_outputs,
             choose_graph=choose_graph,
             lowering=lowering,
-            direct_fallback=not self.is_external,
+            native_only=not self.is_external and bool(refusals),
             tp_group=_tp_group_or_none(),
             last_stage=_is_last_stage(),
             native_kv=native_kv,
             wait_for_kv_loads=wait_for_kv_loads,
             speculative=get_spec().speculative_algorithm is not None,
             pooling=not model_runner.model_config.is_generation,
+            # Read only when a Step is built.
             adapter_slots=(
-                None if self.is_external else native_adapter_slots(model_runner)
+                None
+                if self.is_external or refusals
+                else native_adapter_slots(model_runner)
             ),
             fused_sampling=self._capabilities.fused_sampling,
             # The built-in runner executes on the runner stream itself.
@@ -253,11 +249,12 @@ class ModelRunnerStartup:
         )
         if self.is_external:
             self._plugin.step_forward = self._step_forward
-        if not self.is_external:
+        if not self.is_external and not refusals:
             self._attach_native_draft_steps(tp_worker)
         if tp_worker.step_trace is not None:
             tp_worker.step_trace.bind_kv_pool(model_runner.token_to_kv_pool)
-        logger.info("Model runner %r runs steps through its API", self.runner_name)
+        if self.is_external or not refusals:
+            logger.info("Model runner %r runs steps through its API", self.runner_name)
         return self._step_forward
 
     def _attach_native_draft_steps(self, tp_worker: TpModelWorker) -> None:

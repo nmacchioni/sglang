@@ -1,7 +1,8 @@
 """Per-forward trace at the worker boundary, for tests and step-overhead runs.
 
 Off unless ``SGLANG_MODEL_RUNNER_STEP_TRACE_DIR`` is set. Each record says which
-path ran (direct, or the runner's steps), the step's shape, whether it replayed
+path ran (a Step through the runner's API, or the built-in runner's
+native forward), the step's shape, whether it replayed
 a graph (and, on the step path, ``Step.graph``), and the host time spent at the
 boundary; optionally the inputs and raw logits before sampling.
 """
@@ -36,7 +37,7 @@ def _slot_row_pool(pool):
 
 class AcceptTrace:
     """Speculative acceptance per verify, beside the step trace: one JSON line
-    per accept (``accepts-<pid>.jsonl``), on the direct and the step path."""
+    per accept (``accepts-<pid>.jsonl``), with or without a Step."""
 
     def __init__(self, *, directory: str):
         self._path = os.path.join(directory, f"accepts-{os.getpid()}.jsonl")
@@ -147,7 +148,8 @@ class StepTrace:
         self,
         *,
         tic: float,
-        runner: Optional[str],
+        runner: str,
+        materialized: bool,
         execute_seconds: Optional[float],
         forward_batch: ForwardBatch,
         logits_output: Union[LogitsProcessorOutput, PPProxyTensors],
@@ -177,7 +179,9 @@ class StepTrace:
         record = {
             "index": self._count,
             **self._ranks,
-            "path": "direct" if runner is None else "step",
+            # "step" through the API, "native" on the built-in runner's native
+            # forward with no Step materialized.
+            "path": "step" if materialized else "native",
             "runner": runner,
             "mode": forward_batch.forward_mode.name.lower(),
             "batch_size": forward_batch.batch_size,
@@ -266,7 +270,7 @@ class StepTrace:
         prefix_lens = forward_batch.extend_prefix_lens_cpu
         if not self._save_logits or not prefix_lens or not any(prefix_lens):
             return None
-        # The direct path reads the worker's own pool and page table.
+        # Without a Step: the worker's own pool and page table.
         if kv is not None:
             pool, page_table = self._kv_pool, kv.page_table
         elif model_runner is not None:

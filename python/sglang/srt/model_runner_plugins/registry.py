@@ -2,7 +2,7 @@
 
 Discovery reads entry point metadata only and imports just the selected
 provider, so an unrelated installed package cannot affect a launch. It runs
-only when the flag names a runner.
+only when the flag names a runner other than the built-in one.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.model_runner_plugins.api import (
-    DIRECT_MODEL_RUNNER,
     MODEL_RUNNER_API_VERSION,
     MODEL_RUNNERS_GROUP,
     NATIVE_MODEL_RUNNER,
@@ -41,10 +40,6 @@ def load_model_runner(name: str, *, explicit: bool = True) -> LoadedModelRunner:
 
     ``explicit=False``: the built-in runner selected by default, without the
     flag; no entry point is enumerated then."""
-    if name == DIRECT_MODEL_RUNNER:
-        raise ValueError(
-            f"{DIRECT_MODEL_RUNNER!r} selects the direct path, not a model runner"
-        )
     if name == NATIVE_MODEL_RUNNER and not explicit:
         from sglang.srt.model_runner_plugins.native import SGLangRunnerPlugin
 
@@ -90,11 +85,11 @@ def _unknown_runner_message(name: str) -> str:
     allowed = _allowlist()
     installed = sorted(
         {ep.name for ep in entry_points(group=MODEL_RUNNERS_GROUP)}
-        - {NATIVE_MODEL_RUNNER, DIRECT_MODEL_RUNNER}
+        - {NATIVE_MODEL_RUNNER}
     )
     message = (
         f"Unknown model runner {name!r} for --model-runner. Built in: "
-        f"{NATIVE_MODEL_RUNNER!r} ({DIRECT_MODEL_RUNNER!r} for the direct path); "
+        f"{NATIVE_MODEL_RUNNER!r} (the default); "
         f"installed: {', '.join(installed) or 'none'}."
     )
     if allowed is not None and name in installed:

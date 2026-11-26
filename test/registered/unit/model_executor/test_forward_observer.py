@@ -62,8 +62,24 @@ def test_forward_observer_registration(runner_kwargs, topology, mlx):
 
 
 def _tp_worker(runner):
+    from sglang.srt.model_runner_plugins.native import SGLangRunnerPlugin
+    from sglang.srt.model_runner_plugins.step_forward import StepForward
+
     worker = object.__new__(TpModelWorker)
     worker._model_runner = runner
+    # The built-in runner, untraced: its forward is the runner's own.
+    plugin = SGLangRunnerPlugin(
+        host=SimpleNamespace(tp_worker=SimpleNamespace(model_runner=runner))
+    )
+    worker.step_forward = StepForward(
+        runner_name="sglang",
+        executor=plugin,
+        page_table=None,
+        vocab_size=4,
+        native_prompt_logprobs=True,
+        stream_ordered=True,
+        builtin=True,
+    )
     worker.hicache_layer_transfer_counter = None
     worker.dllm_algorithm = None
     worker.pp_group = SimpleNamespace(is_last_rank=True)
@@ -93,6 +109,7 @@ def test_tp_worker_attaches_observer_output_to_the_result(has_observer, can_run_
     forward_batch = SimpleNamespace(
         is_prefill_only=False,
         apply_deprecated_skip_attn_backend_init=Mock(),
+        global_num_tokens_cpu=None,
     )
 
     with (

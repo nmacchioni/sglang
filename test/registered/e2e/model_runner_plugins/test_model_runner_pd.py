@@ -5,9 +5,9 @@ checksum on (the decode digests the transferred bytes and aborts a request
 whose digest differs from the prefill's), runs the same requests, and keeps
 the step trace of both roles:
 
-- the built-in runner on both roles, against the same PD launch on the direct
-  path, after the direct launch is repeated: identical tokens, and the raw
-  logits of every prefill and decode step bitwise where the direct repeat
+- the built-in runner on both roles, against the same PD launch on the native
+  path, after the native launch is repeated: identical tokens, and the raw
+  logits of every prefill and decode step bitwise where the native repeat
   reproduces them (plain, sliding-window and recurrent-state models);
 - the reference (external) runner on both roles: SGLang registers and moves the
   runner's own KV bytes, located through its KVLayout; the decode's first step
@@ -36,8 +36,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.model_runner_reference import (
     REFERENCE_RUNNER,
     install_reference_runner,
+    native_lane,
     read_step_trace,
-    with_model_runner,
 )
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -182,12 +182,13 @@ class _PDRuns(PDDisaggregationServerBase):
             _MODEL,
             self.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=with_model_runner([*_COMMON[1:], *other_args]),
+            other_args=[*_COMMON[1:], *other_args],
             env={
                 **os.environ,
                 **(env or {}),
                 "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
                 "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+                **native_lane([*_COMMON[1:], *other_args]),
             },
         )
         try:
@@ -224,13 +225,13 @@ class _PDRuns(PDDisaggregationServerBase):
         return matched
 
     def _builtin_case(self, name, *, model=_MODEL, args=()):
-        """Direct PD, direct PD again, then PD through the API. Steps are
-        compared bitwise when the direct repeat reproduces every step;
+        """Native PD, native PD again, then PD through the API. Steps are
+        compared bitwise when the native repeat reproduces every step;
         otherwise the configuration does not repeat, and only tokens are."""
         type(self).model = model
         runner = [*args, "--model-runner", "sglang"]
         try:
-            direct_out, direct = self._serve_pd(prefill_args=args, decode_args=args)
+            native_out, native = self._serve_pd(prefill_args=args, decode_args=args)
             again_out, again = self._serve_pd(prefill_args=args, decode_args=args)
             steps_out, steps = self._serve_pd(prefill_args=runner, decode_args=runner)
         finally:
@@ -238,17 +239,17 @@ class _PDRuns(PDDisaggregationServerBase):
         prefill, decode = _roles(steps)
         self.assertTrue(prefill and decode)
         self.assertEqual({r["path"] for r in prefill + decode}, {"step"})
-        self._assert_same_tokens(direct_out, again_out)
-        self._assert_same_tokens(direct_out, steps_out)
-        want = dict(zip(("extend", "decode"), _roles(direct)))
+        self._assert_same_tokens(native_out, again_out)
+        self._assert_same_tokens(native_out, steps_out)
+        want = dict(zip(("extend", "decode"), _roles(native)))
         report = {}
         for label, roles in (
-            ("direct again", _roles(again)),
+            ("native again", _roles(again)),
             ("steps", (prefill, decode)),
         ):
             for mode, got in zip(("extend", "decode"), roles):
                 report[(label, mode)] = _compare_logits(want[mode], got, modes={mode})
-        print(f"[{name}] (matched, differing) steps vs direct: {report}")
+        print(f"[{name}] (matched, differing) steps vs native: {report}")
         for role, records in (("prefill", prefill), ("decode", decode)):
             outside = [r["host_us"] - r["execute_us"] for r in records[2:]]
             print(
@@ -258,13 +259,13 @@ class _PDRuns(PDDisaggregationServerBase):
         for mode in ("extend", "decode"):
             matched, differ = report[("steps", mode)]
             self.assertGreater(matched, 0)
-            if not report[("direct again", mode)][1]:
+            if not report[("native again", mode)][1]:
                 self.assertEqual(differ, [], f"{mode} steps differ through the API")
         return prefill, decode
 
 
 class TestModelRunnerPD(_PDRuns):
-    def test_builtin_runner_pd_matches_the_direct_path(self):
+    def test_builtin_runner_pd_matches_the_native_lane(self):
         self._builtin_case("builtin PD")
 
     def test_builtin_runner_pd_with_a_sliding_window(self):
@@ -284,7 +285,7 @@ class TestModelRunnerPD(_PDRuns):
     def test_builtin_runner_pd_release_and_resume(self):
         # Weights and graphs only: with NIXL a released KV pool stays registered
         # (it has no deregistration), and the transfers after its resume fail
-        # the KV checksum on the direct path too.
+        # the KV checksum on the native lane too.
         common = [a for a in _COMMON if a != "--disable-decode-cuda-graph"]
         args = [
             *ADMIN_LAUNCH_ARGS_FOR_TEST,
@@ -310,7 +311,7 @@ class TestModelRunnerPD(_PDRuns):
                 control(url, "update_weights_from_disk", {"model_path": _MODEL})
             return before, self._workload(lb_url)
 
-        (direct_before, direct_after), _ = self._serve_pd(
+        (native_before, native_after), _ = self._serve_pd(
             prefill_args=args,
             decode_args=args,
             common=common,
@@ -322,9 +323,9 @@ class TestModelRunnerPD(_PDRuns):
             common=common,
             workload=release_and_resume,
         )
-        self._assert_same_tokens(direct_before, direct_after)
-        self._assert_same_tokens(direct_before, before)
-        self._assert_same_tokens(direct_before, after)
+        self._assert_same_tokens(native_before, native_after)
+        self._assert_same_tokens(native_before, before)
+        self._assert_same_tokens(native_before, after)
         prefill, decode = _roles(steps)
         self.assertEqual({r["path"] for r in prefill + decode}, {"step"})
         by_process = {}

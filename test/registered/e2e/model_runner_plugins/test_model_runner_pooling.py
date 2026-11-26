@@ -1,6 +1,6 @@
 """Pooling models and position scoring through the model runner API.
 
-Each configuration serves the same requests direct, direct again, then with
+Each configuration serves the same requests native, native again, then with
 ``--model-runner sglang``: identical responses, the pooled outputs (or
 logits) bitwise for every step whose inputs the other run also has, and every
 step of the API run on the step path. Configurations: an embedding model, a reward model (a sequence
@@ -15,7 +15,7 @@ import requests
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace, with_model_runner
+from sglang.test.model_runner_reference import native_lane, read_step_trace
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -134,11 +134,12 @@ def _serve(model, args, workload):
         model,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner([*_COMMON, *args]),
+        other_args=[*_COMMON, *args],
         env={
             **os.environ,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+            **native_lane([*_COMMON, *args]),
         },
     )
     try:
@@ -167,7 +168,7 @@ class TestModelRunnerPooling(CustomTestCase):
                 f"step {b['index']} ({b['mode']}): {output} differ",
             )
         # A batch request's items reach the scheduler one by one, so how they
-        # batch depends on timing, on the direct path too, and a run can share
+        # batch depends on timing, on the native lane too, and a run can share
         # no step with another; the responses are compared regardless.
         # Multi-item scoring steps return no next-token logits to compare
         # (their scores are the prompt logprobs at the delimiters).
@@ -175,24 +176,24 @@ class TestModelRunnerPooling(CustomTestCase):
 
     def _case(self, name):
         model, args, workload = _CONFIGS[name]
-        direct, direct_steps = _serve(model, args, workload)
+        native, native_steps = _serve(model, args, workload)
         again, again_steps = _serve(model, args, workload)
         api, api_steps = _serve(model, [*args, "--model-runner", "sglang"], workload)
-        self.assertEqual(again, direct)
-        self.assertEqual(api, direct)
+        self.assertEqual(again, native)
+        self.assertEqual(api, native)
         self.assertEqual({r["path"] for r in api_steps}, {"step"})
         pooled = all(r["pooled"] for r in api_steps)
         output = "pooled" if pooled else "logits"
-        repeat = self._assert_steps_bitwise(direct_steps, again_steps, output=output)
-        through_api = self._assert_steps_bitwise(direct_steps, api_steps, output=output)
+        repeat = self._assert_steps_bitwise(native_steps, again_steps, output=output)
+        through_api = self._assert_steps_bitwise(native_steps, api_steps, output=output)
         # Launch steps are already left out, so no warmup step remains.
         outside = sorted(r["host_us"] - r["execute_us"] for r in api_steps)
         boundary = {
             label: sorted(r["host_us"] for r in run)
-            for label, run in (("direct", direct_steps), ("API", api_steps))
+            for label, run in (("native", native_steps), ("API", api_steps))
         }
         print(
-            f"[{name}] steps bitwise ({output}): direct again {repeat}, API "
+            f"[{name}] steps bitwise ({output}): native again {repeat}, API "
             f"{through_api}; median host time outside execute "
             f"{outside[len(outside) // 2]:.0f} us (n={len(outside)}); at the worker "
             f"boundary {', '.join(f'{k} {v[len(v) // 2]:.0f} us' for k, v in boundary.items())}"

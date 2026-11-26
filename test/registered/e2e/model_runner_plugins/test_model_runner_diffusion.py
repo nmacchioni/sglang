@@ -3,8 +3,8 @@
 SDAR-1.7B-Chat (blocks of 4) with the LowConfidence algorithm, in synchronous
 mode (every denoising pass of a block within one forward call) and in
 first-done-first-out mode (one pass per scheduler step), eager (its decode
-graphs hit an illegal instruction on the direct path here, with the Triton and
-FlashInfer backends alike): direct, direct again, then with
+graphs hit an illegal instruction on the native lane here, with the Triton and
+FlashInfer backends alike): native, native again, then with
 ``--model-runner sglang``. Identical
 outputs, raw logits of every pass bitwise in order, every forward on the step
 path as DENOISE steps (context encoding as EXTEND), and in synchronous mode
@@ -18,7 +18,7 @@ import requests
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.model_runner_reference import read_step_trace, with_model_runner
+from sglang.test.model_runner_reference import native_lane, read_step_trace
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -39,7 +39,7 @@ _COMMON = [
     "4",
     "--dllm-algorithm",
     "LowConfidence",
-    # On the direct path here, the default Blackwell backend has no kernel for
+    # On the native lane here, the default Blackwell backend has no kernel for
     # this block layout.
     "--attention-backend",
     "triton",
@@ -90,11 +90,12 @@ def _serve(args):
         _MODEL,
         DEFAULT_URL_FOR_TEST,
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=with_model_runner([*_COMMON, *args]),
+        other_args=[*_COMMON, *args],
         env={
             **os.environ,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_DIR": trace_dir,
             "SGLANG_MODEL_RUNNER_STEP_TRACE_LOGITS": "1",
+            **native_lane([*_COMMON, *args]),
         },
     )
     try:
@@ -126,13 +127,13 @@ class TestModelRunnerDiffusion(CustomTestCase):
         return len(matched)
 
     def _case(self, name, args):
-        direct, direct_steps = _serve(args)
+        native, native_steps = _serve(args)
         again, again_steps = _serve(args)
         api, api_steps = _serve([*args, "--model-runner", "sglang"])
-        self.assertEqual(again, direct)
-        self.assertEqual(api, direct)
-        repeat = self._assert_steps_bitwise(direct_steps, again_steps)
-        through_api = self._assert_steps_bitwise(direct_steps, api_steps)
+        self.assertEqual(again, native)
+        self.assertEqual(api, native)
+        repeat = self._assert_steps_bitwise(native_steps, again_steps)
+        through_api = self._assert_steps_bitwise(native_steps, api_steps)
         self.assertEqual({r["path"] for r in api_steps}, {"step"})
         passes = [r for r in api_steps if r["mode"] == "dllm_extend"]
         self.assertTrue(passes)
@@ -140,10 +141,10 @@ class TestModelRunnerDiffusion(CustomTestCase):
         outside = sorted(r["host_us"] - r["execute_us"] for r in passes)
         boundary = {
             label: sorted(r["host_us"] for r in run if r["mode"] == "dllm_extend")
-            for label, run in (("direct", direct_steps), ("API", api_steps))
+            for label, run in (("native", native_steps), ("API", api_steps))
         }
         print(
-            f"[diffusion {name}] steps bitwise: direct again {repeat}, API "
+            f"[diffusion {name}] steps bitwise: native again {repeat}, API "
             f"{through_api}; denoising passes {len(passes)}, of them plan "
             f"re-executions {reruns}; graph replays "
             f"{sum(r['replayed_graph'] for r in passes)}; median host time "

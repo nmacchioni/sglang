@@ -14,6 +14,7 @@ from transformers import LlamaConfig
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.model_runner_plugins.api import MODEL_RUNNERS_GROUP
+from sglang.srt.model_runner_plugins.refusal import RequestOptions
 from sglang.srt.model_runner_plugins.registry import load_model_runner
 from sglang.srt.model_runner_plugins.selection import (
     ModelRunnerAdmission,
@@ -202,25 +203,20 @@ class TestFlag(CustomTestCase):
         "sglang.srt.model_runner_plugins.registry.entry_points",
         side_effect=AssertionError("runner plugins enumerated without the flag"),
     )
-    def test_default_and_rollback_enumerate_no_runner(self, _entry_points):
-        """Unset, a CUDA launch runs the built-in runner and any other device the
-        direct path; ``direct`` is the rollback. None reads installed runners."""
-        for device, flag, expected in (
-            ("cuda", None, "sglang"),
-            ("cpu", None, None),
-            ("cuda", "direct", None),
-        ):
-            with self.subTest(device=device, flag=flag):
+    def test_default_enumerates_no_runner(self, _entry_points):
+        """Unset, every device runs the built-in runner, and no installed
+        runner is read."""
+        for device in ("cuda", "cpu"):
+            with self.subTest(device=device):
                 with get_context().override_server_args(
-                    _model_config=_model_config(), device=device, model_runner=flag
+                    _model_config=_model_config(), device=device
                 ):
                     check_model_runner_at_launch()
-                    runner = selected_model_runner()
-                    self.assertEqual(runner and runner.name, expected)
-                    admission = ModelRunnerAdmission.maybe_create(
+                    self.assertEqual(selected_model_runner().name, "sglang")
+                    admission = ModelRunnerAdmission.create(
                         model_config=_model_config()
                     )
-                    self.assertEqual(admission is None, expected is None)
+                    self.assertIsNone(admission.check_options(RequestOptions()))
 
 
 class TestLaunchCheck(_DistsCase):
